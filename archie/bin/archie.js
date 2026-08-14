@@ -73,9 +73,14 @@ function helpText() {
 function parse(argv, { commandOptions = {} } = {}) {
   const loose = parseArgs({ args: argv, options: GLOBAL_OPTIONS, allowPositionals: true, strict: false });
   const found = resolve(loose.positionals);
+  // Command-specific options come from the REGISTRY, not from the command module. A command cannot
+  // declare its own flags at load time, because parsing has to succeed before we know which module to
+  // load — and a module that could add flags after parsing would make `--typo` silently valid for
+  // some commands and not others. `commandOptions` stays injectable purely for tests.
+  const declared = found ? (commandOptions[found.key] || (found.command && found.command.options) || {}) : {};
   const strict = parseArgs({
     args: argv,
-    options: { ...GLOBAL_OPTIONS, ...(found ? commandOptions[found.key] || {} : {}) },
+    options: { ...GLOBAL_OPTIONS, ...declared },
     allowPositionals: true,
     strict: true,
   });

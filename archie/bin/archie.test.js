@@ -183,3 +183,35 @@ test('help lists every declared command and marks deferred ones', () => {
   assert.match(h, /fleet reconcile.*\[phase 2\]/);
   assert.match(h, /4 TAINTED \(stop\)/);
 });
+
+test('command-specific options are accepted; unknown ones still are not', async () => {
+  // Registry-declared options must parse, or every wave-1 command would be unusable. And a flag that
+  // belongs to ANOTHER command must still be rejected — `--keep` on `status` is a typo, not a feature.
+  const c1 = capture();
+  let seen = null;
+  assert.equal(await main(['runtime', 'gc', '--region', 'r', '--keep', '3', '--reconcile-aws'], {
+    streams: c1.streams, env: {}, require: fakeRequire({ gc: async (ctx, args) => { seen = args.values; } }),
+  }), EXIT.OK);
+  assert.equal(seen.keep, '3');
+  assert.equal(seen['reconcile-aws'], true);
+
+  const c2 = capture();
+  assert.equal(await main(['status', '--region', 'r', '--keep', '3'], { streams: c2.streams, env: {} }), EXIT.USAGE);
+});
+
+test('--set is repeatable on generation create', async () => {
+  const c = capture();
+  let seen = null;
+  await main(['generation', 'create', '--region', 'r', '--image', 't', '--set', 'a=1', '--set', 'b=2'], {
+    streams: c.streams, env: {}, require: fakeRequire({ create: async (ctx, args) => { seen = args.values.set; } }),
+  });
+  assert.deepEqual(seen, ['a=1', 'b=2']);
+});
+
+test('every declared command has an options object, so none can be unusable', () => {
+  const { COMMANDS } = require('../lib/registry');
+  for (const [key, meta] of Object.entries(COMMANDS)) {
+    if (key === 'version') continue;
+    assert.ok(meta.options && typeof meta.options === 'object', `${key} declares no options`);
+  }
+});

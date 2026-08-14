@@ -2,12 +2,32 @@
   "name": "archie-cli",
   "version": "0.1.0",
   "private": true,
-  "description": "Fleet CLI for the AgentCore agent fleet — build, stage, healthcheck, release",
-  "bin": { "archie": "./bin/archie.js" },
+  "description": "Fleet CLI for the AgentCore agent fleet \u2014 build, stage, healthcheck, release",
+  "bin": {
+    "archie": "./bin/archie.js"
+  },
   "main": "bin/archie.js",
   "scripts": {
     "test": "node --test",
     "lint": "cd .. && node_modules/.bin/eslint archie"
   },
-  "engines": { "node": ">=22" }
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@aws-sdk/client-bedrock-agentcore": "^3",
+    "@aws-sdk/client-bedrock-agentcore-control": "^3",
+    "@aws-sdk/client-cloudwatch": "^3",
+    "@aws-sdk/client-cloudwatch-logs": "^3",
+    "@aws-sdk/client-dynamodb": "^3",
+    "@aws-sdk/client-ecr": "^3",
+    "@aws-sdk/client-ecs": "^3",
+    "@aws-sdk/client-efs": "^3",
+    "@aws-sdk/client-iam": "^3",
+    "@aws-sdk/client-secrets-manager": "^3",
+    "@aws-sdk/client-service-quotas": "^3",
+    "@aws-sdk/client-sqs": "^3",
+    "@aws-sdk/client-sts": "^3",
+    "@aws-sdk/lib-dynamodb": "^3"
+  }
 }
