@@ -1,0 +1,13 @@
+{
+  "name": "archie-cli",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Fleet CLI for the AgentCore agent fleet — build, stage, healthcheck, release",
+  "bin": { "archie": "./bin/archie.js" },
+  "main": "bin/archie.js",
+  "scripts": {
+    "test": "node --test",
+    "lint": "cd .. && node_modules/.bin/eslint archie"
+  },
+  "engines": { "node": ">=22" }
+}

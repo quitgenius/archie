@@ -306,6 +306,20 @@ export default [
     ],
   },
 
+  // ── archie CLI: CommonJS ──────────────────────────────────────────────────
+  // CJS on purpose: it require()s the dispatcher's modules directly in phase 1 rather than
+  // extracting them (PHASE-1-TASKS.md), and those are CommonJS.
+  {
+    files: ['archie/**/*.js'],
+    languageOptions: {
+      ecmaVersion: 2023,
+      sourceType: 'commonjs',
+      globals: { ...globals.node },
+    },
+    plugins: { n, local },
+    rules: bugRules,
+  },
+
   // ── slack-dispatcher: CommonJS ────────────────────────────────────────────
   {
     files: ['slack-dispatcher/**/*.js'],
