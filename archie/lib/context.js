@@ -41,6 +41,11 @@ function resourcesFor(name) {
     dispatcherLogGroup: `/ecs/${name}-dispatcher`,
     dispatcherNamespace: `${name}Dispatcher`,
     cronNamespace: `${name}Cron`,
+    // Secrets, composed from the same knob Terraform composes them from (secrets.tf:44,61). They
+    // live here rather than in each command because a name derived in two places is a name that
+    // drifts in one of them.
+    credentialSecret: `${name}-connector-api-key`,
+    dispatcherSharedSecret: `${name}-dispatcher-shared-secret`,
   };
 }
 

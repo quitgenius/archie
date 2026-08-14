@@ -50,6 +50,8 @@ test('every resource name derives from --name', () => {
     dispatcherLogGroup: '/ecs/agent-gn0p84-dispatcher',
     dispatcherNamespace: 'agent-gn0p84Dispatcher',
     cronNamespace: 'agent-gn0p84Cron',
+    credentialSecret: 'agent-gn0p84-connector-api-key',
+    dispatcherSharedSecret: 'agent-gn0p84-dispatcher-shared-secret',
   });
   // No value may survive a rename — that is the whole invariant.
   for (const v of Object.values(resourcesFor('other'))) {

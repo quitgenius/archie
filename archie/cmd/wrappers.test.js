@@ -1,0 +1,612 @@
+'use strict';
+
+// Tests for the wrapper commands. NO AWS, NO NETWORK, NO SUBPROCESS: every seam these commands have
+// (spawning, the dispatcher/observability modules, clients, clocks) is injected through the 4th
+// `deps` argument, so what is exercised here is the argument translation, the dry-run convention and
+// the refusals — which is all this file owns. The wrapped modules have their own suites.
+
+const { test } = require('node:test');
+const assert = require('node:assert/strict');
+const wrappers = require('./wrappers');
+const { EXIT } = require('../lib/exit');
+const { resourcesFor } = require('../lib/context');
+
+const { lastJson, oneAgent, observabilityEnv, describeSource } = wrappers._internals;
+
+// ── harness ──────────────────────────────────────────────────────────────────────────────────
+
+function makeCtx(over = {}) {
+  const name = over.name || 'agent-gn0p84';
+  return {
+    name,
+    region: 'us-east-1',
+    profile: null,
+    account: '203366135563',
+    dryRun: false,
+    assumeYes: false,
+    json: false,
+    verbosity: 0,
+    timeoutSeconds: null,
+    resources: resourcesFor(name),
+    ...over,
+  };
+}
+
+function makeOut() {
+  const lines = { progress: [], warn: [], verbose: [], failures: [] };
+  return {
+    lines,
+    answer() {},
+    progress: (l) => lines.progress.push(l),
+    verbose: (l) => lines.verbose.push(l),
+    warn: (l) => lines.warn.push(l),
+    failure: (f) => lines.failures.push(f),
+    failureCount: () => lines.failures.length,
+    text: () => [...lines.progress, ...lines.warn, ...lines.verbose].join('\n'),
+  };
+}
+
+const args = (positionals = [], values = {}) => ({ positionals, values });
+
+/** A fake execFile that records invocations and replies from a scripted table. */
+function fakeExec(reply = () => ({ stdout: '', stderr: '', code: 0 })) {
+  const calls = [];
+  const fn = (cmd, argv, opts, cb) => {
+    calls.push({ cmd, argv, env: opts.env, cwd: opts.cwd });
+    const r = reply({ cmd, argv, env: opts.env }) || {};
+    const err = r.code ? Object.assign(new Error(`Command failed: ${cmd}\n${r.stderr || ''}`), { code: r.code }) : null;
+    setImmediate(() => cb(err, r.stdout || '', r.stderr || ''));
+    return { stdout: null, stderr: null };
+  };
+  fn.calls = calls;
+  return fn;
+}
+
+const rejects = async (p, code, re) => {
+  await assert.rejects(p, (e) => {
+    assert.equal(e.exitCode, code, `expected exit ${code}, got ${e.exitCode}: ${e.message}`);
+    if (re) assert.match(`${e.message} ${e.detail || ''}`, re);
+    return true;
+  });
+};
+
+// ── pure helpers ─────────────────────────────────────────────────────────────────────────────
+
+test('lastJson finds the report a script prints after its log lines', () => {
+  assert.deepEqual(lastJson('hydrate: doing things\n{"applied":true,"written":3}\n'), { applied: true, written: 3 });
+  assert.deepEqual(lastJson('a { not json\n{"ok":1}'), { ok: 1 });
+  assert.equal(lastJson('no json at all'), null);
+});
+
+test('one agent at a time — concurrent mutations for one agent lose one another', () => {
+  assert.equal(oneAgent(args(['agent-75lieo'])), 'agent-75lieo');
+  assert.throws(() => oneAgent(args([])), (e) => e.exitCode === EXIT.USAGE);
+  assert.throws(() => oneAgent(args(['a', 'b'])), (e) => e.exitCode === EXIT.USAGE && /read-modify-write/.test(e.detail));
+  // The sanitizer's character class — a DynamoDB key and a CWL literal are both built from this.
+  assert.throws(() => oneAgent(args(["a'; drop"])), (e) => e.exitCode === EXIT.USAGE);
+});
+
+// ONE KNOB. A mixed environment is what produced a board whose metric widgets read archie and whose
+// log widgets read the OpenClaw stack — and the wrong values do not error, they render another
+// system's fleet as if it were yours.
+test('observability env pins every stack-shaped name to --name', () => {
+  const env = observabilityEnv(makeCtx({ name: 'other-stack' }));
+  assert.equal(env.ARCHIE_STACK, 'other-stack');
+  assert.equal(env.DISPATCHER_LOG_GROUP, '/ecs/other-stack-dispatcher');
+  assert.equal(env.DISPATCHER_METRIC_NAMESPACE, 'other-stackDispatcher');
+  assert.equal(env.CRON_METRIC_NAMESPACE, 'other-stackCron');
+  for (const v of Object.values(env)) assert.ok(!String(v).includes('clawdbot'), `"${v}" is not derived from --name`);
+});
+
+// ── config hydrate ───────────────────────────────────────────────────────────────────────────
+
+test('config hydrate prints the three idempotency consequences BEFORE writing, and dry-run writes nothing', async () => {
+  const out = makeOut();
+  const execFile = fakeExec(({ argv }) => (argv[0] === 'ls-remote' ? { stdout: 'deadbeefcafe\trefs/heads/main\n' } : { stdout: '' }));
+  const r = await wrappers['config hydrate'](makeCtx({ dryRun: true }), args([], {}), out, { execFile, env: {} });
+
+  assert.equal(r.dryRun, true);
+  assert.equal(r.table, 'agent-gn0p84-config');
+  assert.equal(r.consequences.length, 3);
+  assert.match(out.text(), /PUT-ONLY and never deletes/);
+  assert.match(out.text(), /GRANT#\* is RECOMPUTED AND OVERWRITTEN/);
+  assert.match(out.text(), /rewritten WHOLESALE/);
+  // Only the ref resolution ran; hydrate.mjs was never invoked.
+  assert.deepEqual(execFile.calls.map((c) => c.cmd), ['git']);
+});
+
+test('config hydrate resolves the ref rather than tracking a moving one silently', async () => {
+  const out = makeOut();
+  const execFile = fakeExec(() => ({ stdout: 'deadbeefcafe1234\trefs/heads/main\n' }));
+  const r = await wrappers['config hydrate'](makeCtx({ dryRun: true }), args([], {}), out, { execFile, env: {} });
+  assert.equal(r.source.sha, 'deadbeefcafe1234');
+  assert.match(describeSource(r.source), /@ deadbeefcafe/);
+
+  // ...and when it CANNOT be resolved, that is stated. Silence is the failure mode being closed.
+  const out2 = makeOut();
+  const failing = fakeExec(() => ({ code: 128, stderr: 'fatal: could not read Username' }));
+  const r2 = await wrappers['config hydrate'](makeCtx({ dryRun: true }), args([], {}), out2, { execFile: failing, env: {} });
+  assert.equal(r2.source.sha, null);
+  assert.match(out2.lines.warn.join('\n'), /MOVING ref/);
+});
+
+test('config hydrate --no-dry-run invokes hydrate.mjs with the table and ref derived from the context', async () => {
+  const out = makeOut();
+  const execFile = fakeExec(() => ({ stdout: 'hydrate: done — DynamoDB refreshed\n' }));
+  await wrappers['config hydrate'](makeCtx({ name: 'agent-b450oe' }), args([], { ref: 'topic', 'sandra-dir': '/tmp/sandra' }), out, { execFile, env: {} });
+
+  const node = execFile.calls.find((c) => c.cmd === 'node');
+  assert.ok(node.argv[0].endsWith('config-resolver/hydrate.mjs'));
+  assert.equal(node.env.AGENT_CONFIG_TABLE, 'agent-b450oe-config');
+  assert.equal(node.env.SANDRA_DIR, '/tmp/sandra');
+  assert.equal(node.env.SANDRA_REF, 'topic');
+  assert.equal(node.env.AWS_REGION, 'us-east-1');
+});
+
+// ── config hydrate-conversations ─────────────────────────────────────────────────────────────
+
+test('config hydrate-conversations maps dry-run onto the script\'s own APPLY gate', async () => {
+  const report = '{"dryRun":true,"agents":2,"conversations":7,"malformed":[]}';
+  const dry = fakeExec(() => ({ stdout: report }));
+  const r = await wrappers['config hydrate-conversations'](
+    makeCtx({ dryRun: true }), args([], { file: '/tmp/conv.json' }), makeOut(), { execFile: dry, env: {} },
+  );
+  assert.equal(r.conversations, 7);
+  assert.equal(dry.calls[0].env.HYDRATE_APPLY, undefined, 'dry-run must not set HYDRATE_APPLY');
+  assert.deepEqual(dry.calls[0].argv.slice(1), ['--file', '/tmp/conv.json']);
+
+  const apply = fakeExec(() => ({ stdout: '{"applied":true,"written":7,"skipped-older":1,"errors":[]}' }));
+  await wrappers['config hydrate-conversations'](makeCtx(), args([], { file: '/tmp/conv.json' }), makeOut(), { execFile: apply, env: {} });
+  assert.equal(apply.calls[0].env.HYDRATE_APPLY, '1');
+});
+
+test('config hydrate-conversations requires exactly one source, and never exposes --force', async () => {
+  const deps = { execFile: fakeExec(), env: {} };
+  await rejects(wrappers['config hydrate-conversations'](makeCtx(), args([], {}), makeOut(), deps), EXIT.USAGE, /--file|--s3/);
+  await rejects(
+    wrappers['config hydrate-conversations'](makeCtx(), args([], { file: 'a', s3: 's3://b/c' }), makeOut(), deps),
+    EXIT.USAGE, /mutually exclusive/,
+  );
+  // The 6h freshness guard lives in the script and has no CLI override: a snapshot older than a
+  // prune resurrects retired conversations, and no ConditionExpression can catch it.
+  const src = require('node:fs').readFileSync(`${__dirname}/wrappers.js`, 'utf8');
+  assert.ok(!src.includes("'--force'") || !/hydrateConversations[\s\S]{0,600}--force/.test(src), 'no --force pass-through');
+});
+
+test('malformed rows come back as per-unit failures, not a collapsed exit code', async () => {
+  const out = makeOut();
+  const execFile = fakeExec(() => ({ code: 1, stdout: '{"dryRun":true,"agents":1,"conversations":2,"malformed":[{"agentId":"agent-75lieo","threadTs":"1.1","error":"bad conv"}]}' }));
+  const r = await wrappers['config hydrate-conversations'](
+    makeCtx({ dryRun: true }), args([], { file: '/tmp/c.json' }), out, { execFile, env: {} },
+  );
+  assert.equal(r.conversations, 2);
+  assert.equal(out.lines.failures.length, 1);
+  assert.equal(out.lines.failures[0].agent, 'agent-75lieo');
+});
+
+test('a subprocess failure keeps the child stderr — a region mismatch must not look like an unpublished image', async () => {
+  const execFile = fakeExec(() => ({ code: 2, stderr: 'ResourceNotFoundException: table agent-gn0p84-config not found in us-east-2' }));
+  await assert.rejects(
+    wrappers['config hydrate'](makeCtx(), args([], { 'sandra-dir': '/tmp/s' }), makeOut(), { execFile, env: {} }),
+    (e) => {
+      assert.equal(e.exitCode, EXIT.FAILED);
+      assert.match(e.detail, /us-east-2/);
+      assert.match(e.cause.stderr, /ResourceNotFoundException/);
+      return true;
+    },
+  );
+});
+
+// ── config validate / parity ─────────────────────────────────────────────────────────────────
+
+test('config validate: a check that cannot RUN is not a check that passed', async () => {
+  const out = makeOut();
+  const deps = {
+    execFile: fakeExec(() => ({ stdout: '{}' })),
+    env: {},
+    fs: { existsSync: () => false, readdirSync: () => [], readFileSync: () => '{}' },
+  };
+  await rejects(wrappers['config validate'](makeCtx(), args(), out, deps), EXIT.DRIFT, /unrunnable/);
+  assert.match(out.lines.warn.join('\n'), /UNRUNNABLE/);
+});
+
+test('config validate runs the routing single-source invariant from routing-normalize itself', async () => {
+  const out = makeOut();
+  const routing = {
+    'one.json': { channels: ['C1'] },
+    'two.json': { channels: ['C1'], dm_users: ['U1'] },     // violates 1 agent = 1 source
+  };
+  const deps = {
+    execFile: fakeExec(() => ({ stdout: '{"HARD":{}}' })),
+    env: {},
+    fs: {
+      existsSync: () => true,
+      readdirSync: () => Object.keys(routing),
+      readFileSync: (p) => JSON.stringify(routing[p.split('/').pop()]),
+    },
+    modules: {
+      routingNormalize: async () => ({
+        normalizeRouting: (id, r) => r,
+        assertSingleSource: (id, r) => {
+          const n = (r.channels || []).length + (r.dm_users || []).length;
+          if (n > 1) throw new Error(`agent "${id}" routes ${n} sources`);
+          return r;
+        },
+      }),
+    },
+  };
+  await rejects(wrappers['config validate'](makeCtx(), args(), out, deps), EXIT.DRIFT, /routing-single-source/);
+});
+
+test('config parity says so when a round-trip degrades to self-consistency', async () => {
+  const out = makeOut();
+  const deps = {
+    execFile: fakeExec(() => ({ stdout: 'PARITY GREEN' })),
+    env: {},
+    fs: { existsSync: () => true },
+  };
+  const r = await wrappers['config parity'](makeCtx(), args(), out, deps);
+  assert.equal(r.ok, true);
+  assert.match(out.lines.warn.join('\n'), /AGENT_VE2BNZS_DIR unset/);
+  assert.match(out.lines.warn.join('\n'), /SANDRA_SKILLS_DIR unset/);
+  // Every gate got this deployment's table, not the schema default.
+  for (const c of deps.execFile.calls) assert.equal(c.env.AGENT_CONFIG_TABLE, 'agent-gn0p84-config');
+});
+
+// ── grants ───────────────────────────────────────────────────────────────────────────────────
+
+function grantDeps({ catalogSkills = 4, storedGrant = { slack: { sources: ['config'] } }, config = { skills: [] }, reconciled = ['slack', 'demo_warehouse'], putResult = { roleName: 'agentcore/agent-75lieo', applied: true } } = {}) {
+  const put = [];
+  const doc = {
+    send: async (cmd) => {
+      const key = cmd.input.Key;
+      if (key.sk === 'CONFIG') return config === null ? {} : { Item: { data: JSON.stringify(config) } };
+      if (String(key.pk).startsWith('GRANT#')) {
+        return storedGrant === null ? {} : { Item: { data: typeof storedGrant === 'string' ? storedGrant : JSON.stringify(storedGrant) } };
+      }
+      return {};
+    },
+  };
+  return {
+    put,
+    deps: {
+      env: {},
+      clients: { doc, iam: {}, iamCmds: {}, sts: {}, stsCmds: {} },
+      modules: {
+        marketplace: () => ({
+          loadMarketplaceDataFromDdb: async () => (catalogSkills === null ? { error: 'AccessDenied' } : { catalogSkills, installable: 1, agents: 1 }),
+          getInstalls: () => ({ installs: { 'agent-75lieo': { demo_warehouse: {} } } }),
+          getCatalog: () => ({ skills: { demo_warehouse: {} } }),
+          _reconcileSkillGrant: async () => reconciled,
+        }),
+        derivedRole: () => ({ putDerivedGrants: async (a) => { put.push(a); return putResult; } }),
+        schema: async () => ({
+          agentGrantKey: (id) => ({ pk: `GRANT#${id}`, sk: 'SCOPE#*' }),
+          agentConfigKey: (id) => ({ pk: `AGENT#${id}`, sk: 'CONFIG' }),
+          grantedCaps: (d) => Object.keys(d || {}),
+        }),
+        caps: async () => ({
+          capsWithSources: () => ({ slack: { sources: ['config'] }, demo_warehouse: { sources: ['skill:demo_warehouse'] } }),
+          grantedCaps: (d) => Object.keys(d || {}),
+        }),
+      },
+    },
+  };
+}
+
+// The pair that must not be conflated: reconcile RECOMPUTES then writes both halves; apply rewrites
+// IAM only, from the stored grant.
+test('grants reconcile recomputes the grant AND rewrites the role policy', async () => {
+  const { deps, put } = grantDeps();
+  const r = await wrappers['grants reconcile'](makeCtx(), args(['agent-75lieo']), makeOut(), deps);
+  assert.deepEqual(r.caps, ['slack', 'demo_warehouse']);
+  assert.equal(put.length, 1);
+  assert.deepEqual(put[0].caps, ['slack', 'demo_warehouse']);
+  assert.equal(put[0].table, 'agent-gn0p84-config');
+  assert.equal(put[0].agentId, 'agent-75lieo');
+});
+
+test('grants apply rewrites IAM ONLY, from GRANT#* as stored — no recomputation', async () => {
+  const { deps, put } = grantDeps({ storedGrant: { slack: { sources: ['config'] }, github: { sources: ['skill:gh'] } } });
+  // A reconcile from this fixture would produce [slack, demo_warehouse]; apply must not.
+  const r = await wrappers['grants apply'](makeCtx(), args(['agent-75lieo']), makeOut(), deps);
+  assert.deepEqual(r.caps, ['slack', 'github']);
+  assert.deepEqual(put[0].caps, ['slack', 'github']);
+});
+
+test('reconcile SKIPS when the skill catalog is empty — it would derive no skill caps and strip everything', async () => {
+  const { deps } = grantDeps({ catalogSkills: 0 });
+  await rejects(wrappers['grants reconcile'](makeCtx(), args(['agent-75lieo']), makeOut(), deps), EXIT.REFUSED, /grants apply/);
+});
+
+test('a FAILED catalog read is never treated as an empty catalog', async () => {
+  const { deps } = grantDeps({ catalogSkills: null });
+  await rejects(wrappers['grants reconcile'](makeCtx(), args(['agent-75lieo']), makeOut(), deps), EXIT.FAILED, /AccessDenied/);
+});
+
+test('an unparseable stored grant aborts rather than becoming an empty caps list', async () => {
+  // "A miss and a failure are different things" — an expired token mid-run was once enough to
+  // rewrite the fleet's skill library with nothing failing.
+  const { deps, put } = grantDeps({ storedGrant: 'not json{' });
+  await rejects(wrappers['grants apply'](makeCtx(), args(['agent-75lieo']), makeOut(), deps), EXIT.REFUSED, /unparseable/);
+  assert.equal(put.length, 0, 'nothing may be written from a bad read');
+});
+
+test('an ABSENT grant still writes the policy — it is the agent\'s only config-table access', async () => {
+  const { deps, put } = grantDeps({ storedGrant: null });
+  const out = makeOut();
+  const r = await wrappers['grants apply'](makeCtx(), args(['agent-75lieo']), out, deps);
+  assert.deepEqual(r.caps, []);
+  assert.equal(put.length, 1, 'empty caps must still PutRolePolicy — deleting it broke the next boot');
+  assert.match(out.lines.warn.join('\n'), /no GRANT#agent-75lieo/);
+});
+
+test('a missing role is reported, not thrown — the cold provision builds it', async () => {
+  const { deps } = grantDeps({ putResult: { roleName: 'agentcore/new-agent', applied: false, reason: 'role-absent' } });
+  const out = makeOut();
+  const r = await wrappers['grants apply'](makeCtx(), args(['new-agent']), out, deps);
+  assert.equal(r.iamApplied, false);
+  assert.equal(r.reason, 'role-absent');
+  assert.match(out.lines.warn.join('\n'), /cold provision/);
+});
+
+test('reconcile refuses an agent with no CONFIG item — an absent config is not a config with no caps', async () => {
+  const { deps } = grantDeps({ config: null });
+  await rejects(wrappers['grants reconcile'](makeCtx(), args(['ghost']), makeOut(), deps), EXIT.REFUSED, /empty config/);
+});
+
+test('grants dry-run previews the diff and writes nothing', async () => {
+  const { deps, put } = grantDeps();
+  const r = await wrappers['grants reconcile'](makeCtx({ dryRun: true }), args(['agent-75lieo']), makeOut(), deps);
+  assert.equal(r.dryRun, true);
+  assert.deepEqual(r.added, ['demo_warehouse']);
+  assert.equal(put.length, 0);
+});
+
+// ── cron ─────────────────────────────────────────────────────────────────────────────────────
+
+function cronDeps({ hydrated = false, jobs = [], bodies = [{ jobId: 'j1', enabled: true }, { jobId: 'j2', enabled: false }], needsReview = [{ jobId: 'j2' }] } = {}) {
+  const posted = [];
+  const api = {
+    isHydrated: async () => hydrated,
+    markHydrated: async () => {},
+    add: async (b) => { posted.push(b); },
+    list: async () => jobs,
+  };
+  return {
+    posted,
+    deps: {
+      env: { MOUNT_PATH: '/mnt/agents', MANAGER_API_URL: 'http://dispatcher:9090', DISPATCHER_SHARED_SECRET: 's' },
+      managerApi: api,
+      now: () => 1_700_000_000_000,
+      modules: {
+        cronHydrator: () => ({
+          readAgentCron: () => ({ jobs: bodies.map((b) => ({ id: b.jobId })), state: {}, entities: {} }),
+          buildBodies: () => ({ bodies, skipped: [], degraded: [], needsReview, overridden: [], dropped: [], split: [], decisionErrors: [], benign: [] }),
+          hydrateAgent: async () => { for (const b of bodies) await api.add(b); return { posted: bodies.length, errors: [], alreadyHydrated: false }; },
+          createManagerApi: () => api,
+        }),
+      },
+    },
+  };
+}
+
+test('cron hydrate refuses to re-run after the flip, and says what a re-run would resurrect', async () => {
+  const { deps, posted } = cronDeps({ hydrated: true });
+  const out = makeOut();
+  await rejects(wrappers['cron hydrate'](makeCtx(), args(['agent-75lieo']), out, deps), EXIT.REFUSED, /ONE-TIME-AT-FLIP|--force/);
+  assert.match(out.lines.progress.join('\n'), /would post 2 \(1 ENABLED/);
+  assert.equal(posted.length, 0);
+});
+
+test('--force prints the count it would resurrect and still needs --yes', async () => {
+  const forced = cronDeps({ hydrated: true });
+  const out = makeOut();
+  await rejects(
+    wrappers['cron hydrate'](makeCtx(), args(['agent-75lieo'], { force: true }), out, forced.deps),
+    EXIT.REFUSED, /would re-seed 2 job\(s\), 1 of them ENABLED/,
+  );
+  assert.equal(forced.posted.length, 0);
+
+  const ok = cronDeps({ hydrated: true });
+  const r = await wrappers['cron hydrate'](makeCtx({ assumeYes: true }), args(['agent-75lieo'], { force: true }), makeOut(), ok.deps);
+  assert.equal(r.posted, 2);
+  assert.equal(ok.posted.length, 2);
+}, { concurrency: false });
+
+test('cron hydrate dry-run posts nothing', async () => {
+  const { deps, posted } = cronDeps();
+  const r = await wrappers['cron hydrate'](makeCtx({ dryRun: true }), args(['agent-75lieo']), makeOut(), deps);
+  assert.equal(r.dryRun, true);
+  assert.equal(r.wouldPost, 2);
+  assert.equal(posted.length, 0);
+});
+
+test('cron commands refuse without a manager API URL — the store has exactly one writer', async () => {
+  const { deps } = cronDeps();
+  const noUrl = { ...deps, managerApi: undefined, env: { MOUNT_PATH: '/mnt/agents' } };
+  await rejects(wrappers['cron list'](makeCtx(), args(['agent-75lieo']), makeOut(), noUrl), EXIT.REFUSED, /MANAGER_API_URL/);
+  await rejects(wrappers['cron hydrate'](makeCtx(), args(['agent-75lieo']), makeOut(), noUrl), EXIT.REFUSED, /MANAGER_API_URL/);
+});
+
+test('cron hydrate refuses without the read-only parent mount', async () => {
+  const { deps } = cronDeps();
+  await rejects(
+    wrappers['cron hydrate'](makeCtx(), args(['agent-75lieo']), makeOut(), { ...deps, env: { MANAGER_API_URL: 'http://x' } }),
+    EXIT.REFUSED, /MOUNT_PATH/,
+  );
+});
+
+test('cron list goes through the manager API', async () => {
+  const { deps } = cronDeps({ jobs: [{ jobId: 'a', enabled: true }, { jobId: 'b', enabled: false }] });
+  const r = await wrappers['cron list'](makeCtx(), args(['agent-75lieo']), makeOut(), deps);
+  assert.equal(r.count, 2);
+  assert.equal(r.enabled, 1);
+});
+
+test('cron arm/disarm report the deployed switch and refuse to drift from Terraform', async () => {
+  const armed = { ecsCronEnabled: async () => ({ taskDefinition: 'td:9', value: true, raw: 'true' }) };
+  const r = await wrappers['cron arm'](makeCtx(), args(), makeOut(), armed);
+  assert.deepEqual([r.armed, r.changed], [true, false]);
+
+  await rejects(wrappers['cron disarm'](makeCtx(), args(), makeOut(), armed), EXIT.REFUSED, /var\.cron_enabled|dispatcher\.tf/);
+});
+
+// ── dashboard / metrics ──────────────────────────────────────────────────────────────────────
+
+test('dashboard deploy passes only ctx-derived targets, and prints them', async () => {
+  const out = makeOut();
+  const execFile = fakeExec(() => ({ stdout: '{"dashboard":"agentcore-fleet","widgets":31,"checkErrors":[],"stackMismatches":[]}' }));
+  const r = await wrappers['dashboard deploy'](makeCtx({ name: 'agent-b450oe' }), args([], {}), out, {
+    execFile, env: { DISPATCHER_LOG_GROUP: '/ecs/agent-4ggvzl-dispatcher', ARCHIE_STACK: 'agent-4ggvzl' },
+  });
+  assert.equal(r.widgets, 31);
+  const env = execFile.calls[0].env;
+  assert.equal(env.ARCHIE_STACK, 'agent-b450oe');
+  assert.equal(env.DISPATCHER_LOG_GROUP, '/ecs/agent-b450oe-dispatcher', 'an inherited override must not win');
+  assert.equal(env.CRON_METRIC_NAMESPACE, 'agent-b450oeCron');
+  assert.match(out.lines.progress.join('\n'), /\/ecs\/agent-b450oe-dispatcher/);
+});
+
+test('dashboard deploy fails on a stack mismatch — the other stack is real, populated and wrong', async () => {
+  const execFile = fakeExec(() => ({ stdout: '{"checkErrors":["ListMetrics X: AccessDenied"],"stackMismatches":[{"key":"DISPATCHER_LOG_GROUP","dashboard":"/ecs/agent-gn0p84-dispatcher","deployed":"/ecs/agent-4ggvzl-dispatcher"}]}' }));
+  const out = makeOut();
+  await rejects(wrappers['dashboard deploy'](makeCtx(), args([], {}), out, { execFile, env: {} }), EXIT.DRIFT, /another stack/);
+  // A check that could not RUN is not a check that passed.
+  assert.match(out.lines.warn.join('\n'), /could not run: ListMetrics X: AccessDenied/);
+});
+
+test('dashboard deploy honours dry-run', async () => {
+  const execFile = fakeExec();
+  const r = await wrappers['dashboard deploy-latency'](makeCtx({ dryRun: true }), args([], {}), makeOut(), { execFile, env: {} });
+  assert.equal(r.dryRun, true);
+  assert.equal(execFile.calls.length, 0);
+});
+
+function metricsDeps({ status = 'Complete', results = [] } = {}) {
+  const started = [];
+  const Q = {
+    INSIGHTS: { fleet_errors: { logGroups: ['/ecs/agent-gn0p84-dispatcher'], query: 'filter level >= 50' } },
+    METRICS: { coldBoot: { expr: 'SEARCH(\'{AgentCore/Pi,Agent} MetricName="ColdBootMs"\', \'Average\')', label: 'cold' } },
+    scopedTurnsQuery: (a) => ({ logGroups: ['aws/spans'], query: `filter agent = '${a}'` }),
+    scopedMetricExpr: (n, a) => (n === 'coldBoot' ? `SEARCH('… Agent="${a}"')` : null),
+    assertSafeScopeLiteral: (v) => {
+      if (!/^[A-Za-z0-9._-]+$/.test(String(v))) throw new Error(`scope "${v}" is not a safe query literal`);
+      return v;
+    },
+  };
+  return {
+    started,
+    deps: {
+      env: {},
+      now: () => 1_700_000_000_000,
+      sleep: async () => {},
+      modules: { insights: () => Q },
+      logsClient: {
+        send: async (cmd) => {
+          if (cmd.input.queryString) { started.push(cmd.input); return { queryId: 'q1' }; }
+          return { status, results, statistics: { recordsMatched: results.length } };
+        },
+      },
+      cwClient: { send: async () => ({ MetricDataResults: [{ Label: 'cold', StatusCode: 'Complete', Timestamps: [], Values: [] }] }) },
+    },
+  };
+}
+
+test('metrics query polls to COMPLETE, and 0 rows is a valid answer', async () => {
+  const { deps, started } = metricsDeps();
+  const out = makeOut();
+  const r = await wrappers['metrics query'](makeCtx(), args(['fleet_errors'], {}), out, deps);
+  assert.equal(r.status, 'Complete');
+  assert.equal(r.rows, 0);
+  assert.deepEqual(started[0].logGroupNames, ['/ecs/agent-gn0p84-dispatcher']);
+  assert.match(out.lines.progress.join('\n'), /0 rows/);
+  assert.match(out.lines.progress.join('\n'), /ingestion lag/);
+});
+
+test('metrics query maps rows out of the CloudWatch field/value shape', async () => {
+  const { deps } = metricsDeps({ results: [[{ field: 'agent', value: 'agent-75lieo' }, { field: 'msg', value: 'boom' }]] });
+  const r = await wrappers['metrics query'](makeCtx(), args(['fleet_errors'], {}), makeOut(), deps);
+  assert.deepEqual(r.results, [{ agent: 'agent-75lieo', msg: 'boom' }]);
+});
+
+test('--agent uses the SCOPED query, and refuses when a query has no scoped form', async () => {
+  const { deps, started } = metricsDeps();
+  await wrappers['metrics query'](makeCtx(), args(['turns'], { agent: 'agent-75lieo' }), makeOut(), deps);
+  assert.match(started[0].queryString, /filter agent = 'agent-75lieo'/);
+
+  // A fleet query with --agent would silently answer for the whole fleet.
+  await rejects(
+    wrappers['metrics query'](makeCtx(), args(['fleet_errors'], { agent: 'agent-75lieo' }), makeOut(), metricsDeps().deps),
+    EXIT.REFUSED, /no agent-scoped form/,
+  );
+});
+
+test('a metric that cannot be pinned to an agent fails CLOSED', async () => {
+  const { deps } = metricsDeps();
+  deps.modules.insights().METRICS.invocations = { expr: 'SEARCH(\'{AWS/Bedrock-AgentCore}\')', label: 'inv' };
+  await rejects(
+    wrappers['metrics query'](makeCtx(), args(['invocations'], { agent: 'agent-75lieo' }), makeOut(), deps),
+    EXIT.REFUSED, /cannot be scoped/,
+  );
+});
+
+test('an unsafe agent literal is a usage error — CWL has no bind parameters', async () => {
+  const { deps } = metricsDeps();
+  await rejects(
+    wrappers['metrics query'](makeCtx(), args(['turns'], { agent: "x' | fields @message" }), makeOut(), deps),
+    EXIT.USAGE, /safe query literal/,
+  );
+});
+
+test('metrics query with no name lists the curated set instead of guessing', async () => {
+  const { deps } = metricsDeps();
+  const r = await wrappers['metrics query'](makeCtx(), args([], {}), makeOut(), deps);
+  assert.deepEqual(r.fleetInsights, ['fleet_errors']);
+  assert.ok(r.scopedInsights.includes('turns'));
+});
+
+test('a query that never completes times out with 124, not a hang', async () => {
+  const { deps } = metricsDeps({ status: 'Running' });
+  let t = 0;
+  deps.now = () => (t += 60_000);
+  await rejects(
+    wrappers['metrics query'](makeCtx({ timeoutSeconds: 30 }), args(['fleet_errors'], {}), makeOut(), deps),
+    EXIT.TIMEOUT, /--timeout/,
+  );
+});
+
+// ── client construction ──────────────────────────────────────────────────────────────────────
+
+// THE FAILURE SHAPE THIS CLOSES: a wrong client/package name only fails when a real --profile is
+// used, and every other test here injects its clients — so the suite stays green while the binary
+// breaks on its first live run. These two assert the DEFAULT (uninjected) path without any AWS call:
+// constructing a client is local, only sending is not.
+test('every makeClient call site names an installed package and a real export', () => {
+  const src = require('node:fs').readFileSync(`${__dirname}/wrappers.js`, 'utf8');
+  const sites = [...src.matchAll(/makeClient\(ctx, '([^']+)', '([^']+)'/g)];
+  assert.ok(sites.length >= 5, `expected the AWS-touching commands to build clients, found ${sites.length}`);
+  for (const [, pkg, exportName] of sites) {
+    assert.equal(typeof require(pkg)[exportName], 'function', `${pkg} exports no ${exportName}`);
+  }
+});
+
+test('the default client path builds with a --profile, without reaching AWS', () => {
+  const clients = wrappers._internals.grantClients(makeCtx({ profile: 'sandbox' }), { env: {} });
+  for (const k of ['doc', 'iam', 'sts']) assert.ok(clients[k], `no ${k} client`);
+  assert.equal(typeof clients.iamCmds.PutRolePolicyCommand, 'function');
+});
+
+// ── the contract with the registry ───────────────────────────────────────────────────────────
+
+test('every declared wrappers command resolves, and no verb-keyed export can shadow another noun', () => {
+  const { COMMANDS, load } = require('../lib/registry');
+  const keys = Object.entries(COMMANDS).filter(([, m]) => m.module === 'wrappers').map(([k]) => k);
+  assert.ok(keys.length >= 13);
+  for (const key of keys) assert.equal(typeof load(key, COMMANDS[key]), 'function', `${key} did not resolve`);
+  // registry.load() prefers mod[verb]; `config hydrate` and `cron hydrate` share the verb `hydrate`,
+  // so a verb-keyed export would route one into the other. Neither may exist.
+  for (const verb of ['hydrate', 'deploy', 'apply', 'list', 'query', 'validate']) {
+    assert.equal(wrappers[verb], undefined, `exporting "${verb}" would shadow another noun's command`);
+  }
+});

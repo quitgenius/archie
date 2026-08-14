@@ -79,8 +79,8 @@ const COMMANDS = {
   'config parity': { options: {}, module: 'wrappers', task: 'W1-G', needsAws: true, summary: 'config vs deployed parity checks' },
   'grants reconcile': { options: {}, module: 'wrappers', task: 'W1-G', needsAws: true, positional: 'agent', summary: 'recompute GRANT#*, write it, then rewrite the role policy' },
   'grants apply': { options: {}, module: 'wrappers', task: 'W1-G', needsAws: true, positional: 'agent', summary: 'rewrite the role policy only, from GRANT#* as stored' },
-  'cron hydrate': { options: { force:{type:'boolean'} }, module: 'wrappers', task: 'W1-G', needsAws: true, positional: 'agent', summary: 'fold an agent EFS cron store into the dispatcher store' },
-  'cron list': { options: {}, module: 'wrappers', task: 'W1-G', needsAws: true, summary: 'list scheduled jobs via the manager API' },
+  'cron hydrate': { options: { force:{type:'boolean'} }, module: 'wrappers', task: 'W1-G', needsAws: true, dryRunDefault: true, positional: 'agent', summary: 'fold an agent EFS cron store into the dispatcher store' },
+  'cron list': { options: {}, module: 'wrappers', task: 'W1-G', needsAws: true, positional: 'agent', summary: 'list scheduled jobs via the manager API' },
   'cron arm': { options: {}, module: 'wrappers', task: 'W1-G', needsAws: true, summary: 'arm the cron scheduler' },
   'cron disarm': { options: {}, module: 'wrappers', task: 'W1-G', needsAws: true, summary: 'disarm the cron scheduler' },
   'dashboard deploy': { options: { dashboard:{type:'string'} }, module: 'wrappers', task: 'W1-G', needsAws: true, summary: 'PutDashboard for the fleet board' },
@@ -153,7 +153,18 @@ function load(key, command, { require: req = require } = {}) {
     throw e;
   }
   const verb = key.includes(' ') ? key.split(' ').slice(1).join(' ') : key;
-  const handler = mod[verb] || mod[key];
+  // FULL KEY FIRST, verb second — and the order is a safety property, not a preference.
+  //
+  // Verbs are NOT unique across nouns: `runtime gc` and `access-point gc` share `gc`, as do
+  // `config hydrate` and `cron hydrate`. With verb-first precedence, a module that exported a bare
+  // `gc` would answer for BOTH commands — so `archie access-point gc --no-dry-run` would run the
+  // runtime reaper and delete 208 runtimes. That is not hypothetical: two modules independently
+  // avoided it by exporting only full keys, which made correctness depend on every future author
+  // noticing the collision.
+  //
+  // Key-first makes it safe by construction: an unambiguous full key always wins, and the verb
+  // fallback still serves the majority of commands whose verb is unique to their noun.
+  const handler = mod[key] || mod[verb];
   if (typeof handler !== 'function') {
     throw new CliError(`\`archie ${key}\` is declared but cmd/${command.module}.js exports no "${verb}"`, {
       code: EXIT.USAGE,
