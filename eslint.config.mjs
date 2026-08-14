@@ -417,4 +417,21 @@ export default [
     plugins: { n, local },
     rules: bugRules,
   },
+
+  // ── RATCHET ──────────────────────────────────────────────────────────────
+  // Packages already at zero silent catches are pinned there at `error`. The rule stays `warn`
+  // tree-wide so the 126-item backlog stays visible without blocking; these two are the part that
+  // can no longer regress.
+  //
+  // config-resolver is the one that carries weight: it is IN the agent image's lint stage
+  // (`npx eslint clawdbot/agentcore-pi clawdbot/config-resolver`), so a new silent catch there now
+  // fails the BUILD, not just a report someone has to read. agentcore-observability is hand-run
+  // tooling outside both Dockerfile lint stages, so pinning it is a report-time guard only.
+  //
+  // Move a package here the moment it reaches zero — that is the whole ratchet. Do NOT add one that
+  // still has sites "to fix later"; a failing gate gets disabled, and then it protects nothing.
+  {
+    files: ['clawdbot/config-resolver/**/*.{mjs,cjs}', 'clawdbot/agentcore-observability/**/*.{js,cjs}'],
+    rules: { 'local/no-statementless-catch': 'error' },
+  },
 ];
