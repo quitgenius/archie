@@ -84,7 +84,14 @@ function parse(argv, { commandOptions = {} } = {}) {
     allowPositionals: true,
     strict: true,
   });
-  return { found, values: strict.values, positionals: strict.positionals };
+  // RE-RESOLVE from the STRICT positionals. Pass 1 knows only the global options, so a
+  // command-specific flag's VALUE is parsed as a positional there — `generation stage --concurrency 9`
+  // yields loose positionals ['generation','stage','9']. Handing that to the command means `9`
+  // arrives as its id argument, which for `release set` or `generation taint` is a flag value
+  // masquerading as a generation. Only the strict pass, which knows the command's own options, has
+  // the real positionals; pass 1 exists solely to discover WHICH command that is.
+  const resolved = resolve(strict.positionals) || found;
+  return { found: resolved, values: strict.values, positionals: strict.positionals };
 }
 
 async function main(argv = process.argv.slice(2), deps = {}) {

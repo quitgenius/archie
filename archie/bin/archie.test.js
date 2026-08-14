@@ -215,3 +215,14 @@ test('every declared command has an options object, so none can be unusable', ()
     assert.ok(meta.options && typeof meta.options === 'object', `${key} declares no options`);
   }
 });
+
+test('a command-specific flag VALUE never arrives as a positional', async () => {
+  // Pass 1 knows only the global options, so `--concurrency 9` parses as a boolean flag plus a
+  // positional `9` there. Resolving args from that pass handed `9` to the command as its id —
+  // for `release set` or `generation taint` that is a flag value masquerading as a generation.
+  const { parse } = require('./archie');
+  assert.deepEqual(parse(['generation', 'stage', '--concurrency', '9']).found.args, []);
+  assert.deepEqual(parse(['generation', 'taint', 'rel-1', '--reason', 'bad image']).found.args, ['rel-1']);
+  assert.deepEqual(parse(['release', 'set', '--hotfix', 'rel-1']).found.args, ['rel-1']);
+  assert.deepEqual(parse(['runtime', 'gc', '--keep', '3']).found.args, []);
+});
