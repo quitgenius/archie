@@ -6,6 +6,8 @@
 //   npx eslint .                      whole tree, ~2s
 //   npx eslint slack-dispatcher       one package
 //   npm run lint                      inside any covered package
+//   npm run swallowed-errors          the §8(d) backlog count, per package
+//   npm test                          unit-tests the one LOCAL rule below
 //
 // The `files` patterns below are resolved relative to the WORKING DIRECTORY, not
 // to this file, so eslint must be run from docker/. That is why each package's
@@ -71,6 +73,97 @@
 import n from 'eslint-plugin-n';
 import globals from 'globals';
 
+// ─────────────────────────────────────────────────────────────────────────────
+// LOCAL RULE: local/no-statementless-catch
+// ─────────────────────────────────────────────────────────────────────────────
+// SWALLOWED-ERRORS-PLAN.md §8(d), Option B. Kept INLINE rather than in its own
+// file on purpose: both Dockerfiles' lint stages COPY exactly one config file
+// (`COPY eslint.config.mjs ./` / `COPY --from=lintroot eslint.config.mjs ./`),
+// so a second file means two more COPY lines to keep in sync forever, for ~30
+// lines of rule. It is exported by name below so the unit test can import it
+// (`eslint.config.test.mjs`, `npm test` from docker/) without an eslint run.
+//
+// WHY IT EXISTS. `no-empty` was meant to be the ratchet's instrument and CANNOT
+// BE: it does not report a block that contains a comment, and has no option to.
+// Measured on this tree it reports exactly ONE site — a comment-free `catch {}`
+// in a test helper — i.e. zero of the backlog, nearly all of which carries an
+// explanatory comment. A comment is precisely what the plan's standard (§2)
+// calls insufficient: the failure must LOG, COUNT or be CLASSIFIED.
+//
+// THE PREDICATE is "a rejection path that runs zero STATEMENTS". Comments are
+// not statements — they live on the AST's comment list, not in BlockStatement
+// .body — so every form below reports except the last:
+//
+//   catch {}                                 -> reported (CatchClause, 0 stmts)
+//   catch (e) { /* absent */ }               -> reported
+//   catch (e) { // peer gone                 -> reported
+//   }
+//   p.catch(() => {})                        -> reported (handler, 0 stmts)
+//   p.catch(function () { /* best effort */ })-> reported
+//   p.then(ok, () => {})                     -> reported
+//   catch (e) { log.warn(e) }                -> NOT reported (1 statement)
+//
+// WHY THE HANDLER FORMS ARE IN SCOPE — MEASURED, not assumed. A pure CatchClause
+// predicate finds 82 sites here. `.catch(() => {})` adds 53 more and `.then(_, ()
+// => {})` 2, for 137. The 55 are not a fringe: they are the whole of the plan's
+// §8(b) "best-effort teardown" family (ranked #10 in §4, remediated by the
+// `bestEffort(label, promise)` helper), plus most of `agentcore-fixture.js`. A
+// CatchClause-only rule would let that entire batch land without the number
+// moving — the exact failure the meter exists to prevent. Same class, same
+// standard, same fix; one rule, two messages so the output stays legible.
+//
+// It is deliberately NOT a detector of every swallowed error — `catch { return
+// null }` has a statement and passes. It measures the specific §8 population.
+export const noStatementlessCatch = {
+  meta: {
+    type: 'problem',
+    docs: {
+      description:
+        'Disallow a rejection path that runs no statements — a catch clause or a .catch()/.then() handler whose body is empty or comment-only.',
+      url: 'https://github.com/example/repo',
+    },
+    schema: [],
+    messages: {
+      emptyCatchClause:
+        'Swallowed error: this catch body runs no statements, so the failure produces no signal at all. Make it LOG, COUNT, or CLASSIFY (rethrow anything but the expected class) — SWALLOWED-ERRORS-PLAN.md §2. If silence is genuinely correct here, disable this rule on the line and write the reason.',
+      emptyRejectionHandler:
+        'Swallowed error: this rejection handler runs no statements, so the failure produces no signal at all. Use the bestEffort(label, promise) helper (SWALLOWED-ERRORS-PLAN.md §8b) or log it. If silence is genuinely correct here, disable this rule on the line and write the reason.',
+    },
+  },
+  create(context) {
+    // A function expression whose block body holds no statements. An expression-bodied
+    // arrow (`() => undefined`) is excluded on purpose: it is a written-down value, not
+    // an absence, and it is not part of the measured population.
+    const isEmptyHandler = (node) =>
+      !!node &&
+      (node.type === 'ArrowFunctionExpression' || node.type === 'FunctionExpression') &&
+      node.body.type === 'BlockStatement' &&
+      node.body.body.length === 0;
+
+    return {
+      CatchClause(node) {
+        // node.body is always a BlockStatement; .body is its statement list.
+        if (node.body.body.length === 0) {
+          context.report({ node, messageId: 'emptyCatchClause' });
+        }
+      },
+      CallExpression(node) {
+        const { callee } = node;
+        if (callee.type !== 'MemberExpression' || callee.computed) return;
+        const method = callee.property.name;
+        // .catch(fn) → arg 0 is the rejection handler. .then(onOk, fn) → arg 1 is.
+        const handler =
+          method === 'catch' ? node.arguments[0] : method === 'then' ? node.arguments[1] : null;
+        if (isEmptyHandler(handler)) {
+          context.report({ node: handler, messageId: 'emptyRejectionHandler' });
+        }
+      },
+    };
+  },
+};
+
+const local = { rules: { 'no-statementless-catch': noStatementlessCatch } };
+
 // Vitest injects these because slack-dispatcher/vitest.config.js sets
 // `test.globals: true`. Without them every *.test.js is a wall of no-undef.
 const vitestGlobals = {
@@ -112,24 +205,63 @@ const bugRules = {
   'n/no-extraneous-require': 'error',
   'n/no-extraneous-import': 'error',
 
-  // BUG CLASS: silently swallowed errors — `catch {}` with an empty body turns a
-  // real failure into a wrong-but-quiet result.
+  // BUG CLASS: silently swallowed errors — a catch body that does nothing turns
+  // a real failure into a wrong-but-quiet result. Definition and rationale at
+  // the rule itself, above; SWALLOWED-ERRORS-PLAN.md §8(d) is the decision.
   //
   // WARN, NOT ERROR, ON PURPOSE, and the intent is to RATCHET IT TO 'error' as
-  // the docker/SWALLOWED-ERRORS-PLAN.md batches land. Landing it at error now
-  // would invite a bulk sweep of `eslint-disable` comments with placeholder
-  // reasons — the same silence with extra steps. Every disable that survives the
-  // ratchet must be written by whoever understands that specific call site and
-  // must say why swallowing is correct there.
+  // the plan's batches land. Landing it at error now would fail both image builds
+  // outright, and would invite a bulk sweep of `eslint-disable` comments with
+  // placeholder reasons — the same silence with extra steps. Every disable that
+  // survives the ratchet must be written by whoever understands that specific
+  // call site and must say why swallowing is correct there.
   //
-  // MEASURED CAVEAT — READ THIS BEFORE TREATING THE WARN COUNT AS THE BACKLOG.
-  // SWALLOWED-ERRORS-PLAN.md counts ~111 sites whose catch body is "empty OR
-  // COMMENT-ONLY". `no-empty` does not report a block containing a comment, and
-  // has no option to. Measured on this tree it reports exactly ONE site. So this
-  // rule is NOT a meter for that backlog and must not be quoted as one — the
-  // plan's own regex sweep is. What this rule does buy is that the count cannot
-  // grow silently from zero-comment `catch {}`, which is the cheapest shape to
-  // add and the hardest to spot in review.
+  // BASELINE at 2026-08-14 — 137 sites, and this count IS the backlog (unlike
+  // `no-empty`'s, below). `npm run swallowed-errors` from docker/ reprints it:
+  //
+  //    52  slack-dispatcher                      30  clawdbot/agentcore-pi
+  //    47  clawdbot/agentcore-tests               1  clawdbot/config-resolver
+  //     7  clawdbot/agentcore-provision           0  clawdbot/agentcore-observability
+  //
+  // Treat that as a reading, not a constant: it moved 137 -> 139 -> 137 in one
+  // afternoon (two new silences added by concurrent work, then agentcore-
+  // observability cleared to zero). That rate was previously invisible, which is
+  // the whole argument for the rule.
+  //
+  // Of the 137, 11 are sites SWALLOWED-ERRORS-PLAN.md §8 explicitly leaves alone
+  // as already correct — 4 SSE "client gone" writes, 3 mount probes and 2
+  // session.dispose in pi-adapter.mjs, plus 2 session.dispose in test helpers.
+  // They stay at warn: a disable comment there must be written by hand with the
+  // reason, and that is the last step of the ratchet, not the first.
+  //
+  // HOW TO RATCHET, per directory. The blocks below are already one per package,
+  // so tightening a cleared package is a `rules` override inside its existing
+  // block — no new structure. Append to the block, after `rules: bugRules`:
+  //
+  //   {
+  //     files: ['clawdbot/agentcore-observability/**/*.{js,cjs}'],
+  //     ...
+  //     rules: { ...bugRules, 'local/no-statementless-catch': 'error' },
+  //   }
+  //
+  // or, for a subtree finer than a package, add a new block after it:
+  //
+  //   { files: ['slack-dispatcher/cron-*.js'],
+  //     rules: { 'local/no-statementless-catch': 'error' } }
+  //
+  // Later blocks win, so a narrow error block always beats the package's warn.
+  // Move the numbers above down as you go — they are the backlog.
+  'local/no-statementless-catch': 'warn',
+
+  // KEPT ALONGSIDE, not superseded. The local rule looks only at catch clauses
+  // and rejection handlers; `no-empty` still covers empty `if` / `for` / `while`
+  // / bare blocks, and is the only rule here that sees them. Its catch coverage
+  // is now redundant (and was never sufficient — see above), so expect the two to
+  // double-report a comment-free `catch {}` — currently exactly one site,
+  // agentcore-pi/config-map-test.mjs:62. That overlap is cheap and deliberate:
+  // setting allowEmptyCatch back to true would silence the local rule's only
+  // duplicate at the price of making `no-empty` the rule people read for catch
+  // blocks, and its message says nothing about logging or classifying.
   'no-empty': ['warn', { allowEmptyCatch: false }],
 };
 
@@ -182,7 +314,7 @@ export default [
       sourceType: 'commonjs',
       globals: { ...globals.node },
     },
-    plugins: { n },
+    plugins: { n, local },
     rules: bugRules,
   },
   {
@@ -194,7 +326,7 @@ export default [
       sourceType: 'module',
       globals: { ...globals.node },
     },
-    plugins: { n },
+    plugins: { n, local },
     rules: bugRules,
   },
   {
@@ -234,7 +366,7 @@ export default [
       sourceType: 'module',
       globals: { ...globals.node },
     },
-    plugins: { n },
+    plugins: { n, local },
     rules: bugRules,
   },
   {
@@ -244,7 +376,7 @@ export default [
       sourceType: 'commonjs',
       globals: { ...globals.node },
     },
-    plugins: { n },
+    plugins: { n, local },
     rules: bugRules,
   },
 
@@ -260,7 +392,7 @@ export default [
       sourceType: 'commonjs',
       globals: { ...globals.node },
     },
-    plugins: { n },
+    plugins: { n, local },
     rules: bugRules,
   },
   {
@@ -270,7 +402,7 @@ export default [
       sourceType: 'module',
       globals: { ...globals.node },
     },
-    plugins: { n },
+    plugins: { n, local },
     rules: bugRules,
   },
 
@@ -282,7 +414,7 @@ export default [
       sourceType: 'commonjs',
       globals: { ...globals.node },
     },
-    plugins: { n },
+    plugins: { n, local },
     rules: bugRules,
   },
 ];
