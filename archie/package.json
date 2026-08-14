@@ -17,9 +17,11 @@
   "dependencies": {
     "@aws-sdk/client-bedrock-agentcore": "^3",
     "@aws-sdk/client-bedrock-agentcore-control": "^3",
+    "@aws-sdk/client-bedrock-runtime": "^3",
     "@aws-sdk/client-cloudwatch": "^3",
     "@aws-sdk/client-cloudwatch-logs": "^3",
     "@aws-sdk/client-dynamodb": "^3",
+    "@aws-sdk/client-ec2": "^3",
     "@aws-sdk/client-ecr": "^3",
     "@aws-sdk/client-ecs": "^3",
     "@aws-sdk/client-efs": "^3",
@@ -28,6 +30,8 @@
     "@aws-sdk/client-service-quotas": "^3",
     "@aws-sdk/client-sqs": "^3",
     "@aws-sdk/client-sts": "^3",
+    "@aws-sdk/client-xray": "^3",
+    "@aws-sdk/credential-provider-node": "^3",
     "@aws-sdk/lib-dynamodb": "^3"
   }
 }
