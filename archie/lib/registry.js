@@ -31,12 +31,12 @@ const COMMANDS = {
   version: { top: true, module: null, needsAws: false, summary: 'print the CLI version' },
 
   // ── gateway (ECS) ────────────────────────────────────────────────────────
-  'gateway build': { options: { tag:{type:'string'}, push:{type:'boolean'}, platform:{type:'string'} }, module: 'gateway', task: 'W1-B', needsAws: true, summary: 'build/push the amd64 dispatcher image' },
+  'gateway build': { options: { tag:{type:'string'}, push:{type:'boolean'}, platform:{type:'string'}, pure:{type:'boolean'} }, module: 'gateway', task: 'W1-B', needsAws: true, summary: 'build/push the amd64 dispatcher image' },
   'gateway deploy': { options: { tag:{type:'string'}, 'wait-timeout':{type:'string'}, 'no-wait':{type:'boolean'} }, module: 'gateway', task: 'W1-B', needsAws: true, summary: 'roll the dispatcher service and monitor to healthy' },
   'gateway status': { options: { check:{type:'boolean'} }, module: 'gateway', task: 'W1-B', needsAws: true, summary: 'which task definition and image is actually running' },
 
   // ── generation ───────────────────────────────────────────────────────────
-  'generation build': { options: { tag:{type:'string'}, push:{type:'boolean'}, platform:{type:'string'} }, module: 'generation', task: 'W1-C', needsAws: true, summary: 'build/push the arm64 Pi runtime image' },
+  'generation build': { options: { tag:{type:'string'}, push:{type:'boolean'}, platform:{type:'string'}, pure:{type:'boolean'} }, module: 'generation', task: 'W1-C', needsAws: true, summary: 'build/push the arm64 Pi runtime image' },
   'generation create': { options: { image:{type:'string'}, id:{type:'string'}, set:{type:'string',multiple:true}, from:{type:'string'} }, module: 'generation', task: 'W1-C', needsAws: true, summary: 'write CONFIG#generation; nothing goes live' },
   'generation list': { options: { limit:{type:'string'} }, module: 'generation', task: 'W1-C', needsAws: true, summary: 'generations, coverage, health, which is live, which are rollback targets' },
   'generation show': { options: {}, module: 'generation', task: 'W1-C', needsAws: true, positional: 'generationId', summary: 'one generation: declared spec and per-agent bindings' },
