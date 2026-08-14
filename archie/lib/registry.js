@@ -67,7 +67,7 @@ const COMMANDS = {
   'agent ensure-connector': { options: {}, module: 'agent', task: 'W1-H', needsAws: true, positional: 'agent', summary: 'give the agent its own Connector project and key' },
   'agent seed-workspace': { options: {}, module: 'agent', task: 'W1-H', needsAws: true, positional: 'agent', summary: 'pre-write the agent workspace SEED' },
   'agent ensure-runtime': { options: { generation:{type:'string'} }, module: 'agent', task: 'W1-H', needsAws: true, positional: 'agent', summary: 'the full provisioning saga for one agent' },
-  'agent migrate': { options: { agents:{type:'string'}, 'skip-config':{type:'boolean'}, 'skip-runtimes':{type:'boolean'}, 'skip-cron':{type:'boolean'} }, module: 'agent', task: 'W1-H', needsAws: true, summary: 'config hydrate, ensure runtimes, fold in per-agent cron' },
+  'agent migrate': { options: { agents:{type:'string'}, generation:{type:'string'}, 'skip-config':{type:'boolean'}, 'skip-runtimes':{type:'boolean'}, 'skip-cron':{type:'boolean'} }, module: 'agent', task: 'W1-H', needsAws: true, summary: 'config hydrate, ensure runtimes, fold in per-agent cron' },
   'agent rekey': { options: { 'to-scope':{type:'boolean'} }, module: 'agent', task: 'W1-H', needsAws: true, dryRunDefault: true, positional: 'agent', summary: 'move an agent identity to a scope key, carrying GRANT#' },
   'agent teardown': { options: { 'name-re':{type:'string'}, 'skip-re':{type:'string'} }, module: 'agent', task: 'W1-H', needsAws: true, dryRunDefault: true, summary: 'delete runtimes, access points and table items (guarded)' },
   'agent create': { options: {}, module: 'agent', task: null, phase: 2, needsAws: true, positional: 'agent', summary: 'mint an agent identity and enqueue provisioning' },
