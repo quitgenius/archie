@@ -1,0 +1,11 @@
+# Build context for `make build-archie-gateway` is docker/ (the dispatcher image COPYs from
+# clawdbot/ as well as slack-dispatcher/). Until this file existed, that context was ~1.2GB —
+# every package's installed node_modules was uploaded to the daemon on every build, and nothing
+# in the Dockerfile ever COPYs one: every stage runs its own npm install.
+#
+# `**/node_modules` (not `node_modules/`) — .dockerignore patterns are NOT recursive by default,
+# so the bare form would only match the top-level directory.
+**/node_modules
+.git
+**/.DS_Store
+**/.vite

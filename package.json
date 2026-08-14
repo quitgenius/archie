@@ -1,0 +1,15 @@
+{
+  "name": "archie-docker-lint",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Lint-only root for the archie/AgentCore docker tree. Holds the single ESLint 9 flat config (eslint.config.mjs) and the toolchain the per-package `npm run lint` scripts shell out to. Deliberately has NO runtime dependencies — nothing in here is copied into any image.",
+  "scripts": {
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix"
+  },
+  "devDependencies": {
+    "eslint": "^9.39.5",
+    "eslint-plugin-n": "^18.3.0",
+    "globals": "^17.11.0"
+  }
+}
