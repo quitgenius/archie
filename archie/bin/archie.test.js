@@ -203,7 +203,12 @@ test('--set is repeatable on generation create', async () => {
   const c = capture();
   let seen = null;
   await main(['generation', 'create', '--region', 'r', '--image', 't', '--set', 'a=1', '--set', 'b=2'], {
-    streams: c.streams, env: {}, require: fakeRequire({ create: async (ctx, args) => { seen = args.values.set; } }),
+    streams: c.streams,
+    env: {},
+    // `generation create` provisions, so it is dispatched with the deployed fleet config applied.
+    // Stubbed because this test is about PARSING; the assertion below is unchanged.
+    dispatcherEnv: async () => ({ env: {}, revision: 'stub' }),
+    require: fakeRequire({ create: async (ctx, args) => { seen = args.values.set; } }),
   });
   assert.deepEqual(seen, ['a=1', 'b=2']);
 });
@@ -225,4 +230,76 @@ test('a command-specific flag VALUE never arrives as a positional', async () => 
   assert.deepEqual(parse(['generation', 'taint', 'rel-1', '--reason', 'bad image']).found.args, ['rel-1']);
   assert.deepEqual(parse(['release', 'set', '--hotfix', 'rel-1']).found.args, ['rel-1']);
   assert.deepEqual(parse(['runtime', 'gc', '--keep', '3']).found.args, []);
+});
+
+// ── the fleet's configuration, not the laptop's ──────────────────────────────────────────────────
+//
+// REGRESSION (first sandbox rehearsal). `createAgentCoreClient` resolves what it is not given as
+// `process.env.X || <pre-archie constant>`. Running on a laptop, where none of those variables are
+// set, `generation create` recorded the OpenClaw stack's security group, dispatcher URL and secret
+// names into a generation, computed specDigest over them, and REPORTED SUCCESS. `generation stage`
+// then failed closed on a filesystem that had been deleted. The silent one was the dangerous one.
+
+test('commands that provision are dispatched with the DEPLOYED dispatcher config applied', async () => {
+  const seen = {};
+  const env = { AGENTCORE_EFS_FS_ID: 'fs-fromLaptop', ARCHIE_NAME: 'agent-gn0p84' };
+  const c = capture();
+  const code = await main(['generation', 'create', '--image', 'x', '--region', 'us-east-1'], {
+    streams: c.streams,
+    env,
+    // Stands in for the ECS read. The point of the assertion is the ORDER: the handler must see the
+    // applied value, so this cannot be lazily resolved after dispatch.
+    dispatcherEnv: async () => ({
+      revision: 'agent-gn0p84-dispatcher:39',
+      env: { AGENTCORE_EFS_FS_ID: 'fs-fromFleet', AGENTCORE_SECURITY_GROUP_ID: 'sg-fromFleet' },
+    }),
+    require: fakeRequire({
+      'generation create': async () => {
+        seen.fs = env.AGENTCORE_EFS_FS_ID;
+        seen.sg = env.AGENTCORE_SECURITY_GROUP_ID;
+        return { ok: true };
+      },
+    }),
+  });
+  assert.equal(code, EXIT.OK, c.stderr());
+  // The FLEET's value wins over the ambient one: an AGENTCORE_* left exported in a shell is exactly
+  // how one laptop bakes itself into a fleet-wide generation.
+  assert.equal(seen.fs, 'fs-fromFleet', 'an ambient env var overrode the deployed fleet config');
+  assert.equal(seen.sg, 'sg-fromFleet', 'a field the CLI never overrides did not reach the handler');
+});
+
+test('read-only commands do not require a deployed dispatcher', async () => {
+  let called = false;
+  const c = capture();
+  const code = await main(['generation', 'list', '--region', 'us-east-1'], {
+    streams: c.streams,
+    env: { ARCHIE_NAME: 'agent-gn0p84' },
+    dispatcherEnv: async () => { called = true; return { env: {}, revision: 'x' }; },
+    require: fakeRequire({ 'generation list': async () => ({ ok: true }) }),
+  });
+  assert.equal(code, EXIT.OK, c.stderr());
+  // `generation list` reads DynamoDB. Making it depend on an ECS service it never talks to would be
+  // a dependency invented by the fix rather than required by the command.
+  assert.equal(called, false, 'a read-only command paid for an ECS round trip');
+});
+
+test('every command that builds a provisioning client declares needsFleetEnv', () => {
+  const { COMMANDS, FLEET_ENV_COMMANDS } = require('../lib/registry');
+  const fs = require('node:fs');
+  const path = require('node:path');
+  // Modules that construct the dispatcher's client, found in the source rather than restated — a
+  // hand-maintained list would drift in exactly the direction that reintroduces the bug.
+  const constructs = new Set();
+  for (const f of fs.readdirSync(path.join(__dirname, '..', 'cmd'))) {
+    if (!f.endsWith('.js') || f.endsWith('.test.js')) continue;
+    const src = fs.readFileSync(path.join(__dirname, '..', 'cmd', f), 'utf8');
+    if (/createAgentCoreClient\(/.test(src)) constructs.add(f.replace(/\.js$/, ''));
+  }
+  const declared = new Set(FLEET_ENV_COMMANDS.map((k) => COMMANDS[k].module));
+  for (const mod of constructs) {
+    // healthcheck is the documented exception: its client only invokes an ARN it is handed.
+    if (mod === 'healthcheck') continue;
+    assert.ok(declared.has(mod), `cmd/${mod}.js builds a provisioning client but no command in `
+      + 'FLEET_ENV_COMMANDS routes to it — it will run against pre-archie constants');
+  }
 });

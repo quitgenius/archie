@@ -202,8 +202,14 @@ function clientsFor(ctx, deps = {}) {
  * `createAgentCoreClient` resolves its own defaults from `process.env` (agentcore-client.js:45-143),
  * which is exactly the state this whole plan is replacing — so region, account and the config table
  * come from the CLI context, and the fleet fields an operator wants to change come from `--set`.
- * Everything else still falls back to the dispatcher's own defaults, which is the honest behaviour:
- * a generation records what the dispatcher WOULD have used.
+ *
+ * Everything else comes from the DEPLOYED DISPATCHER'S TASK DEFINITION, applied by the caller before
+ * this runs (`lib/dispatcher-env.js`). It used to "fall back to the dispatcher's own defaults", which
+ * was described as honest and was not: on a laptop none of those variables are set, so the fallbacks
+ * fired and a generation recorded the PRE-ARCHIE stack — sg-REDACTED, the OpenClaw
+ * dispatcher URL, and `agent-4ggvzl-*` for every secret — into `runtimeEnv`, with
+ * `specDigest` computed over it. Caught by the first sandbox rehearsal, and it failed silently:
+ * `generation create` reported success.
  */
 function dispatcherClientFor(ctx, account, sets = { fields: {}, env: {} }, deps = {}) {
   const overrides = {

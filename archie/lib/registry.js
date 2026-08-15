@@ -88,6 +88,35 @@ const COMMANDS = {
   'metrics query': { options: { agent:{type:'string'} }, module: 'wrappers', task: 'W1-G', needsAws: true, positional: 'query', summary: 'run a curated Insights/metric query' },
 };
 
+// ── commands that must run with the FLEET's configuration, not the laptop's ───────────────────────
+//
+// Every command here builds `createAgentCoreClient`, which resolves what it is not given as
+// `process.env.X || <constant>`. The deployed dispatcher sets those variables from its task
+// definition; a laptop sets none of them, so before this list existed each of these commands
+// silently fell back to the PRE-ARCHIE OpenClaw constants — `generation create` recorded that
+// stack's security group, dispatcher URL and secret names into a generation and reported success.
+// `bin/archie.js` reads the deployed task definition and applies it before dispatch.
+//
+// Declared as a SET here rather than a field on each entry so the list is readable as a list — the
+// question "which commands provision?" is one an operator asks, and fifteen scattered booleans do
+// not answer it. `registry.test.js` holds it to the modules that actually construct a client.
+//
+// Deliberately absent: `generation healthcheck`. Its client only ever calls `invokeStreaming` against
+// an ARN it is given — no EFS, no security group, no secret names — so requiring a deployed
+// dispatcher to run one would be a dependency it does not have.
+const FLEET_ENV_COMMANDS = [
+  'deploy',
+  'generation create', 'generation verify', 'generation stage',
+  'fleet deploy', 'fleet drift', 'fleet reconcile',
+  'agent ensure-role', 'agent ensure-access-point', 'agent ensure-connector',
+  'agent seed-workspace', 'agent ensure-runtime', 'agent migrate', 'agent rekey',
+  'agent teardown', 'agent create',
+];
+for (const key of FLEET_ENV_COMMANDS) {
+  if (!COMMANDS[key]) throw new Error(`FLEET_ENV_COMMANDS names an unknown command: ${key}`);
+  COMMANDS[key].needsFleetEnv = true;
+}
+
 // The plan §5 spellings, kept so runbooks written against the plan do not break. Undocumented in
 // help; --json always reports the canonical name.
 const ALIASES = {
@@ -174,4 +203,6 @@ function load(key, command, { require: req = require } = {}) {
   return handler;
 }
 
-module.exports = { COMMANDS, ALIASES, resolve, load };
+module.exports = {
+  COMMANDS, ALIASES, FLEET_ENV_COMMANDS, resolve, load,
+};

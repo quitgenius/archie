@@ -57,6 +57,7 @@ const { efsRootDir, generationRuntimeName } = require('../../slack-dispatcher/ag
 const generationCmd = require('./generation');
 const { CliError, EXIT, usage, preflight, refused, tainted } = require('../lib/exit');
 const { makeClient } = require('../lib/aws');
+const { basePolicyArnFor } = require('../lib/context');
 
 // ── constants, each with the measurement or incident behind it ───────────────────────────────────
 
@@ -166,10 +167,15 @@ function awsClients(ctx, deps) {
  * The dispatcher's own resolved configuration, for THIS deployment.
  *
  * `createAgentCoreClient` resolves its defaults from `process.env` (agentcore-client.js:45-143) —
- * exactly the coupling this plan replaces — so the four names the CLI owns come from `ctx` and
- * everything else (VPC, security group, EFS filesystem, mount path, supported AZ ids, skeleton dir,
- * base policy ARN) still falls back to the dispatcher's, which is the honest answer: these commands
- * provision what the dispatcher WOULD have provisioned.
+ * exactly the coupling this plan replaces — so the names the CLI owns come from `ctx` and everything
+ * else (VPC, security group, EFS filesystem, mount path, supported AZ ids, skeleton dir) still falls
+ * back to the dispatcher's, which is the honest answer: these commands provision what the dispatcher
+ * WOULD have provisioned.
+ *
+ * The BASE POLICY ARN used to be on that fallback list, described as honest. It was not: the
+ * dispatcher's default is a bare `agentcore-base`, which does not exist in an archie account, so
+ * every `ensure-role`/`ensure-runtime` here would have failed closed on NoSuchEntityException —
+ * the failure `generation stage` actually hit during the first sandbox rehearsal.
  *
  * Constructing the client does not construct any SDK client (they are lazy), so this is free for the
  * commands that only want `client.config`.
@@ -184,6 +190,9 @@ function dispatcherClient(ctx, account, deps, overrides = {}) {
     // (secrets.tf:61). Left on the dispatcher's env default it would name ANOTHER deployment's
     // secret — which exists and is readable, so the failure is a wrong answer rather than an error.
     credentialSecret: ctx.resources.credentialSecret,
+    // Derived for the same reason, with a harder failure mode: the wrong secret name is a wrong
+    // answer, the wrong policy name is NoSuchEntityException on every provision.
+    baseManagedPolicyArn: basePolicyArnFor(ctx.resources, account),
     ...overrides,
   };
   let mod;

@@ -46,8 +46,21 @@ function resourcesFor(name) {
     // drifts in one of them.
     credentialSecret: `${name}-connector-api-key`,
     dispatcherSharedSecret: `${name}-dispatcher-shared-secret`,
+    // The managed policy every derived per-agent role attaches. NAME ONLY — the ARN needs the
+    // account, which is resolved (never assumed) at call time.
+    //
+    // This is here because it was the ONE resource the one-knob derivation missed, and the way it
+    // failed is the reason the rule exists: `cmd/preflight.js:617` derived `${name}-agentcore-base`
+    // and reported PASS, while the provisioning client fell back to its own pre-archie default of a
+    // bare `agentcore-base` (agentcore-client.js:69) and every provision failed closed with
+    // NoSuchEntityException. A green gate and a failing action, disagreeing about a name neither
+    // could see the other spell.
+    basePolicyName: `${name}-agentcore-base`,
   };
 }
+
+/** The base managed policy ARN. Separate from `resourcesFor` because only this one needs an account. */
+const basePolicyArnFor = (resources, account) => `arn:aws:iam::${account}:policy/${resources.basePolicyName}`;
 
 /**
  * Resolve the deployment name.
@@ -115,4 +128,6 @@ function createContext(values, command, env = process.env) {
   };
 }
 
-module.exports = { createContext, resourcesFor, resolveName, DEFAULT_NAME };
+module.exports = {
+  createContext, resourcesFor, basePolicyArnFor, resolveName, DEFAULT_NAME,
+};

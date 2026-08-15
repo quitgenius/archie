@@ -146,7 +146,24 @@ async function main(argv = process.argv.slice(2), deps = {}) {
 
   let code = EXIT.OK;
   try {
+    // THE FLEET'S OWN CONFIGURATION, before any handler builds a provisioning client.
+    //
+    // `createAgentCoreClient` resolves what it is not given as `process.env.X || <constant>`, and on
+    // a laptop none of those variables are set — so before this, every field archie did not override
+    // resolved to a PRE-ARCHIE constant. `generation create` recorded the OpenClaw stack's security
+    // group, dispatcher URL and secret names into a generation and reported success; `generation
+    // stage` failed closed on a deleted filesystem. Applied here, once, rather than in each of the
+    // nine client constructions, because the failure mode of one call site forgetting is a silently
+    // wrong generation rather than an error.
+    // AFTER `load`, deliberately: an unbuilt or phase-2 command must report that it does not exist
+    // before the CLI spends an ECS round trip on configuration it will never use.
     const handler = load(found.key, found.command, deps);
+    if (found.command.needsFleetEnv) {
+      const { readDispatcherEnv, applyDispatcherEnv } = require('../lib/dispatcher-env');
+      const fleet = await (deps.dispatcherEnv || readDispatcherEnv)(ctx, deps);
+      applyDispatcherEnv(fleet.env, env);
+      out.verbose(`fleet config from ${ctx.resources.dispatcherService} (${fleet.revision})`);
+    }
     const result = await handler(ctx, { positionals: found.args, values }, out);
     if (result !== undefined) out.answer(result);
     // A command that recorded per-unit failures without throwing is PARTIAL, not OK — stragglers are

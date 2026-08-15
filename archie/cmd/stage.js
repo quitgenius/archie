@@ -56,6 +56,7 @@ const {
   CliError, EXIT, usage, preflight, refused, tainted, headroom,
 } = require('../lib/exit');
 const { makeClient } = require('../lib/aws');
+const { basePolicyArnFor } = require('../lib/context');
 
 // ── constants, each with the measurement behind it ───────────────────────────────────────────────
 
@@ -169,6 +170,12 @@ function dispatcherClientFor(ctx, account, spec, deps = {}) {
     efsRootPrefix: spec.efsRootPrefix,
     efsMountPath: spec.efsMountPath,
     securityGroupId: spec.securityGroupId,
+    // DERIVED, never inherited. The client's own default is the pre-archie `agentcore-base`
+    // (agentcore-client.js:69), which does not exist in an archie account — so omitting this made
+    // every provision fail closed with NoSuchEntityException while `archie preflight` check 7,
+    // which derives the name correctly, reported PASS. Passing it explicitly is what keeps the
+    // gate and the action talking about the same policy.
+    baseManagedPolicyArn: basePolicyArnFor(ctx.resources, account),
   };
   if (deps.agentcore) return deps.agentcore(overrides);
   let mod;
