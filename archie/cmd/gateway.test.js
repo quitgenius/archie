@@ -463,15 +463,66 @@ function fakeClock(startIso) {
   return { now: () => t, sleep: (ms) => { t += ms; return Promise.resolve(); } };
 }
 
-test('deploy: a tag absent from ECR is refused before anything is stopped', async () => {
-  // Otherwise it appears ~40s later as a Fargate image-pull error INSIDE the downtime window, with
-  // the old task already gone.
+test('deploy: an EXPLICIT tag absent from ECR is still refused — it is not built', async () => {
+  // A derived tag gets built (see below); an explicit one must not. `--tag` names an artifact that is
+  // supposed to EXIST — a rollback target, a tag from CI — so building the current working tree and
+  // publishing it under that name would silently relabel different code as that artifact. That is
+  // worse than failing, which is why the two cases diverge here rather than sharing a path.
   const ecs = ecsFor();
   const e = await expectExit(EXIT.REFUSED, () => gateway.deploy(
     makeCtx(), makeArgs({ tag: 'archie-0.2.99' }), makeOut(), { ecr: ecrFor(), ecs, sts: stsOk(), clients: discoveryClients() },
   ));
   assert.match(e.message, /not in ECR/);
   assert.equal(ecs.calls.length, 0, 'nothing was even read from ECS');
+});
+
+test('deploy: a DERIVED tag absent from ECR is BUILT AND PUSHED, before anything stops', async () => {
+  // It used to refuse and tell you to run `gateway build --push` first, which made the common path
+  // two commands whose only failure mode was "run the other one". A derived tag is a content digest
+  // of this working tree, so absent from ECR means exactly one thing — this code has never been
+  // published — and publishing it is the only sensible response.
+  //
+  // ORDER IS THE SAFETY PROPERTY: the build happens BEFORE the rollout. A docker failure here costs
+  // nothing; the same failure after the old task is stopped is an outage lasting until someone fixes
+  // the build.
+  let pushed = false;
+  const ecr = fakeClient({
+    DescribeRepositoriesCommand: () => ({
+      repositories: [{ repositoryName: 'agent-gn0p84-gateway', repositoryUri: REPO_URI, registryId: ACCOUNT, imageTagMutability: 'IMMUTABLE' }],
+    }),
+    DescribeImagesCommand: () => (pushed
+      ? { imageDetails: [{ imageDigest: 'sha256:deadbeef', imagePushedAt: new Date('2026-08-16T00:00:00Z') }] }
+      : notFound()),
+    GetAuthorizationTokenCommand: () => ({
+      authorizationData: [{ authorizationToken: Buffer.from('AWS:tok3n').toString('base64'), proxyEndpoint: `https://${REGISTRY}` }],
+    }),
+  });
+  const ran = [];
+  const ecs = ecsFor();
+  await gateway.deploy(makeCtx(), makeArgs({ 'no-wait': true }), makeOut(), {
+    ecr, ecs, sts: stsOk(), clients: discoveryClients(),
+    run: (cmd, cmdArgs) => {
+      ran.push(cmd);
+      if (cmdArgs.includes('push')) pushed = true;
+      return Promise.resolve({});
+    },
+  });
+
+  assert.ok(ran.includes('docker'), 'it built rather than refusing');
+  const registeredAt = ecs.calls.findIndex((c) => c.name === 'RegisterTaskDefinitionCommand');
+  assert.ok(registeredAt >= 0, 'and still rolled afterwards');
+});
+
+test('deploy: a derived tag ALREADY in ECR is not rebuilt', async () => {
+  // The content-addressed skip. Re-deploying unchanged code must not shell out to docker at all —
+  // that is what makes a repeat deploy free, and it is why `archie deploy` can call build and deploy
+  // in sequence without paying for the build twice.
+  const ecs = ecsFor();
+  await gateway.deploy(makeCtx(), makeArgs({ 'no-wait': true }), makeOut(), {
+    ecr: ecrFor({ image: true }), ecs, sts: stsOk(), clients: discoveryClients(),
+    run: () => assert.fail('an image already in ECR must not be rebuilt'),
+  });
+  assert.ok(ecs.calls.some((c) => c.name === 'RegisterTaskDefinitionCommand'));
 });
 
 test('deploy: a deployed env disagreeing with --name is CORRECTED, not refused', async () => {

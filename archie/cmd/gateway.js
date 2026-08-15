@@ -28,6 +28,12 @@
 // of this image's declared COPY inputs (../lib/digest.js). If that tag is already in ECR the build
 // AND the push are skipped entirely — which is what makes `archie deploy` idempotent, and what stops
 // a no-op release from costing 94 seconds of dropped Slack messages.
+//
+// That digest is also why `gateway deploy` BUILDS a derived tag it cannot find in ECR rather than
+// refusing. Absent means "this working tree has never been published", so there is exactly one image
+// it could want, and it builds it BEFORE stopping anything. An explicit `--tag` keeps the refusal:
+// it names an artifact that is supposed to exist, and publishing this tree under that name would
+// relabel different code as that artifact.
 
 const { spawn } = require('node:child_process');
 const {
@@ -531,17 +537,42 @@ async function deploy(ctx, args, out, deps = {}) {
   const repo = await describeRepo(ecr, ctx);
   const image = `${repo.repositoryUri}:${tag}`;
 
-  // REFUSE A TAG ABSENT FROM ECR. Otherwise the failure appears ~40 seconds later as a Fargate
-  // image-pull error INSIDE the downtime window — with the old task already stopped.
-  const inEcr = await findImage(ecr, repo.repositoryName, tag);
-  if (!inEcr) {
+  // THE IMAGE MUST BE IN ECR BEFORE ANYTHING STOPS. A tag that is absent surfaces ~40 seconds from
+  // now as a Fargate image-pull error INSIDE the downtime window, with the old task already gone.
+  //
+  // A DERIVED tag is BUILT AND PUSHED here rather than refused. The tag is a content digest of this
+  // working tree, so "absent from ECR" means exactly one thing — this code has never been published —
+  // and the only sensible response is to publish it. Requiring a separate `gateway build --push`
+  // first made the common path two commands and the failure mode a refusal telling you to run the
+  // other one.
+  //
+  // AN EXPLICIT --tag IS STILL REFUSED, and that distinction is the whole safety of this. An explicit
+  // tag names an artifact that is supposed to EXIST — a rollback target, a tag from CI. Building the
+  // current working tree and publishing it under that name would silently relabel different code as
+  // that artifact, which is worse than failing.
+  let inEcr = await findImage(ecr, repo.repositoryName, tag);
+  if (!inEcr && !derived) {
     throw refused(`${repo.repositoryName}:${tag} is not in ECR`, {
-      detail: derived
-        ? 'Derived from the working tree — run `archie gateway build --push` first. Deploying it '
-          + 'would fail ~40s from now as an image-pull error, inside the downtime window.'
-        : 'Push it first. Deploying it would fail ~40s from now as an image-pull error, inside the '
-          + 'downtime window, with the old task already stopped.',
+      detail: '--tag names an artifact that must already exist (a rollback target, or a tag from CI). '
+        + 'Push it first, or drop --tag to derive a content tag from this tree and have it built here. '
+        + 'Deploying it would fail ~40s from now as an image-pull error, inside the downtime window, '
+        + 'with the old task already stopped.',
     });
+  }
+  if (!inEcr && ctx.dryRun) {
+    out.progress(`would build and push ${repo.repositoryName}:${tag} — it is not in ECR`);
+  } else if (!inEcr) {
+    out.progress(`building    ${tag} is not in ECR — building and pushing before anything stops`);
+    // BEFORE the rollout, deliberately: a docker failure here costs nothing, while the same failure
+    // after the old task is stopped is an outage that lasts until someone fixes the build.
+    await build(ctx, { positionals: [], values: { push: true, pure: args.values.pure } }, out, deps);
+    inEcr = await findImage(ecr, repo.repositoryName, tag);
+    if (!inEcr) {
+      throw new CliError(`${repo.repositoryName}:${tag} is still absent from ECR after a successful build`, {
+        detail: 'The build reported success but the tag cannot be found. Refusing to roll onto an '
+          + 'image that is not there.',
+      });
+    }
   }
 
   // COMPOSED, NOT CLONED. This used to register a revision of the DEPLOYED definition with only the
