@@ -228,10 +228,9 @@ function healthcheckFor(deps = {}) {
   if (typeof deps.healthcheck === 'function') return deps.healthcheck;
   let mod = null;
   try {
-    // cmd/healthcheck.js is W2-A and does not exist YET. That is the whole point of this seam: the
-    // require is expected to fail today and to start succeeding the moment the file lands, with no
-    // change here. The directive below is what W2-A removes.
-    // eslint-disable-next-line n/no-missing-require
+    // W2-A has landed, so this now resolves. The seam stays: a healthcheck module that exists but
+    // fails to LOAD must not degrade into "pending" (see the catch below), and keeping the lookup
+    // dynamic is what lets the tests substitute it.
     mod = require('./healthcheck');
   } catch (e) {
     // Only "the file does not exist yet" falls through to the stub. A healthcheck module that exists
@@ -981,6 +980,9 @@ module.exports = {
   enumerateAgents,
   writeBinding,
   taintGeneration,
+  // W2-A composes this: one place threads --profile to the clients the dispatcher's own client
+  // builds for itself, so the healthcheck cannot end up on a different credential path than staging.
+  clientsFor,
   HEALTHCHECK_NOT_IMPLEMENTED,
   DEFAULT_CONCURRENCY,
   MAX_CONCURRENCY,
