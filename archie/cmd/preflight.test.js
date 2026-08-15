@@ -102,12 +102,11 @@ function healthyAws(overrides = {}) {
       calls.push({ name: 'describeServices', args: [cluster, service] });
       return { services: [{ status: 'ACTIVE', desiredCount: 1, runningCount: 1, taskDefinition: 'arn:aws:ecs:us-east-1:1:task-definition/agent-gn0p84-dispatcher:69' }], failures: [] };
     },
+    // The hydrator's task definition is deliberately NOT stubbed: it is registered on demand and
+    // deregistered, so absent is its normal state and check 20 no longer looks for it.
+    async getRole(roleName) { calls.push({ name: 'getRole', args: [roleName] }); return { Arn: `arn:aws:iam::${ACCOUNT}:role/${roleName}` }; },
     async describeTaskDefinition(td) {
       calls.push({ name: 'describeTaskDefinition', args: [td] });
-      if (String(td).includes('cron-hydrator')) {
-        return { taskDefinitionArn: 'arn:.../agent-gn0p84-dispatcher-cron-hydrator:3', revision: 3,
-          containerDefinitions: [{ name: 'hydrator', mountPoints: [{ sourceVolume: 'agents', containerPath: '/efs/agents', readOnly: true }] }] };
-      }
       return {
         taskDefinitionArn: 'arn:aws:ecs:us-east-1:1:task-definition/agent-gn0p84-dispatcher:69',
         revision: 69,

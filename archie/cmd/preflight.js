@@ -240,6 +240,13 @@ function createAws(ctx) {
       return r.Policy;
     },
 
+    /** GetRole. Check 20: the ephemeral hydrator borrows this role, so its absence blocks hydration. */
+    async getRole(roleName) {
+      const { GetRoleCommand } = require('@aws-sdk/client-iam');
+      const r = await use('iam').send(new GetRoleCommand({ RoleName: roleName }));
+      return r.Role;
+    },
+
     async simulatePrincipalPolicy(sourceArn, actions, resources) {
       const { SimulatePrincipalPolicyCommand } = require('@aws-sdk/client-iam');
       const r = await use('iam').send(new SimulatePrincipalPolicyCommand({
@@ -984,25 +991,27 @@ const CHECKS = [
 
   {
     n: 20,
-    title: 'cron hydrator task def + parent AP',
+    title: 'cron hydration prerequisites (parent AP + execution role)',
     async run(w) {
+      // THIS CHECK USED TO ASSERT A TASK DEFINITION, and failed hard when it was absent —
+      // "cutover silently drops every agent's schedules". That definition is now registered on
+      // demand by `archie cron hydrate`, run, and deregistered (GATEWAY-OWNERSHIP-PLAN.md §8), so
+      // ABSENT IS THE NORMAL STATE and asserting it would fail permanently. A check that is always
+      // red is worse than no check: it trains everyone to skim past the one line that matters.
+      //
+      // What it asserts instead is what Terraform still owns and what hydration genuinely cannot
+      // proceed without — the fleet-wide access point and the execution role the ephemeral
+      // definition borrows. Those are the things whose absence actually breaks it.
       const { env } = await w.deployed();
-      const family = `${w.ctx.resources.dispatcherService}-cron-hydrator`;   // cron_hydrator.tf:48
-      let td;
-      try {
-        td = await w.aws.describeTaskDefinition(family);
-      } catch (e) {
-        if (!isNotFound(e) && !/ClientException/.test(errName(e))) throw e;
-        return {
-          status: FAIL,
-          note: `ecs:DescribeTaskDefinition ${family}: absent`,
-          detail: 'cutover silently drops every agent\'s schedules (cron_hydrator.tf:25,48)',
-        };
-      }
       const { fsId } = await w.efs();
       const prefix = env.AGENTCORE_EFS_ROOT_PREFIX;
-      const aps = await w.aws.describeAccessPoints(fsId);
       const wantPath = prefix ? `${prefix}/agents` : null;
+
+      // THE ACCESS POINT IS THE PRIVILEGE, which is why it stays in Terraform rather than being
+      // created by a CLI: its root is the PARENT <prefix>/agents, so one task can read every agent's
+      // subtree. The always-on gateway deliberately never holds that mount — it gets a narrow one —
+      // precisely so a compromised gateway cannot walk the fleet's workspaces.
+      const aps = await w.aws.describeAccessPoints(fsId);
       const parent = wantPath
         ? aps.find((ap) => ap.RootDirectory && ap.RootDirectory.Path === wantPath)
         : null;
@@ -1010,19 +1019,34 @@ const CHECKS = [
         return {
           status: FAIL,
           note: `no access point at ${wantPath || '<AGENTCORE_EFS_ROOT_PREFIX unset>/agents'} on ${fsId}`,
-          detail: 'the hydrator reads every agent subtree through one parent access point (cron_hydrator.tf:25)',
+          detail: 'the hydrator reads every agent subtree through one parent access point '
+            + '(modules/archie/cron_hydrator.tf). Terraform owns it; archie only decides when a task may use it.',
         };
       }
-      // Read-only is a property of the MOUNT, not of the access point: the always-on gateway
-      // deliberately never holds this parent mount, so a writable one here is a real widening.
-      const mounts = (td.containerDefinitions || []).flatMap((c) => c.mountPoints || []);
-      const writable = mounts.filter((m) => m.readOnly !== true);
-      if (writable.length) {
-        return { status: WARN, note: `${family} rev ${td.revision}, parent AP ${parent.AccessPointId} — advisory: mount is not readOnly` };
+
+      // The hydrator has NO task role — deliberately, because it makes no AWS API calls: it reads
+      // EFS and makes one HTTP call to the gateway's manager API. It borrows the dispatcher's
+      // EXECUTION role, which is what pulls the image and resolves secrets.
+      const roleName = `${w.ctx.resources.dispatcherService}-execution-role`;
+      try {
+        await w.aws.getRole(roleName);
+      } catch (e) {
+        if (!isNotFound(e)) throw e;
+        return {
+          status: FAIL,
+          note: `iam:GetRole ${roleName}: absent`,
+          detail: 'the ephemeral hydrator definition borrows this role; without it RunTask cannot pull the image.',
+        };
       }
-      return { status: PASS, note: `${family} rev ${td.revision}, parent AP ${parent.AccessPointId} (read-only)` };
+
+      return {
+        status: PASS,
+        note: `parent AP ${parent.AccessPointId} at ${wantPath}, execution role ${roleName} `
+          + '(task definition is registered on demand)',
+      };
     },
   },
+
 ];
 
 const CHECK_NUMBERS = CHECKS.map((c) => c.n);
