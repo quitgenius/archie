@@ -209,9 +209,10 @@ async function fleetDeploy(ctx, args, out, deps = {}) {
   // dirty one.
   //
   // ARITHMETIC THIS CHANGES: the new generation arrives AFTER the reap, so `--keep N` rests at N+1
-  // rollback targets. At --keep 2 that is 4 generations (832 runtimes) rather than 3 (624), against
-  // the 1000 cap. The PEAK is unchanged — staging always adds one on top of the retained set — so
-  // nothing newly breaks; the resting headroom narrows from 376 to 168.
+  // rollback targets. That is why the default is `--keep 1` (cmd/runtime.js): it yields the live
+  // generation plus two to roll back to — exactly what `--keep 2` yielded when the reap came last —
+  // at a LOWER peak, 3 generations (624 runtimes) rather than 4 (832), so the resting headroom is
+  // 376 rather than 168.
   //
   // A reap failure must NEVER block the deploy: failing to reclaim quota is not a reason to refuse to
   // ship, and if headroom is genuinely insufficient `preflight` check 12 refuses a step later. That

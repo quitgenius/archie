@@ -288,7 +288,7 @@ const splitList = (v) => String(v || '').split(',').map((s) => s.trim()).filter(
 /**
  * Every known agent, from the routing GSI (`routing-build.js:68`).
  *
- * `stage` covers EVERY known agent — decided, plan §13: "Simpler, and `--keep 2` leaves the quota
+ * `stage` covers EVERY known agent — decided, plan §13: "Simpler, and `--keep 1` leaves the quota
  * headroom for it." `--agents` narrows it for canary staging and straggler re-runs, and a name that
  * is not in the roster is a usage error rather than a provision: a typo'd agent would otherwise mint
  * a role, an access point and a runtime for an identity that does not exist.
@@ -950,7 +950,7 @@ async function stage(ctx, args, out, deps = {}) {
       ? `hit a service quota while staging ${generationId}`
       : `sustained throttling while staging ${generationId} (${run.headroom.throttle} throttled provisions)`, {
       detail: run.headroom.quota
-        ? 'Re-running now buys nothing. Reap superseded generations first (`archie runtime gc --keep 2`) — at '
+        ? 'Re-running now buys nothing. Reap superseded generations first (`archie runtime gc`) — at '
           + 'every agent in the fleet, keeping 3 generations is 1,040 runtimes against the 1,000 cap (§5.4).'
         : 'The bound is EFS CreateAccessPoint and the token bucket does not refill inside a run (§5.3). '
           + 'Lower --concurrency, wait, then re-run to pick up the stragglers.',

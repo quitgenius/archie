@@ -38,9 +38,20 @@ const { makeClient } = require('../lib/aws');
 const RUNTIME_QUOTA = 1000;
 
 // "N ROLLBACK TARGETS", not N runtimes and not N days. Keeping N therefore keeps N+1 generations:
-// the live one plus N to roll back to. Reference §5.4: at every agent in the fleet `--keep 2` is 624 runtimes,
-// 832 during a staging pass — the working ceiling — and `--keep 3` is 1,040, over the cap.
-const DEFAULT_KEEP = 2;
+// the live one plus N to roll back to.
+//
+// DEFAULT 1, not 2, because `fleet deploy` now reaps BEFORE it builds (see cmd/fleet.js step 0). The
+// new generation arrives AFTER the reap, so a deploy leaves N+1 rollback targets rather than N:
+//
+//   --keep 1  ->  gc leaves 2 generations (416), staging peaks at 3 (624), rests at 3 (624)
+//   --keep 2  ->  gc leaves 3 generations (624), staging peaks at 4 (832), rests at 4 (832)
+//   --keep 3  ->  gc leaves 4 generations (832), staging peaks at 5 (1,040) — OVER the 1,000 cap
+//
+// So `--keep 1` under reap-first yields exactly what `--keep 2` yielded under reap-last — the live
+// generation plus two to roll back to — at a lower peak (624 vs 832) and with the resting headroom
+// restored to 376 rather than 168. A standalone `archie runtime gc` keeps the same meaning; it
+// simply is not followed by a generation being added.
+const DEFAULT_KEEP = 1;
 const MAX_SAFE_KEEP = 2;
 
 // Only a SETTLED runtime may be deleted. A CREATING generation may be another writer's in-flight
@@ -860,6 +871,9 @@ module.exports = {
   gcRuntimes,
   accessPointGc,
   planReap,
+  // Exported so the default can be ASSERTED: changing it changes fleet-wide quota headroom.
+  DEFAULT_KEEP,
+  MAX_SAFE_KEEP,
   bindingOf,
   parseTagFilter,
 };
