@@ -117,6 +117,11 @@ const SSM_PARAMETERS = [
 const SSM_HANDLES = [
   { key: 'EFS_FILE_SYSTEM_ARN', required: true },
   { key: 'DISPATCHER_ACCESS_POINT_ID', required: true },
+  // The hydrator's PARENT access point, rooted at <prefix>/agents. Optional, and deliberately so:
+  // it is a cutover tool with a finite life, and a deployment that has finished migrating should be
+  // able to drop it without the gateway refusing to deploy. `cron hydrate` enforces it for itself,
+  // where the error can say what it is for.
+  { key: 'CRON_HYDRATOR_ACCESS_POINT_ID', required: false },
 ];
 
 // ── §4.3, third category: SERVICE settings ───────────────────────────────────────────────────────
@@ -338,6 +343,104 @@ function composeTaskDefinition({ resources, region, facts, ssm, image, tags }) {
   return td;
 }
 
+/**
+ * The EPHEMERAL cron-hydrator task definition (GATEWAY-OWNERSHIP-PLAN.md §8).
+ *
+ * Registered on demand by `archie cron hydrate`, run once, deregistered. It used to be a standing
+ * Terraform resource; it is not, for three reasons in order of weight:
+ *
+ *   1. It is a CUTOVER TOOL with a finite life. When every agent is over it has no job, and a
+ *      standing resource for a one-off is how migration scaffolding outlives the migration.
+ *   2. IT HOLDS A PRIVILEGE THE GATEWAY REFUSES. Its access point is the PARENT <prefix>/agents, so
+ *      one task can read every agent's subtree. The always-on gateway never holds that mount — it
+ *      gets a narrow one — precisely so a compromised gateway cannot walk the fleet's workspaces.
+ *      Hydration legitimately needs the breadth and should hold it for the life of ONE TASK.
+ *   3. It calls the gateway's manager API, so it must run the same build as the gateway it talks to.
+ *      Composing it here makes that automatic — the image is read from the RUNNING task definition,
+ *      not from a tag someone remembered to bump.
+ *
+ * NO TASK ROLE, and `iam: DISABLED` ON THE MOUNT — the two are the same decision. It makes no AWS API
+ * calls: it reads EFS through the access point and POSTs to the manager API. It borrows the
+ * dispatcher's EXECUTION role, which is what pulls the image and resolves the shared secret.
+ *
+ * `iam: ENABLED` HERE IS AN ERROR, not a hardening. ECS refuses outright — "EFS IAM authorization
+ * requires a task role" — found live 2026-08-16 by copying the dispatcher's volume shape, which does
+ * have a task role. Satisfying it would mean giving a fleet-wide-read task an AWS identity purely to
+ * authorise a mount it can already reach, which is the opposite of the point.
+ *
+ * HARDENED BEYOND THE MOUNT, carried over from the Terraform definition this replaces: unprivileged
+ * user, read-only root filesystem, all capabilities dropped, no privilege escalation. A task that
+ * reads files and makes one HTTP call has no reason to hold anything more — and this one reads EVERY
+ * agent's subtree, so it is the task where that matters most.
+ */
+function composeCronHydratorTaskDefinition({
+  resources, region, facts, image, agentId, parentAccessPointId, mountPath = '/mnt/agents',
+}) {
+  requireFacts(facts, ['executionRoleArn', 'efsFileSystemId', 'dispatcherSharedSecretArn']);
+  if (!image) throw new CliError('composeCronHydratorTaskDefinition needs an image');
+  if (!agentId) throw new CliError('composeCronHydratorTaskDefinition needs an agentId');
+  if (!parentAccessPointId) {
+    throw new CliError(`${SSM_PREFIX}/CRON_HYDRATOR_ACCESS_POINT_ID is not published`, {
+      detail: 'Terraform owns the fleet-wide-read access point at <prefix>/agents and publishes its '
+        + 'id (modules/archie/cron_hydrator.tf, ssm.tf). Hydration cannot read the agents tree '
+        + 'without it.',
+    });
+  }
+
+  const volumeName = 'agents-ro';
+  return {
+    family: `${resources.dispatcherService}-cron-hydrator`,
+    networkMode: 'awsvpc',
+    requiresCompatibilities: ['FARGATE'],
+    // Smaller than the gateway: it reads a handful of JSON files and makes HTTP calls.
+    cpu: '256',
+    memory: '512',
+    executionRoleArn: facts.executionRoleArn,
+
+    volumes: [{
+      name: volumeName,
+      efsVolumeConfiguration: {
+        fileSystemId: facts.efsFileSystemId,
+        rootDirectory: '/',
+        transitEncryption: 'ENABLED',
+        authorizationConfig: { accessPointId: parentAccessPointId, iam: 'DISABLED' },
+      },
+    }],
+
+    containerDefinitions: [{
+      name: 'cron-hydrator',
+      image,
+      essential: true,
+      user: '1000:1000',
+      readonlyRootFilesystem: true,
+      linuxParameters: { capabilities: { add: [], drop: ['ALL'] }, noNewPrivileges: true },
+      // The script ships inside the gateway image; this is the same artifact with a different entry.
+      entryPoint: ['node'],
+      command: ['cron-hydrator.js'],
+      workingDirectory: '/app',
+      environment: [
+        { name: 'HYDRATE_AGENT', value: agentId },
+        { name: 'MOUNT_PATH', value: mountPath },
+        { name: 'MANAGER_API_URL', value: dispatcherBaseUrl(resources.name) },
+        { name: 'AWS_REGION', value: region },
+      ],
+      secrets: [{ name: 'DISPATCHER_SHARED_SECRET', valueFrom: facts.dispatcherSharedSecretArn }],
+      mountPoints: [{ sourceVolume: volumeName, containerPath: mountPath, readOnly: true }],
+      logConfiguration: {
+        logDriver: 'awslogs',
+        options: {
+          // The gateway's log group, with its own stream prefix. Terraform owns log groups, and a
+          // task that created one would be creating infrastructure; sharing keeps a hydration run
+          // next to the gateway turns it produced, which is where you look when comparing them.
+          'awslogs-group': resources.dispatcherLogGroup,
+          'awslogs-region': region,
+          'awslogs-stream-prefix': 'cron-hydrator',
+        },
+      },
+    }],
+  };
+}
+
 /** Kept as one expression so the port cannot disagree with the port mapping. */
 const healthCheckCommand = () => `node -e "require('http').get('http://localhost:${PORT}/health',`
   + 'r=>process.exit(r.statusCode===200?0:1)).on(\'error\',()=>process.exit(1))"';
@@ -355,5 +458,5 @@ function requireFacts(facts, keys) {
 module.exports = {
   CONSTANTS, SSM_PARAMETERS, SSM_HANDLES, SSM_SERVICE, SERVICE, PORT, CPU, MEMORY,
   SSM_PREFIX, dispatcherBaseUrl, healthCheckCommand,
-  composeEnvironment, composeTaskDefinition,
+  composeEnvironment, composeTaskDefinition, composeCronHydratorTaskDefinition,
 };

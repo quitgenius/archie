@@ -106,6 +106,9 @@ test('discoverFacts resolves the whole set from one name', async () => {
   assert.equal(facts.vpcId, 'vpc-1');
   assert.equal(facts.runtimeSecurityGroupId, 'sg-agent-gn0p84-runtime-sg');
   assert.equal(facts.dispatcherSecurityGroupId, 'sg-agent-gn0p84-dispatcher-sg');
+  // The hydrator's own group — the gateway admits port 9090 only from the runtime and hydrator
+  // groups, so reusing the dispatcher's would surface as a bare "fetch failed" from the manager API.
+  assert.equal(facts.cronHydratorSecurityGroupId, 'sg-agent-gn0p84-dispatcher-cron-hydrator-sg');
   assert.equal(facts.executionRoleArn, 'arn:aws:iam::543510375323:role/agent-gn0p84-dispatcher-execution-role');
   assert.equal(facts.taskRoleArn, 'arn:aws:iam::543510375323:role/agent-gn0p84-dispatcher-task-role');
   assert.equal(facts.serviceRegistryArn, 'arn:servicediscovery:svc/1');
@@ -215,8 +218,9 @@ test('security groups are resolved BY NAME within the filesystem VPC', async () 
     },
   });
   await discoverFacts(CTX(), config(), { clients: clients({ ec2 }) });
-  assert.deepEqual(seen.map((s) => s['vpc-id']), ['vpc-1', 'vpc-1']);
-  assert.deepEqual(seen.map((s) => s['group-name']).sort(), ['agent-gn0p84-dispatcher-sg', 'agent-gn0p84-runtime-sg']);
+  assert.deepEqual(seen.map((s) => s['vpc-id']), ['vpc-1', 'vpc-1', 'vpc-1']);
+  assert.deepEqual(seen.map((s) => s['group-name']).sort(),
+    ['agent-gn0p84-dispatcher-cron-hydrator-sg', 'agent-gn0p84-dispatcher-sg', 'agent-gn0p84-runtime-sg']);
 });
 
 test('missing infrastructure exits PREFLIGHT and names what Terraform owns', async () => {
@@ -280,4 +284,28 @@ test('an SSM permission failure names the grant rather than surfacing a bare SDK
   const ssm = clientFrom({ GetParametersCommand: () => { const e = new Error('AccessDenied'); e.name = 'AccessDeniedException'; throw e; } });
   await assert.rejects(readGatewayConfig(CTX(), { clients: clients({ ssm }) }),
     (e) => /ssm:GetParameters failed under \/archie\/gateway/.test(e.message));
+});
+
+test('the SSM read is BATCHED — GetParameters rejects more than 10 names outright', async () => {
+  // Found live: the 11th published parameter turned a working read into a ValidationException
+  // ("Member must have length less than or equal to 10") that failed the WHOLE read rather than
+  // truncating. Before that the single call happened to fit, which is the kind of limit you only
+  // meet by crossing it — and it would have taken `gateway deploy` down with it, not just hydration.
+  const batches = [];
+  const ssm = clientFrom({
+    GetParametersCommand: ({ Names }) => {
+      batches.push(Names.length);
+      if (Names.length > 10) { const e = new Error('too many'); e.name = 'ValidationException'; throw e; }
+      return {
+        Parameters: Names.filter((n) => valueFor(n) !== undefined).map((Name) => ({ Name, Value: valueFor(Name) })),
+        InvalidParameters: [],
+      };
+    },
+  });
+  const { values } = await readGatewayConfig(CTX(), { clients: clients({ ssm }) });
+  assert.ok(batches.length > 1, 'more than one call was made');
+  assert.ok(batches.every((n) => n <= 10), `every batch is within the limit: ${batches.join(',')}`);
+  // and the batching is invisible to the caller — results merge by name
+  assert.equal(values.EFS_FILE_SYSTEM_ARN, FS_ARN);
+  assert.equal(values.DEPLOYMENT_ENVIRONMENT, 'v:DEPLOYMENT_ENVIRONMENT');
 });

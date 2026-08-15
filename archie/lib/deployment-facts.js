@@ -74,29 +74,38 @@ async function readGatewayConfig(ctx, deps = {}) {
   const clients = clientsFor(ctx, deps);
   const prefix = SSM_PREFIX;
 
-  // ONE read covering both categories. `composeEnvironment` consumes only the declared
-  // SSM_PARAMETERS keys and ignores everything else, so the handles ride along without any risk of
-  // being promoted into the container's environment.
+  // Every declared key, in one logical read. `composeEnvironment` consumes only the declared
+  // SSM_PARAMETERS keys and ignores everything else, so the handles and service settings ride along
+  // without any risk of being promoted into the container's environment.
   const names = [...SSM_HANDLES, ...SSM_SERVICE, ...SSM_PARAMETERS].map((p) => `${prefix}/${p.key}`);
-  let res;
-  try {
-    // WithDecryption for the SecureString case. Nothing here is a SecureString today — these are
-    // secret NAMES and account ids, not secret values — but a deployment that upgrades one should
-    // not silently start reading ciphertext.
-    res = await clients.ssm.send(new GetParametersCommand({ Names: names, WithDecryption: true }));
-  } catch (e) {
-    throw new CliError(`ssm:GetParameters failed under ${prefix}`, {
-      cause: e,
-      detail: 'The operator needs ssm:GetParameters on this path. Terraform publishes it '
-        + '(modules/archie/ssm.tf); this reads it.',
-    });
-  }
 
+  // BATCHED IN TENS. `GetParameters` rejects more than 10 names outright — "Member must have length
+  // less than or equal to 10" — and it is a ValidationException, so it fails the whole read rather
+  // than truncating. Found live the moment the 11th parameter was published; before that the single
+  // call happened to fit, which is the kind of limit you meet by crossing it.
+  //
+  // Order is preserved across batches only incidentally; nothing here depends on it, because both
+  // results are keyed by name.
   const values = {};
-  for (const p of res.Parameters || []) {
-    values[String(p.Name).slice(prefix.length + 1)] = p.Value;
+  const missing = [];
+  for (let i = 0; i < names.length; i += 10) {
+    const batch = names.slice(i, i + 10);
+    let res;
+    try {
+      // WithDecryption for the SecureString case. Nothing here is a SecureString today — these are
+      // secret NAMES and account ids, not secret values — but a deployment that upgrades one should
+      // not silently start reading ciphertext.
+      res = await clients.ssm.send(new GetParametersCommand({ Names: batch, WithDecryption: true }));
+    } catch (e) {
+      throw new CliError(`ssm:GetParameters failed under ${prefix}`, {
+        cause: e,
+        detail: 'The operator needs ssm:GetParameters on this path. Terraform publishes it '
+          + '(modules/archie/ssm.tf); this reads it.',
+      });
+    }
+    for (const p of res.Parameters || []) values[String(p.Name).slice(prefix.length + 1)] = p.Value;
+    for (const n of res.InvalidParameters || []) missing.push(String(n).slice(prefix.length + 1));
   }
-  const missing = (res.InvalidParameters || []).map((n) => String(n).slice(prefix.length + 1));
   return { values, missing, prefix };
 }
 
@@ -131,11 +140,12 @@ async function discoverFacts(ctx, config, deps = {}) {
     dispatcherSecrets(clients, r),
   ]);
 
-  // Both groups are resolved BY NAME inside the filesystem's VPC — see the file header for the
+  // All three groups are resolved BY NAME inside the filesystem's VPC — see the file header for the
   // failure that rule exists to prevent.
-  const [runtimeSecurityGroupId, dispatcherSecurityGroupId] = await Promise.all([
+  const [runtimeSecurityGroupId, dispatcherSecurityGroupId, cronHydratorSecurityGroupId] = await Promise.all([
     securityGroupId(clients, efs.vpcId, `${r.name}-runtime-sg`),
-    securityGroupId(clients, efs.vpcId, `${r.name}-dispatcher-sg`),
+    securityGroupId(clients, efs.vpcId, `${r.dispatcherService}-sg`),
+    securityGroupId(clients, efs.vpcId, `${r.dispatcherService}-cron-hydrator-sg`),
   ]);
 
   return {
@@ -152,11 +162,18 @@ async function discoverFacts(ctx, config, deps = {}) {
     subnetIds: efs.subnetIds.slice().sort(),
     runtimeSecurityGroupId,
     dispatcherSecurityGroupId,
+    // The hydrator's OWN group. Using the dispatcher's would fail in a way that reads as a network
+    // problem: the gateway admits port 9090 only from the runtime and hydrator groups, so the
+    // manager-API call comes back as a bare "fetch failed".
+    cronHydratorSecurityGroupId,
     serviceRegistryArn,
     executionRoleArn: roles.executionRoleArn,
     taskRoleArn: roles.taskRoleArn,
     secrets: secrets.list,
     credentialSecretName: secrets.credentialSecretName,
+    // Named separately because the hydrator needs THIS one on its own — it authenticates to the
+    // manager API and reads nothing else.
+    dispatcherSharedSecretArn: (secrets.list.find((x) => x.name === 'DISPATCHER_SHARED_SECRET') || {}).valueFrom,
   };
 }
 

@@ -427,11 +427,144 @@ test('cron commands refuse without a manager API URL — the store has exactly o
   await rejects(wrappers['cron hydrate'](makeCtx(), args(['agent-75lieo']), makeOut(), noUrl), EXIT.REFUSED, /MANAGER_API_URL/);
 });
 
-test('cron hydrate refuses without the read-only parent mount', async () => {
+/**
+ * The discovery bag the task path needs: SSM handles plus the AWS facts the composition reads.
+ * Mirrors lib/deployment-facts.js's client shapes so the real discovery code runs unmodified.
+ */
+function hydratorClients() {
+  const ACCT = '203366135563';
+  const one = (handlers) => ({
+    send: async (cmd) => {
+      const h = handlers[cmd.constructor.name];
+      if (!h) throw new Error(`unexpected ${cmd.constructor.name}`);
+      return h(cmd.input);
+    },
+  });
+  const VALUES = {
+    EFS_FILE_SYSTEM_ARN: `arn:aws:elasticfilesystem:us-east-1:${ACCT}:file-system/fs-1`,
+    DISPATCHER_ACCESS_POINT_ID: 'fsap-gw',
+    CRON_HYDRATOR_ACCESS_POINT_ID: 'fsap-parent',
+    DEPLOYMENT_ENVIRONMENT: 'sandbox',
+    AGENTCORE_RUNTIME_TLS_REJECT: '1',
+  };
+  return {
+    sts: one({ GetCallerIdentityCommand: () => ({ Account: ACCT }) }),
+    ecr: one({ DescribeRepositoriesCommand: ({ repositoryNames }) => ({ repositories: [{ repositoryUri: `r/${repositoryNames[0]}` }] }) }),
+    sqs: one({ GetQueueUrlCommand: ({ QueueName }) => ({ QueueUrl: `https://sqs/${QueueName}` }) }),
+    iam: one({ GetRoleCommand: ({ RoleName }) => ({ Role: { Arn: `arn:aws:iam::${ACCT}:role/${RoleName}` } }) }),
+    efs: one({
+      DescribeAccessPointsCommand: () => ({ AccessPoints: [{ AccessPointId: 'fsap-gw', FileSystemId: 'fs-1' }] }),
+      DescribeMountTargetsCommand: () => ({ MountTargets: [{ VpcId: 'vpc-1', SubnetId: 'subnet-a' }] }),
+    }),
+    ec2: one({ DescribeSecurityGroupsCommand: ({ Filters }) => ({ SecurityGroups: [{ GroupId: `sg-${Filters.find((f) => f.Name === 'group-name').Values[0]}` }] }) }),
+    secrets: one({ DescribeSecretCommand: ({ SecretId }) => ({ ARN: `arn:secret:${SecretId}` }) }),
+    discovery: one({
+      ListNamespacesCommand: () => ({ Namespaces: [{ Id: 'ns-1', Name: 'redacted-internal-host.example' }] }),
+      ListServicesCommand: () => ({ Services: [{ Name: 'dispatcher', Arn: 'arn:sd/1' }] }),
+    }),
+    ssm: one({
+      GetParametersCommand: ({ Names }) => ({
+        Parameters: Names.filter((n) => VALUES[n.split('/').pop()] !== undefined).map((Name) => ({ Name, Value: VALUES[Name.split('/').pop()] })),
+        InvalidParameters: Names.filter((n) => VALUES[n.split('/').pop()] === undefined),
+      }),
+    }),
+  };
+}
+
+test('cron hydrate without a local mount runs an EPHEMERAL task, and drops it afterwards', async () => {
+  // It used to REFUSE here — "MOUNT_PATH is not set, that mount exists on the cron_hydrator task, not
+  // on a laptop" — which was true and useless: the task was the only way to run it and the CLI could
+  // not start one. §E1 is that missing half.
+  //
+  // The three things asserted are the three that make it ephemeral rather than standing: it
+  // registers, it runs against its OWN security group, and it deregisters. The deregister is in a
+  // `finally`, so a failure mid-run cannot leave behind exactly the standing resource this design
+  // removed — unowned by Terraform this time.
+  const calls = [];
+  const ecs = {
+    send: async (cmd) => {
+      const name = cmd.constructor.name;
+      calls.push({ name, input: cmd.input });
+      if (name === 'DescribeServicesCommand') return { services: [{ status: 'ACTIVE', taskDefinition: 'arn:td/archie-dispatcher:2' }] };
+      if (name === 'DescribeTaskDefinitionCommand') return { taskDefinition: { containerDefinitions: [{ image: 'repo/archie-gateway:content-abc' }] } };
+      if (name === 'RegisterTaskDefinitionCommand') return { taskDefinition: { taskDefinitionArn: 'arn:aws:ecs:us-east-1:1:task-definition/archie-dispatcher-cron-hydrator:7' } };
+      if (name === 'RunTaskCommand') return { tasks: [{ taskArn: 'arn:aws:ecs:us-east-1:1:task/archie/abc123' }], failures: [] };
+      if (name === 'DescribeTasksCommand') return { tasks: [{ lastStatus: 'STOPPED', containers: [{ exitCode: 0 }] }] };
+      if (name === 'DeregisterTaskDefinitionCommand') return {};
+      throw new Error(`unexpected ${name}`);
+    },
+  };
+  const logs = { send: async () => ({ events: [{ message: 'cron-hydrator: done' }] }) };
+
+  const { deps } = cronDeps();
+  const out = makeOut();
+  const r = await wrappers['cron hydrate'](makeCtx(), args(['agent-75lieo']), out, {
+    ...deps, env: {}, ecs, logs, clients: hydratorClients(),
+  });
+
+  assert.equal(r.mode, 'task');
+  assert.equal(r.exitCode, 0);
+  const names = calls.map((c) => c.name);
+  assert.ok(names.includes('RegisterTaskDefinitionCommand'), 'registers an ephemeral definition');
+  assert.ok(names.includes('DeregisterTaskDefinitionCommand'), 'and deregisters it');
+
+  const run = calls.find((c) => c.name === 'RunTaskCommand').input;
+  assert.deepEqual(run.networkConfiguration.awsvpcConfiguration.securityGroups, ['sg-agent-gn0p84-dispatcher-cron-hydrator-sg'],
+    'its OWN group — the gateway admits 9090 only from the runtime and hydrator groups');
+  assert.equal(run.networkConfiguration.awsvpcConfiguration.assignPublicIp, 'DISABLED');
+
+  const registered = calls.find((c) => c.name === 'RegisterTaskDefinitionCommand').input;
+  assert.equal(registered.containerDefinitions[0].image, 'repo/archie-gateway:content-abc',
+    'the RUNNING gateway image, so the hydrator speaks the same manager API');
+  assert.equal(registered.taskRoleArn, undefined, 'no task role: it makes no AWS API calls');
+  assert.equal(registered.containerDefinitions[0].mountPoints[0].readOnly, true);
+  assert.match(out.text(), /WIPES archie's cron store/);
+});
+
+test('cron hydrate deregisters the ephemeral definition even when the task FAILS', async () => {
+  // The `finally`. A non-zero exit is a real failure and must propagate — but leaving the definition
+  // behind on the way out would recreate the standing resource by accident.
+  let deregistered = false;
+  const ecs = {
+    send: async (cmd) => {
+      const name = cmd.constructor.name;
+      if (name === 'DescribeServicesCommand') return { services: [{ status: 'ACTIVE', taskDefinition: 'arn:td/x:1' }] };
+      if (name === 'DescribeTaskDefinitionCommand') return { taskDefinition: { containerDefinitions: [{ image: 'repo:tag' }] } };
+      if (name === 'RegisterTaskDefinitionCommand') return { taskDefinition: { taskDefinitionArn: 'arn:td/h:1' } };
+      if (name === 'RunTaskCommand') return { tasks: [{ taskArn: 'arn:task/abc' }], failures: [] };
+      if (name === 'DescribeTasksCommand') return { tasks: [{ lastStatus: 'STOPPED', containers: [{ exitCode: 1, reason: 'boom' }], stoppedReason: 'Essential container exited' }] };
+      if (name === 'DeregisterTaskDefinitionCommand') { deregistered = true; return {}; }
+      throw new Error(`unexpected ${name}`);
+    },
+  };
   const { deps } = cronDeps();
   await rejects(
-    wrappers['cron hydrate'](makeCtx(), args(['agent-75lieo']), makeOut(), { ...deps, env: { MANAGER_API_URL: 'http://x' } }),
-    EXIT.REFUSED, /MOUNT_PATH/,
+    wrappers['cron hydrate'](makeCtx(), args(['agent-75lieo']), makeOut(), { ...deps, env: {}, ecs, logs: null, clients: hydratorClients() }),
+    EXIT.FAILED, /exited 1/,
+  );
+  assert.equal(deregistered, true);
+});
+
+test('cron hydrate reports a RunTask that never started, rather than an empty task list', async () => {
+  // `failures` is how ECS says "no capacity", "subnet has no route", "image pull will fail".
+  // Surfacing that as "the task did not appear" sends someone looking in entirely the wrong place.
+  const ecs = {
+    send: async (cmd) => {
+      const name = cmd.constructor.name;
+      if (name === 'DescribeServicesCommand') return { services: [{ status: 'ACTIVE', taskDefinition: 'arn:td/x:1' }] };
+      if (name === 'DescribeTaskDefinitionCommand') return { taskDefinition: { containerDefinitions: [{ image: 'repo:tag' }] } };
+      if (name === 'RegisterTaskDefinitionCommand') return { taskDefinition: { taskDefinitionArn: 'arn:td/h:1' } };
+      if (name === 'RunTaskCommand') return { tasks: [], failures: [{ arn: 'arn:task/x', reason: 'RESOURCE:MEMORY' }] };
+      if (name === 'DeregisterTaskDefinitionCommand') return {};
+      throw new Error(`unexpected ${name}`);
+    },
+  };
+  const { deps } = cronDeps();
+  // `rejects` matches against `message + detail`, so this asserts the ECS reason reaches the operator
+  // rather than being swallowed into a generic failure.
+  await rejects(
+    wrappers['cron hydrate'](makeCtx(), args(['agent-75lieo']), makeOut(), { ...deps, env: {}, ecs, logs: null, clients: hydratorClients() }),
+    EXIT.FAILED, /started no task.*RESOURCE:MEMORY/s,
   );
 });
 

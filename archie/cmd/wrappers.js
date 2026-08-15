@@ -645,21 +645,42 @@ async function cronList(ctx, args, out, deps) {
   return { agent: agentId, jobs, count: jobs.length, enabled };
 }
 
+/**
+ * `archie cron hydrate <agent>` — GATEWAY-OWNERSHIP-PLAN.md §8/§E1.
+ *
+ * TWO MODES, and the split is not a convenience. The hydrator must read the PARENT access point
+ * (<prefix>/agents, fleet-wide read) which exists on a Fargate task and nowhere else — certainly not
+ * on a laptop. So from a laptop this composes an EPHEMERAL task definition around that access point,
+ * runs it once, and deregisters it; INSIDE that task, `cron-hydrator.js` runs directly and this code
+ * is not involved.
+ *
+ * MOUNT_PATH being set is what distinguishes them, and it is a fact about the environment rather than
+ * a flag: if the agents tree is already mounted here, running in-process is both possible and
+ * cheaper. That is the path the tests and the container itself take.
+ *
+ * THE PREVIEW MOVED WITH THE WORK. In-process, it is computed here and printed before anything is
+ * posted. Remote, it is computed and logged INSIDE the task — by the same planner, over the same
+ * files — and reaches you in the task's log tail. It could not be computed locally: the whole reason
+ * for the task is that these files are not readable from here.
+ */
 async function cronHydrate(ctx, args, out, deps) {
   const agentId = oneAgent(args);
   const mountDir = deps.env.MOUNT_PATH;
-  if (!mountDir) {
-    throw refused('MOUNT_PATH is not set — the agent EFS cron store is not mounted here', {
-      detail: 'This reads the PARENT access point READ-ONLY at MOUNT_PATH; that mount exists on the '
-        + 'cron_hydrator task (cron_hydrator.tf:25,48), not on a laptop.',
-    });
-  }
+
+  out.progress(`${agentId}: WIPES archie's cron store for this agent, then seeds from EFS`);
+  return mountDir
+    ? cronHydrateInProcess(ctx, args, out, deps, { agentId, mountDir })
+    : cronHydrateViaTask(ctx, args, out, deps, { agentId });
+}
+
+/** The agents tree is mounted here (inside the hydrator task, or a test). Seed directly. */
+async function cronHydrateInProcess(ctx, args, out, deps, { agentId, mountDir }) {
   const api = await managerApi(ctx, out, deps);
   const hydrator = deps.modules.cronHydrator();
 
-  // What this run will seed — computed from the SAME planner the seed uses, and
-  // printed BEFORE anything is posted. 79 of 259 enabled prod jobs are in a failing state, and
-  // "cutover would quietly resurrect all of them at once, in a single burst, into people's DMs"
+  // What this run will seed — computed from the SAME planner the seed uses, and printed BEFORE
+  // anything is posted. 79 of 259 enabled prod jobs are in a failing state, and "cutover would
+  // quietly resurrect all of them at once, in a single burst, into people's DMs"
   // (cron-hydrator.js:388-390). A count is the difference between a decision and a surprise.
   const parsed = hydrator.readAgentCron(mountDir, agentId, deps.fs);
   const plan = hydrator.buildBodies(agentId, parsed, deps.now());
@@ -674,25 +695,17 @@ async function cronHydrate(ctx, args, out, deps) {
     skipped: plan.skipped.length,
     dropped: plan.dropped.length,
   };
-  // "PURGE then post", not "post". Hydration is destructive now — it wipes the agent's archie-side
-  // store before seeding, which is what makes repeated attempts converge. Saying only what will be
-  // posted would understate what the command does.
-  out.progress(`${agentId}: WIPES archie's cron store for this agent, then seeds from EFS`);
   out.progress(`${agentId}: ${preview.onEfs} job(s) on EFS → would post ${wouldPost} (${wouldEnable} ENABLED, `
     + `${preview.seededDisabledPendingReview} parked for review, ${preview.seededDisabledUnroutableChannel} parked for an unroutable channel, `
     + `${preview.skipped} skipped, ${preview.dropped} dropped by decision)`);
 
   // NO RE-RUN GATE. There was one — a per-agent `hydrated` marker making this one-time-at-flip,
-  // refusing a second run unless --force. It has been removed: during the migration window OpenClaw
-  // stays authoritative and archie's store is a derived replica, so re-running to converge is the
-  // NORMAL operation, not a recovery escape hatch. Getting an agent's decision map right routinely
-  // takes several attempts, and a crash mid-seed must not leave it stuck.
-  //
-  // The preview above still prints first, and still matters: it is the difference between a decision
-  // and a surprise. What it no longer does is block.
+  // refusing a second run unless --force. Removed: while OpenClaw stays authoritative archie's store
+  // is a derived replica, so re-running to converge is the NORMAL operation. The preview still prints
+  // first and still matters; what it no longer does is block.
   if (ctx.dryRun) {
     out.progress('dry-run: nothing purged, nothing posted — the store is untouched');
-    return { dryRun: true, agent: agentId, ...preview };
+    return { dryRun: true, agent: agentId, mode: 'in-process', ...preview };
   }
 
   const summary = await hydrator.hydrateAgent({
@@ -703,10 +716,84 @@ async function cronHydrate(ctx, args, out, deps) {
       error: (o, m) => out.verbose(`ERROR ${m} ${JSON.stringify(o)}`),
     },
   });
-  // A partial seed is NOT marked hydrated, by design, so it retries. Surface each failed job rather
-  // than one exit code — `failures[]` names them (lib/output.js).
+  // Surface each failed job rather than one exit code — `failures[]` names them (lib/output.js).
   for (const e of summary.errors || []) out.failure({ agent: agentId, step: `cron-seed ${e.jobId}`, error: new Error(e.err) });
-  return { agent: agentId, ...preview, posted: summary.posted, errors: summary.errors };
+  return { agent: agentId, mode: 'in-process', ...preview, purged: summary.purged, posted: summary.posted, errors: summary.errors };
+}
+
+/** The normal path: register an ephemeral task around the fleet-wide-read mount, run it, drop it. */
+async function cronHydrateViaTask(ctx, args, out, deps, { agentId }) {
+  const { discoverFacts, readGatewayConfig } = require('../lib/deployment-facts');
+  const { composeCronHydratorTaskDefinition } = require('../lib/task-definition');
+  const { runEphemeralTask } = require('../lib/run-task');
+  const { makeClient } = require('../lib/aws');
+
+  const ecs = deps.ecs || makeClient(ctx, '@aws-sdk/client-ecs', 'ECSClient');
+  const logs = deps.logs || makeClient(ctx, '@aws-sdk/client-cloudwatch-logs', 'CloudWatchLogsClient');
+
+  const config = await readGatewayConfig(ctx, deps);
+  const facts = await discoverFacts(ctx, config, deps);
+
+  // THE IMAGE COMES FROM THE RUNNING GATEWAY, not from a tag. The hydrator calls the gateway's
+  // manager API, so it has to speak the same version — and reading the deployed task definition is
+  // the only way to be sure of that without an operator remembering to keep two tags in step.
+  const deployed = await readDeployedGatewayImage(ctx, ecs, deps);
+  out.progress(`image       ${deployed.image}  (the running gateway's own build)`);
+
+  const taskDefinition = composeCronHydratorTaskDefinition({
+    resources: ctx.resources,
+    region: ctx.region,
+    facts,
+    image: deployed.image,
+    agentId,
+    parentAccessPointId: config.values.CRON_HYDRATOR_ACCESS_POINT_ID,
+  });
+
+  if (ctx.dryRun) {
+    out.progress(`would register ${taskDefinition.family}, RunTask it against ${ctx.resources.cluster}, `
+      + 'and deregister it');
+    out.progress('dry-run: nothing purged, nothing posted — the store is untouched');
+    return { dryRun: true, agent: agentId, mode: 'task', taskDefinition };
+  }
+
+  const result = await runEphemeralTask({
+    ecs,
+    logs,
+    taskDefinition,
+    cluster: ctx.resources.cluster,
+    subnets: facts.subnetIds,
+    // ITS OWN group, not the dispatcher's: the gateway admits port 9090 only from the runtime and
+    // hydrator groups, so any other choice fails as a bare "fetch failed" from the manager API call.
+    securityGroups: [facts.cronHydratorSecurityGroupId],
+    logGroup: ctx.resources.dispatcherLogGroup,
+    streamPrefix: 'cron-hydrator',
+    out,
+    now: deps.now,
+  });
+
+  // The task's own output IS the report — the preview, every per-job decision, and the counts are all
+  // logged in there by the same code the in-process path prints from.
+  for (const line of result.logLines) out.progress(`            ${line}`);
+  return { agent: agentId, mode: 'task', ...result };
+}
+
+/** The image the dispatcher is actually running. */
+async function readDeployedGatewayImage(ctx, ecs, deps) {
+  if (deps.deployedGatewayImage) return deps.deployedGatewayImage();
+  const { DescribeServicesCommand, DescribeTaskDefinitionCommand } = require('@aws-sdk/client-ecs');
+  const described = await ecs.send(new DescribeServicesCommand({
+    cluster: ctx.resources.cluster, services: [ctx.resources.dispatcherService],
+  }));
+  const svc = (described.services || []).find((x) => x.status !== 'INACTIVE');
+  if (!svc) {
+    throw refused(`${ctx.resources.dispatcherService} is not running`, {
+      detail: 'The hydrator runs the gateway\'s own image and calls its manager API; both need the '
+        + 'gateway deployed. Run `archie gateway deploy` first.',
+    });
+  }
+  const td = await ecs.send(new DescribeTaskDefinitionCommand({ taskDefinition: svc.taskDefinition }));
+  const container = (td.taskDefinition.containerDefinitions || [])[0] || {};
+  return { image: container.image, taskDefinition: svc.taskDefinition };
 }
 
 /**
