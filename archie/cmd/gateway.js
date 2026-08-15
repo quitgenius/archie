@@ -602,13 +602,19 @@ async function deploy(ctx, args, out, deps = {}) {
   }));
   out.progress('rolling     desired=1 min=0% max=100%  — stop-then-start, downtime expected');
 
-  // The Terraform follow-up, said EVERY time and not only on failure: the service resource has no
-  // `ignore_changes` on task_definition, so the next `terraform apply` plans the service back onto
-  // the task definition Terraform knows about.
-  const tf = terraformFollowUp(ctx, tag);
-  out.warn(`Terraform owns this task definition (dispatcher.tf:149) and this service `
-    + `(dispatcher.tf:216). Set ${tf.variable} = "${tf.value}" before the next \`terraform apply\`, or `
-    + 'that apply will roll the dispatcher back to the tag in tfvars — a second ~94s outage.');
+  // NO Terraform follow-up. The service carries `ignore_changes = [task_definition]`
+  // (modules/archie/dispatcher.tf), so this command owns which revision runs and `terraform apply`
+  // leaves it alone.
+  //
+  // It did not used to. Terraform planned the service back onto the tag in tfvars, so an unrelated
+  // apply days later silently rolled the dispatcher to an older image AND cost a second ~94s outage,
+  // with nothing linking the two events. The mitigation was a warning printed here telling the
+  // operator to go and bump `archie_dispatcher_image_tag` — a convention that holds until the one
+  // time it matters. `var.dispatcher_image_tag` is now the BOOTSTRAP image only: what a from-scratch
+  // apply starts on. Bumping it does not deploy anything.
+  out.verbose(`terraform  not required: the service ignores task_definition changes, so this revision `
+    + `survives the next apply. var.${terraformFollowUp(ctx, tag).variable} is the from-scratch `
+    + 'bootstrap image only.');
 
   if (args.values['no-wait']) {
     out.warn('--no-wait: nothing is monitoring the rollout. The wait is the value of this command; '
@@ -616,7 +622,7 @@ async function deploy(ctx, args, out, deps = {}) {
     return emit(ctx, out, {
       tag, image, imageDigest: inEcr.digest, cluster: deployed.cluster, service: deployed.service,
       previousTaskDefinition: currentTd, registeredTaskDefinition: arnTail(newArn),
-      rolled: true, unchanged: false, waited: false, timeline: null, terraform: tf,
+      rolled: true, unchanged: false, waited: false, timeline: null, terraform: terraformFollowUp(ctx, tag),
     }, renderDeploy);
   }
 
@@ -634,7 +640,7 @@ async function deploy(ctx, args, out, deps = {}) {
   return emit(ctx, out, {
     tag, image, imageDigest: inEcr.digest, cluster: deployed.cluster, service: deployed.service,
     previousTaskDefinition: currentTd, registeredTaskDefinition: arnTail(newArn),
-    rolled: true, unchanged: false, waited: true, timeline, terraform: tf,
+    rolled: true, unchanged: false, waited: true, timeline, terraform: terraformFollowUp(ctx, tag),
   }, renderDeploy);
 }
 
@@ -649,9 +655,22 @@ function waitBudgetSeconds(ctx, args) {
   return ctx.timeoutSeconds || DEFAULT_WAIT_SECONDS;
 }
 
-/** The tfvars knob a deploy leaves stale. Derived, so a rename of the variable is a one-line fix. */
+/**
+ * The BOOTSTRAP tfvar — reported for context, no longer a follow-up action.
+ *
+ * The service ignores `task_definition` changes (modules/archie/dispatcher.tf), so a deploy no
+ * longer leaves this stale in any way that matters: it is what a from-scratch apply starts on, not
+ * what runs. Still emitted in --json because a from-scratch environment DOES want it current, and
+ * kept derived so renaming the variable is a one-line fix.
+ */
 function terraformFollowUp(ctx, tag) {
-  return { variable: 'archie_dispatcher_image_tag', value: tag, makefileVariable: 'ARCHIE_GATEWAY_TAG' };
+  return {
+    variable: 'archie_dispatcher_image_tag',
+    value: tag,
+    makefileVariable: 'ARCHIE_GATEWAY_TAG',
+    required: false,
+    note: 'bootstrap image for a from-scratch apply; the service ignores task_definition changes, so this deploy survives terraform apply',
+  };
 }
 
 /**

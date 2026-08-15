@@ -465,18 +465,25 @@ test('deploy: waits stopped -> started -> healthy and reports the measured gap',
   assert.doesNotMatch(text, /zero downtime|no downtime/i);
 });
 
-test('deploy: says which tfvars value the next terraform apply needs', async () => {
-  // Terraform owns both resources and has no ignore_changes on task_definition, so the next apply
-  // plans the service back onto the tag in tfvars — a second ~94s outage if nobody bumps it.
+test('deploy: does NOT ask for a terraform follow-up — archie owns the running revision', async () => {
+  // The service carries `ignore_changes = [task_definition]` (modules/archie/dispatcher.tf), so this
+  // deploy survives the next apply. It used to not: Terraform planned the service back onto the tag
+  // in tfvars, so an unrelated apply days later silently rolled the dispatcher to an older image AND
+  // cost a second ~94s outage. The mitigation was a WARNING telling the operator to go bump the
+  // tfvar — a convention that holds until the once it matters. This asserts the warning is gone,
+  // because a stale "you must do X" is worse than none: it trains operators to ignore warnings.
   const ecs = ecsFor({ services: sequence([[service()], [service({ runningCount: 0 })], [service({ runningCount: 1, taskDefinitionArn: TD_70, deployments: [{ status: 'PRIMARY', taskDefinition: TD_70, runningCount: 1 }] })]]) });
   const out = makeOut();
   const result = await gateway.deploy(makeCtx(), makeArgs({ tag: 'archie-0.2.23' }), out, {
     ecr: ecrFor({ image: true }), ecs, sts: stsOk(), ...fakeClock('2026-08-14T20:12:53Z'), pollIntervalMs: 47000,
   });
-  assert.deepEqual(result.terraform, {
-    variable: 'archie_dispatcher_image_tag', value: 'archie-0.2.23', makefileVariable: 'ARCHIE_GATEWAY_TAG',
-  });
-  assert.match(out.lines.warn.join('\n'), /archie_dispatcher_image_tag = "archie-0\.2\.23"/);
+  // Still REPORTED in --json: a from-scratch environment does want the bootstrap tag current.
+  assert.equal(result.terraform.variable, 'archie_dispatcher_image_tag');
+  assert.equal(result.terraform.value, 'archie-0.2.23');
+  assert.equal(result.terraform.required, false);
+  assert.match(result.terraform.note, /bootstrap/);
+  // ...but no longer an instruction the operator must act on.
+  assert.doesNotMatch(out.lines.warn.join('\n'), /terraform apply|archie_dispatcher_image_tag/);
 });
 
 test('deploy: a stop observed between polls still reports a gap, flagged approximate', async () => {
