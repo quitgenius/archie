@@ -365,11 +365,9 @@ test('grants dry-run previews the diff and writes nothing', async () => {
 
 // ── cron ─────────────────────────────────────────────────────────────────────────────────────
 
-function cronDeps({ hydrated = false, jobs = [], bodies = [{ jobId: 'j1', enabled: true }, { jobId: 'j2', enabled: false }], needsReview = [{ jobId: 'j2' }] } = {}) {
+function cronDeps({ jobs = [], bodies = [{ jobId: 'j1', enabled: true }, { jobId: 'j2', enabled: false }], needsReview = [{ jobId: 'j2' }] } = {}) {
   const posted = [];
   const api = {
-    isHydrated: async () => hydrated,
-    markHydrated: async () => {},
     add: async (b) => { posted.push(b); },
     list: async () => jobs,
   };
@@ -383,7 +381,7 @@ function cronDeps({ hydrated = false, jobs = [], bodies = [{ jobId: 'j1', enable
         cronHydrator: () => ({
           readAgentCron: () => ({ jobs: bodies.map((b) => ({ id: b.jobId })), state: {}, entities: {} }),
           buildBodies: () => ({ bodies, skipped: [], degraded: [], needsReview, overridden: [], dropped: [], split: [], decisionErrors: [], benign: [] }),
-          hydrateAgent: async () => { for (const b of bodies) await api.add(b); return { posted: bodies.length, errors: [], alreadyHydrated: false }; },
+          hydrateAgent: async () => { for (const b of bodies) await api.add(b); return { posted: bodies.length, errors: [] }; },
           createManagerApi: () => api,
         }),
       },
@@ -391,28 +389,28 @@ function cronDeps({ hydrated = false, jobs = [], bodies = [{ jobId: 'j1', enable
   };
 }
 
-test('cron hydrate refuses to re-run after the flip, and says what a re-run would resurrect', async () => {
-  const { deps, posted } = cronDeps({ hydrated: true });
-  const out = makeOut();
-  await rejects(wrappers['cron hydrate'](makeCtx(), args(['agent-75lieo']), out, deps), EXIT.REFUSED, /ONE-TIME-AT-FLIP|--force/);
-  assert.match(out.lines.progress.join('\n'), /would post 2 \(1 ENABLED/);
-  assert.equal(posted.length, 0);
+test('cron hydrate is RE-RUNNABLE — no marker, no refusal, and the preview still prints', async () => {
+  // It used to refuse a second run: a per-agent `hydrated` marker made this one-time-at-flip, and
+  // getting past it needed --force plus --yes. Removed 2026-08-16 — while OpenClaw stays
+  // authoritative, archie's store is a derived replica and re-running to converge is the normal
+  // operation. An agent's decision map routinely takes several attempts, and a crash mid-seed must
+  // not leave it stuck.
+  //
+  // The preview is what survives, and it is the part that mattered: it still prints BEFORE anything
+  // is posted. 79 of 259 enabled prod jobs are in a failing state, so seeing the counts first is the
+  // difference between a decision and a surprise. What it no longer does is block.
+  const first = cronDeps();
+  const out1 = makeOut();
+  const r1 = await wrappers['cron hydrate'](makeCtx({ assumeYes: true }), args(['agent-75lieo']), out1, first.deps);
+  assert.equal(r1.posted, 2);
+  assert.match(out1.lines.progress.join('\n'), /would post 2 \(1 ENABLED/);
+
+  const again = cronDeps();
+  const out2 = makeOut();
+  const r2 = await wrappers['cron hydrate'](makeCtx({ assumeYes: true }), args(['agent-75lieo']), out2, again.deps);
+  assert.equal(r2.posted, 2, 'a second run seeds again rather than refusing');
+  assert.match(out2.lines.progress.join('\n'), /would post 2 \(1 ENABLED/);
 });
-
-test('--force prints the count it would resurrect and still needs --yes', async () => {
-  const forced = cronDeps({ hydrated: true });
-  const out = makeOut();
-  await rejects(
-    wrappers['cron hydrate'](makeCtx(), args(['agent-75lieo'], { force: true }), out, forced.deps),
-    EXIT.REFUSED, /would re-seed 2 job\(s\), 1 of them ENABLED/,
-  );
-  assert.equal(forced.posted.length, 0);
-
-  const ok = cronDeps({ hydrated: true });
-  const r = await wrappers['cron hydrate'](makeCtx({ assumeYes: true }), args(['agent-75lieo'], { force: true }), makeOut(), ok.deps);
-  assert.equal(r.posted, 2);
-  assert.equal(ok.posted.length, 2);
-}, { concurrency: false });
 
 test('cron hydrate dry-run posts nothing', async () => {
   const { deps, posted } = cronDeps();

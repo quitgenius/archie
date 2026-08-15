@@ -647,7 +647,6 @@ async function cronList(ctx, args, out, deps) {
 
 async function cronHydrate(ctx, args, out, deps) {
   const agentId = oneAgent(args);
-  const force = Boolean(args.values.force);
   const mountDir = deps.env.MOUNT_PATH;
   if (!mountDir) {
     throw refused('MOUNT_PATH is not set — the agent EFS cron store is not mounted here', {
@@ -658,11 +657,7 @@ async function cronHydrate(ctx, args, out, deps) {
   const api = await managerApi(ctx, out, deps);
   const hydrator = deps.modules.cronHydrator();
 
-  // The flip gate. "Once flipped, the store is authoritative and EFS is only a rollback mirror;
-  // re-hydrating later would resurrect stale/deleted jobs" (cron-hydrator.js:18-20).
-  const already = await api.isHydrated(agentId);
-
-  // What a re-run would actually bring back — computed from the SAME planner the seed uses, and
+  // What this run will seed — computed from the SAME planner the seed uses, and
   // printed BEFORE anything is posted. 79 of 259 enabled prod jobs are in a failing state, and
   // "cutover would quietly resurrect all of them at once, in a single burst, into people's DMs"
   // (cron-hydrator.js:388-390). A count is the difference between a decision and a surprise.
@@ -679,28 +674,29 @@ async function cronHydrate(ctx, args, out, deps) {
     skipped: plan.skipped.length,
     dropped: plan.dropped.length,
   };
+  // "PURGE then post", not "post". Hydration is destructive now — it wipes the agent's archie-side
+  // store before seeding, which is what makes repeated attempts converge. Saying only what will be
+  // posted would understate what the command does.
+  out.progress(`${agentId}: WIPES archie's cron store for this agent, then seeds from EFS`);
   out.progress(`${agentId}: ${preview.onEfs} job(s) on EFS → would post ${wouldPost} (${wouldEnable} ENABLED, `
     + `${preview.seededDisabledPendingReview} parked for review, ${preview.seededDisabledUnroutableChannel} parked for an unroutable channel, `
     + `${preview.skipped} skipped, ${preview.dropped} dropped by decision)`);
 
-  if (already && !force) {
-    throw refused(`${agentId} is already marked hydrated — this is a ONE-TIME-AT-FLIP seed, not a re-runnable reconcile`, {
-      detail: `Re-running would resurrect stale or deleted jobs (${wouldEnable} of them ENABLED). `
-        + 'Pass --force with --yes if you have decided that is what you want.',
-    });
-  }
-  if (force && !ctx.dryRun && !ctx.assumeYes) {
-    throw refused(`--force would re-seed ${wouldPost} job(s), ${wouldEnable} of them ENABLED, into a store that is already authoritative`, {
-      detail: 'Re-run with --yes once you have read the counts above.',
-    });
-  }
+  // NO RE-RUN GATE. There was one — a per-agent `hydrated` marker making this one-time-at-flip,
+  // refusing a second run unless --force. It has been removed: during the migration window OpenClaw
+  // stays authoritative and archie's store is a derived replica, so re-running to converge is the
+  // NORMAL operation, not a recovery escape hatch. Getting an agent's decision map right routinely
+  // takes several attempts, and a crash mid-seed must not leave it stuck.
+  //
+  // The preview above still prints first, and still matters: it is the difference between a decision
+  // and a surprise. What it no longer does is block.
   if (ctx.dryRun) {
-    out.progress('dry-run: nothing posted to the manager API');
-    return { dryRun: true, agent: agentId, alreadyHydrated: already, ...preview };
+    out.progress('dry-run: nothing purged, nothing posted — the store is untouched');
+    return { dryRun: true, agent: agentId, ...preview };
   }
 
   const summary = await hydrator.hydrateAgent({
-    agentId, mountDir, api, force, fs: deps.fs, now: deps.now,
+    agentId, mountDir, api, fs: deps.fs, now: deps.now,
     log: {
       info: (o, m) => out.verbose(`${m} ${JSON.stringify(o)}`),
       warn: (o, m) => out.warn(`${m} ${JSON.stringify(o)}`),
@@ -710,7 +706,7 @@ async function cronHydrate(ctx, args, out, deps) {
   // A partial seed is NOT marked hydrated, by design, so it retries. Surface each failed job rather
   // than one exit code — `failures[]` names them (lib/output.js).
   for (const e of summary.errors || []) out.failure({ agent: agentId, step: `cron-seed ${e.jobId}`, error: new Error(e.err) });
-  return { agent: agentId, ...preview, posted: summary.posted, errors: summary.errors, alreadyHydrated: summary.alreadyHydrated };
+  return { agent: agentId, ...preview, posted: summary.posted, errors: summary.errors };
 }
 
 /**

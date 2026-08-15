@@ -81,7 +81,7 @@ const COMMANDS = {
   'config parity': { options: {}, module: 'wrappers', task: 'W1-G', needsAws: true, summary: 'config vs deployed parity checks' },
   'grants reconcile': { options: {}, module: 'wrappers', task: 'W1-G', needsAws: true, positional: 'agent', summary: 'recompute GRANT#*, write it, then rewrite the role policy' },
   'grants apply': { options: {}, module: 'wrappers', task: 'W1-G', needsAws: true, positional: 'agent', summary: 'rewrite the role policy only, from GRANT#* as stored' },
-  'cron hydrate': { options: { force:{type:'boolean'} }, module: 'wrappers', task: 'W1-G', needsAws: true, dryRunDefault: true, positional: 'agent', summary: 'fold an agent EFS cron store into the dispatcher store' },
+  'cron hydrate': { options: {}, module: 'wrappers', task: 'W1-G', needsAws: true, dryRunDefault: true, positional: 'agent', summary: 'fold an agent EFS cron store into the dispatcher store' },
   'cron list': { options: {}, module: 'wrappers', task: 'W1-G', needsAws: true, positional: 'agent', summary: 'list scheduled jobs via the manager API' },
   'cron arm': { options: {}, module: 'wrappers', task: 'W1-G', needsAws: true, summary: 'arm the cron scheduler' },
   'cron disarm': { options: {}, module: 'wrappers', task: 'W1-G', needsAws: true, summary: 'disarm the cron scheduler' },
