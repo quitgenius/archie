@@ -17,7 +17,7 @@
 
 const { usage } = require('./exit');
 
-const DEFAULT_NAME = 'agent-gn0p84';
+const DEFAULT_NAME = 'archie';
 
 /**
  * Every resource name the CLI touches, from one deployment name.

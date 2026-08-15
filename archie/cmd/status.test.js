@@ -187,7 +187,7 @@ test('an agent whose registry read FAILED is `unknown`, never `missing`, and exi
   // The cause chain names the table and the underlying exception — "wrong region" and "throttled"
   // are indistinguishable without it (lib/exit.js, agent-image.js:52-56).
   assert.match(c.stderr(), /1 backing read failed/);
-  assert.match(c.stderr(), /Query RUNTIME#ch_growth on agent-gn0p84-config/);
+  assert.match(c.stderr(), /Query RUNTIME#ch_growth on archie-agent-config/);
   assert.match(c.stderr(), /ProvisionedThroughputExceeded/);
 });
 

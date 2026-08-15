@@ -41,7 +41,7 @@ function helpText() {
     '',
     'GLOBAL OPTIONS',
     '  --region <r>        REQUIRED for anything touching AWS. Never defaulted.',
-    '  --name <n>          which archie deployment (default agent-gn0p84; env ARCHIE_NAME)',
+    '  --name <n>          which archie deployment (default archie; env ARCHIE_NAME)',
     '  --profile <p>       AWS profile',
     '  --account <id>      assert the caller is in this account, or exit 3',
     '  --dry-run           print the plan; --no-dry-run to write',
