@@ -41,6 +41,7 @@
 
 const {
   GENERATION_PK, RELEASE_KEY, readGeneration, readBody, scanBindings, bindingStats, stateOf,
+  describeImage, assertArm64, imageUriFor, resolveAccount,
 } = require('./generation');
 const { taintGeneration } = require('./stage');
 const {
@@ -125,6 +126,7 @@ function clientsFor(ctx, deps = {}) {
 
   let doc = deps.doc || null;
   let sts = deps.sts || null;
+  let ecr = deps.ecr || null;
   return {
     doc() {
       if (!doc) {
@@ -136,6 +138,11 @@ function clientsFor(ctx, deps = {}) {
     sts() {
       if (!sts) sts = makeClient(ctx, '@aws-sdk/client-sts', 'STSClient');
       return sts;
+    },
+    // `release publish-image` only — the shape `cmd/generation.js:describeImage` expects.
+    ecr() {
+      if (!ecr) ecr = makeClient(ctx, '@aws-sdk/client-ecr', 'ECRClient');
+      return ecr;
     },
   };
 }
@@ -706,6 +713,110 @@ async function taint(ctx, args, out, deps = {}) {
   return undefined;
 }
 
+// ── release publish-image ────────────────────────────────────────────────────────────────────────
+
+const IMAGE_PK = 'CONFIG#image';
+const imageSkFor = (agent) => (agent ? `AGENT#${agent}` : 'FLEET');
+
+/**
+ * `archie release publish-image <tag> [--agent <id>] [--clear]` — §2.13a.
+ *
+ * WHY THIS EXISTS, AND WHY IT IS NOT `release set`. There are two pointers, and today they mean
+ * different things. `release set` writes `CONFIG#release/ACTIVE`, which is the release model's
+ * intent; `image-source.js:63` — the turn path — reads `CONFIG#image` and has never read the other
+ * one. So until the dispatcher is switched over (plan §3 "what this replaces"), THIS is the write
+ * that actually decides what the fleet provisions, and it was reachable only from
+ * `slack-dispatcher/publish-image.mjs`, outside the CLI. `archie preflight` check 4 would tell you
+ * the pointer was missing and `archie status` would report it as drift, while the CLI had no way to
+ * fix it. That asymmetry is the whole bug this closes.
+ *
+ * DELIBERATELY NOT MERGED INTO `release set`. Dual-writing both pointers would make `release set`
+ * look like it moves traffic when the semantics still live in the other key — and when the turn
+ * path does switch, the dual write becomes the thing you have to remember to unpick. One command
+ * per pointer, until there is one pointer.
+ *
+ * THE GATE IS THE SAME ONE `generation create` APPLIES, imported rather than restated: the tag must
+ * exist in ECR and must not be a non-arm64 image. A bad pointer does not fail here — it provisions
+ * runtimes that cannot pull, so every agent breaks on its NEXT message with a create failure and
+ * nothing points back at this command. `publish-image.mjs:18-22` calls that out and it is still the
+ * reason: the amd64 dispatcher image is built from the same tree minutes apart.
+ */
+async function publishImage(ctx, args, out, deps = {}) {
+  const aws = clientsFor(ctx, deps);
+  const agent = args.values.agent || null;
+  const clear = Boolean(args.values.clear);
+  const tag = args.positionals && args.positionals[0];
+
+  if (clear && tag) throw usage('--clear takes no tag — it removes a pointer rather than moving it');
+  if (!clear && !tag) throw usage('release publish-image needs a tag: `archie release publish-image <tag> [--agent <id>]`');
+
+  // CLEARING THE FLEET POINTER IS AN OUTAGE, and is refused. `image-source.js:11-15` removed the
+  // baked fallback on 2026-08-11 — with no `CONFIG#image/FLEET` every provision throws
+  // ImagePointerMissing, so "clear" means "stop the fleet", not "revert". `publish-image.mjs:117`
+  // still prints "fleet falls back to the dispatcher's baked image", which has been untrue since
+  // that change; publishing a different tag is the actual revert.
+  if (clear && !agent) {
+    throw refused('refusing to clear the FLEET image pointer', {
+      detail: 'There is no baked fallback image (image-source.js:11-15), so removing CONFIG#image/FLEET makes '
+        + 'every provision fail closed with ImagePointerMissing — a fleet-wide outage, not a rollback. To go '
+        + 'back to a previous build, publish its tag: `archie release publish-image <previous-tag>`.',
+    });
+  }
+
+  const account = await resolveAccount(ctx, aws);
+  const table = ctx.resources.configTable;
+  const Key = { pk: IMAGE_PK, sk: imageSkFor(agent) };
+
+  if (clear) {
+    // Per-agent only, by the rail above: this returns one canaried agent to whatever the fleet runs.
+    if (ctx.dryRun) {
+      out.progress(`would delete ${Key.pk} / ${Key.sk}`);
+      return { ...Key, cleared: false, dryRun: true };
+    }
+    const { DeleteCommand } = require('@aws-sdk/lib-dynamodb');
+    await aws.doc().send(new DeleteCommand({ TableName: table, Key }));
+    out.progress(`cleared ${Key.sk} — agent ${agent} now follows the fleet pointer`);
+    return { ...Key, agent, cleared: true };
+  }
+
+  const repo = ctx.resources.agentRepo;
+  const uri = imageUriFor(ctx, account, tag);
+  const found = await describeImage(aws, { account, repo, tag });
+  if (!found) {
+    throw refused(`${uri} does not exist in ECR`, {
+      detail: 'Build and push it first — `archie generation build --push`. Publishing a tag that is not there '
+        + 'provisions runtimes that cannot pull, and the failure surfaces on each agent\'s next message.',
+    });
+  }
+  assertArm64(found, uri);
+
+  // The item shape `publish-image.mjs:126-134` writes, field for field. Both writers must agree
+  // while both exist: `image-source.js:36-41` resolves `imageUri || uri`, then falls back to `tag`
+  // against the dispatcher's own repo — so `tag` is the operative field and the digest is provenance.
+  const item = {
+    ...Key,
+    tag,
+    imageDigest: found.digest || null,
+    publishedAt: new Date().toISOString(),
+    publishedBy: whoami(deps),
+  };
+
+  if (ctx.dryRun) {
+    out.progress(`would publish ${uri} to ${Key.sk}`);
+    return { ...item, written: false, dryRun: true };
+  }
+
+  const { PutCommand } = require('@aws-sdk/lib-dynamodb');
+  await aws.doc().send(new PutCommand({ TableName: table, Item: item }));
+
+  out.progress(`published ${uri} to ${Key.sk}`);
+  out.verbose(`  digest ${found.digest || '—'}${found.sizeMb ? `  (${found.sizeMb} MB)` : ''}`
+    + `${found.arches.length ? `  [${found.arches.join(',')}]` : `  [arch unproven: ${found.archesFrom}]`}`);
+  out.verbose('  picked up by the next message per agent — no dispatcher deploy, no restart.');
+  return { ...item, written: true, imageUri: uri, arches: found.arches };
+}
+
+
 module.exports = {
   // THE FULL COMMAND KEYS, never bare verbs. `registry.load()` resolves `mod[key] || mod[verb]`, and a
   // verb-keyed export answers for every noun sharing that verb — `show` is also `generation show`'s
@@ -713,6 +824,7 @@ module.exports = {
   // makes the collision impossible by construction rather than by everyone remembering
   // (`lib/registry.js:156-166`, `cmd/runtime.js:843`).
   'release set': set,
+  'release publish-image': publishImage,
   'release show': show,
   'release history': history,
   'generation taint': taint,
@@ -721,6 +833,7 @@ module.exports = {
   // pre-flight gate should ask THIS function whether a generation is releasable rather than
   // re-deriving the rule).
   releaseSet: set,
+  releasePublishImage: publishImage,
   releaseShow: show,
   releaseHistory: history,
   generationTaint: taint,
@@ -731,6 +844,8 @@ module.exports = {
   historyItemFor,
   historySkFor,
   HISTORY_PK,
+  IMAGE_PK,
+  imageSkFor,
   MODES,
   POINTER_TTL_SECONDS,
 };

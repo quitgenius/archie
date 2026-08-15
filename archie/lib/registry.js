@@ -47,6 +47,7 @@ const COMMANDS = {
 
   // ── release pointer ──────────────────────────────────────────────────────
   'release set': { options: { hotfix:{type:'boolean'} }, module: 'release', task: 'W2-B', needsAws: true, positional: 'generationId', summary: 'move the live pointer (the only command that moves traffic)' },
+  'release publish-image': { options: { agent:{type:'string'}, clear:{type:'boolean'} }, module: 'release', task: 'W3-C', needsAws: true, positional: 'tag', summary: 'write CONFIG#image — what the dispatcher provisions on TODAY' },
   'release show': { options: {}, module: 'release', task: 'W2-B', needsAws: true, summary: 'the active generation and how it was published' },
   'release history': { options: { limit:{type:'string'} }, module: 'release', task: 'W2-B', needsAws: true, summary: 'previous pointer values' },
 

@@ -1182,4 +1182,11 @@ module.exports = {
   assertMakeConstraints,
   makeRecipe,
   describeImage,
+  // Exported for `release publish-image`, which writes the OTHER pointer (CONFIG#image) and has to
+  // apply the identical ECR gate — an amd64 image published there breaks every agent's next
+  // provision exactly as it would here. Two copies of "is this image runnable" is how the two
+  // pointers end up disagreeing about the same tag.
+  resolveAccount,
+  assertArm64,
+  imageUriFor,
 };

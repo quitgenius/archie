@@ -130,7 +130,43 @@ function fakeDoc(items = [], opts = {}) {
         store.set(key, item);
         return {};
       }
+      if (name === 'DeleteCommand') {
+        store.delete(keyOf(input.Key.pk, input.Key.sk));
+        return {};
+      }
       throw new Error(`fakeDoc: unexpected ${name}`);
+    },
+  };
+}
+
+/**
+ * ECR double for `release publish-image`. `describeImage` (cmd/generation.js) issues DescribeImages
+ * then BatchGetImage; a missing tag is `ImageNotFoundException` from the first, and the architecture
+ * comes from the manifest list returned by the second.
+ */
+function fakeEcr({ missing = false, arches = ['arm64'], digest = 'sha256:deadbeef' } = {}) {
+  const seen = [];
+  return {
+    seen,
+    async send(cmd) {
+      const name = cmd.constructor.name;
+      seen.push(name);
+      if (name === 'DescribeImagesCommand') {
+        if (missing) {
+          const e = new Error('image not found');
+          e.name = 'ImageNotFoundException';
+          throw e;
+        }
+        return {
+          imageDetails: [{ imageDigest: digest, imagePushedAt: new Date(NOW), imageSizeInBytes: 104857600 }],
+        };
+      }
+      if (name === 'BatchGetImageCommand') {
+        return {
+          images: [{ imageManifest: JSON.stringify({ manifests: arches.map((a) => ({ platform: { architecture: a } })) }) }],
+        };
+      }
+      throw new Error(`fakeEcr: unexpected ${name}`);
     },
   };
 }
@@ -809,4 +845,138 @@ test('history lives in its own partition, apart from the pointer and its reserve
   };
   assert.equal(rel.historyItemFor(body).pk, 'CONFIG#release-history');
   assert.equal(rel.historyItemFor(body).sk, `${NOW_ISO}#${GEN}`);
+});
+
+// ── release publish-image ────────────────────────────────────────────────────────────────────────
+//
+// WHY THIS COMMAND MATTERS MORE THAN ITS SIZE SUGGESTS. `CONFIG#image` is what `image-source.js:63`
+// actually reads on the turn path — `CONFIG#release/ACTIVE` is not read by anything yet — so until
+// the dispatcher switches over, THIS write is the one that decides what the fleet provisions. It was
+// reachable only from `slack-dispatcher/publish-image.mjs`, outside the CLI, while `preflight` check
+// 4 and `status` both reported its absence. The tests below hold the two rails that make writing it
+// safe: the ECR gate, and the refusal to clear the fleet pointer.
+
+const publish = (over = {}) => ({ positionals: ['pi-obs-41'], values: {}, ...over });
+
+test('publish-image writes CONFIG#image/FLEET after the ECR gate passes', async () => {
+  const doc = fakeDoc();
+  const ecr = fakeEcr();
+  const out = fakeOut();
+  const r = await rel['release publish-image'](ctxFor(), publish(), out, {
+    doc, ecr, sts: fakeSts(), user: 'sandbox', now: () => NOW,
+  });
+
+  const put = doc.puts()[0];
+  assert.equal(put.input.Item.pk, 'CONFIG#image');
+  assert.equal(put.input.Item.sk, 'FLEET');
+  assert.equal(put.input.Item.tag, 'pi-obs-41');
+  // The digest is provenance; `tag` is what image-source.js resolves against the repo. Both are
+  // written because publish-image.mjs writes both, and the two writers must agree while both exist.
+  assert.equal(put.input.Item.imageDigest, 'sha256:deadbeef');
+  assert.equal(put.input.Item.publishedBy, 'sandbox');
+  assert.equal(r.written, true);
+  assert.match(r.imageUri, /agent-gn0p84core:pi-obs-41$/);
+});
+
+test('publish-image REFUSES a tag that is not in ECR, and writes nothing', async () => {
+  const doc = fakeDoc();
+  const out = fakeOut();
+  // The failure this prevents is silent: a bad pointer provisions runtimes that cannot pull, so
+  // every agent breaks on its NEXT message and nothing points back at the publish.
+  const e = await rel['release publish-image'](ctxFor(), publish(), out, {
+    doc, ecr: fakeEcr({ missing: true }), sts: fakeSts(),
+  }).then(() => null, (err) => err);
+  assert.equal(e.exitCode, EXIT.REFUSED);
+  assert.match(e.message, /does not exist in ECR/);
+  assert.equal(doc.writes().length, 0);
+});
+
+test('publish-image REFUSES an amd64 image — microVMs are arm64', async () => {
+  const doc = fakeDoc();
+  const out = fakeOut();
+  // "almost always the amd64 dispatcher image published by mistake" — same tree, minutes apart.
+  const e = await rel['release publish-image'](ctxFor(), publish(), out, {
+    doc, ecr: fakeEcr({ arches: ['amd64'] }), sts: fakeSts(),
+  }).then(() => null, (err) => err);
+  assert.equal(e.exitCode, EXIT.REFUSED);
+  assert.match(e.message, /amd64/);
+  assert.equal(doc.writes().length, 0);
+});
+
+test('publish-image --agent writes the per-agent override, not the fleet key', async () => {
+  const doc = fakeDoc();
+  const out = fakeOut();
+  await rel['release publish-image'](ctxFor(), publish({ values: { agent: 'dm-u0x' } }), out, {
+    doc, ecr: fakeEcr(), sts: fakeSts(), user: 'sandbox',
+  });
+  assert.equal(doc.puts()[0].input.Item.sk, 'AGENT#dm-u0x');
+  // The fleet pointer must be untouched — a canary that moved the fleet is the opposite of a canary.
+  assert.equal(doc.puts().filter((p) => p.input.Item.sk === 'FLEET').length, 0);
+});
+
+test('publish-image REFUSES --clear on the FLEET pointer — it is an outage, not a rollback', async () => {
+  const doc = fakeDoc([{ pk: 'CONFIG#image', sk: 'FLEET', tag: 'pi-obs-40' }]);
+  const out = fakeOut();
+  // There has been no baked fallback since 2026-08-11 (image-source.js:11-15), so clearing FLEET
+  // makes every provision fail closed. publish-image.mjs:117 still calls this "falls back to the
+  // dispatcher's baked image", which is why the CLI states the real consequence instead.
+  const e = await rel['release publish-image'](ctxFor(), { positionals: [], values: { clear: true } }, out, {
+    doc, ecr: fakeEcr(), sts: fakeSts(),
+  }).then(() => null, (err) => err);
+  assert.equal(e.exitCode, EXIT.REFUSED);
+  assert.match(e.detail, /ImagePointerMissing/);
+  assert.equal(doc.writes().length, 0);
+  assert.ok(doc.store.has('CONFIG#image FLEET'), 'the fleet pointer must survive a refused clear');
+});
+
+test('publish-image --clear --agent removes only that agent override', async () => {
+  const doc = fakeDoc([
+    { pk: 'CONFIG#image', sk: 'FLEET', tag: 'pi-obs-40' },
+    { pk: 'CONFIG#image', sk: 'AGENT#dm-u0x', tag: 'pi-obs-41' },
+  ]);
+  const out = fakeOut();
+  const r = await rel['release publish-image'](ctxFor(), { positionals: [], values: { clear: true, agent: 'dm-u0x' } }, out, {
+    doc, ecr: fakeEcr(), sts: fakeSts(),
+  });
+  assert.equal(r.cleared, true);
+  assert.equal(doc.store.has('CONFIG#image AGENT#dm-u0x'), false);
+  assert.ok(doc.store.has('CONFIG#image FLEET'), 'clearing an override must not touch the fleet');
+});
+
+test('publish-image --clear with a tag is a usage error, not a silent ignore', async () => {
+  const doc = fakeDoc();
+  const e = await rel['release publish-image'](ctxFor(), publish({ values: { clear: true } }), fakeOut(), {
+    doc, ecr: fakeEcr(), sts: fakeSts(),
+  }).then(() => null, (err) => err);
+  assert.equal(e.exitCode, EXIT.USAGE);
+  assert.equal(doc.writes().length, 0);
+});
+
+test('publish-image with no tag is a usage error', async () => {
+  const e = await rel['release publish-image'](ctxFor(), { positionals: [], values: {} }, fakeOut(), {
+    doc: fakeDoc(), ecr: fakeEcr(), sts: fakeSts(),
+  }).then(() => null, (err) => err);
+  assert.equal(e.exitCode, EXIT.USAGE);
+});
+
+test('publish-image --dry-run writes nothing but still runs the ECR gate', async () => {
+  const doc = fakeDoc();
+  const ecr = fakeEcr();
+  const r = await rel['release publish-image'](ctxFor({ dryRun: true }), publish(), fakeOut(), {
+    doc, ecr, sts: fakeSts(), user: 'sandbox',
+  });
+  assert.equal(r.written, false);
+  assert.equal(r.dryRun, true);
+  assert.equal(doc.writes().length, 0);
+  // The gate must run in dry-run too, or "would publish" tells you nothing about whether it could.
+  assert.ok(ecr.seen.includes('DescribeImagesCommand'));
+});
+
+test('the registry routes release publish-image and declares only agent/clear', () => {
+  const meta = COMMANDS['release publish-image'];
+  assert.ok(meta, 'release publish-image is not registered');
+  assert.deepEqual(Object.keys(meta.options).sort(), ['agent', 'clear']);
+  assert.equal(meta.positional, 'tag');
+  // Key-first resolution: `publish-image` must not be answerable by some other noun's verb.
+  assert.equal(load('release publish-image', meta, {}), rel['release publish-image']);
 });
