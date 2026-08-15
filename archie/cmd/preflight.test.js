@@ -147,8 +147,13 @@ async function run(argv = {}, awsOverrides = {}, ctxValues = {}) {
 
 // ── the table itself ─────────────────────────────────────────────────────────────────────────────
 
-test('all 20 checks from reference §4 exist, numbered 1-20', () => {
-  assert.deepEqual(CHECKS.map((c) => c.n), Array.from({ length: 20 }, (_, i) => i + 1));
+// 19 checks numbered 1..20 with 3 MISSING. The gap is the point: check 3 was `CONFIG#base / BASE
+// present` and that item no longer exists, but the reference cites checks by number throughout
+// (`check 4`, `check 7`, `check 16`), so renumbering would silently repoint every citation.
+test('the checks are numbered 1-20 with 3 retired, never renumbered', () => {
+  const ns = CHECKS.map((c) => c.n);
+  assert.deepEqual(ns, Array.from({ length: 20 }, (_, i) => i + 1).filter((n) => n !== 3));
+  assert.equal(ns.includes(3), false, 'check 3 is retired — reusing the number repoints every doc citation');
   for (const c of CHECKS) assert.equal(typeof c.run, 'function', `check ${c.n} has no run()`);
 });
 
@@ -171,7 +176,7 @@ test('a skipped check prints SKIPPED and NEVER PASS', async () => {
 });
 
 test('--checks runs only those, and the rest are SKIPPED rather than absent or passed', async () => {
-  const { code, stdout, aws } = await run({ checks: '1,2,3' }, {}, { account: ACCOUNT });
+  const { code, stdout, aws } = await run({ checks: '1,2,4' }, {}, { account: ACCOUNT });
   assert.equal(code, EXIT.OK);
   assert.match(stdout, /^ 1\s+.*PASS/m);
   assert.match(stdout, /^20\s+.*SKIPPED\s+not in --checks/m);
@@ -229,11 +234,12 @@ test('check 2: the routing GSI is checked by NAME — routing-build.js queries i
   assert.match(stdout, /no "routing" GSI \(has: gsi1\)/);
 });
 
-test('check 3: an absent CONFIG#base/BASE says every runtime exits 1 at boot', async () => {
-  const { code, stderr, stdout } = await run({ checks: '3' }, { async getItem() { return null; } });
-  assert.equal(code, EXIT.PREFLIGHT);
-  assert.match(stdout, /dynamodb:GetItem agent-gn0p84-config CONFIG#base\/BASE: absent/);
-  assert.match(stderr, /checks failed: 3/);
+// The retired number must not silently select nothing and report success — `--checks 3` in an old
+// runbook has to say the check is gone, not exit 0 having verified nothing.
+test('check 3 is retired: no check claims the number, and --checks 3 does not pass vacuously', async () => {
+  assert.equal(CHECKS.find((c) => c.n === 3), undefined);
+  const { code } = await run({ checks: '3' }, { async getItem() { return null; } });
+  assert.notEqual(code, EXIT.OK, '--checks 3 must not exit 0 — it would read as "base config verified"');
 });
 
 test('check 4: the pointer read is ConsistentRead', async () => {
@@ -476,7 +482,7 @@ test('--json puts the whole check table in the envelope, even when it fails', as
 
   const envelope = JSON.parse(c.stdout());
   assert.equal(envelope.exit, EXIT.PREFLIGHT);
-  assert.equal(envelope.result.checks.length, 20);
+  assert.equal(envelope.result.checks.length, 19); // 20 numbers, 3 retired
   assert.equal(envelope.result.checks.find((r) => r.n === 7).status, FAIL);
   // failures[] names WHICH check failed, not just an exit code.
   assert.match(envelope.failures[0].step, /check 7/);
@@ -493,13 +499,14 @@ test('the human line matches the reference §2.1 example shape', () => {
 
 // ── the library half ─────────────────────────────────────────────────────────────────────────────
 
-test('assertBaseline runs exactly checks 1-3 and returns the account', async () => {
+test('assertBaseline runs exactly checks 1-2 and returns the account', async () => {
   const aws = healthyAws();
   const result = await assertBaseline(ctxFor({ account: ACCOUNT }), { aws });
   assert.equal(result.account, ACCOUNT);
-  assert.deepEqual(result.results.map((r) => r.n), [1, 2, 3]);
-  // nothing beyond the three cheap reads: these run before EVERY mutating command.
-  assert.deepEqual([...new Set(aws.calls.map((c) => c.name))], ['callerIdentity', 'describeTable', 'getItem']);
+  assert.deepEqual(result.results.map((r) => r.n), [1, 2]);
+  // nothing beyond the two cheap reads: these run before EVERY mutating command. The CONFIG#base
+  // GetItem is gone with check 3, so a mutating command is now one AWS call cheaper.
+  assert.deepEqual([...new Set(aws.calls.map((c) => c.name))], ['callerIdentity', 'describeTable']);
 });
 
 test('assertBaseline throws exit 3 on the first failure — a mutating command wants a stop', async () => {

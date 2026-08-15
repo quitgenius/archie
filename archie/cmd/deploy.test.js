@@ -110,7 +110,7 @@ test('--skip-preflight skips the checks and says so', async () => {
   const s = fakeSteps();
   const { out } = await run({ 'skip-preflight': true }, { steps: s.steps, digestFor: digestFor(RUNNING_TAG) });
   assert.ok(!s.names().includes('assertBaseline'));
-  assert.match(out.warnings.join('\n'), /CONFIG#base/);
+  assert.match(out.warnings.join('\n'), /account identity and the config table are NOT verified/);
 });
 
 test('a failing preflight stops before anything is built', async () => {

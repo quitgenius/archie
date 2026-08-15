@@ -91,15 +91,15 @@ async function deploy(ctx, args, out, deps = {}) {
   //
   // Called as a LIBRARY, not by shelling out to our own CLI — a `deploy` that spawned `archie
   // preflight` could pass it a flag that skipped the checks (`cmd/preflight.js:1179-1191`). Checks
-  // 1-3 are the account identity, the config table + routing GSI, and `CONFIG#base / BASE`, whose
-  // absence makes every runtime exit 1 at boot (§3.4 step 4).
+  // 1-2 are the account identity and the config table + routing GSI. (Check 3 was `CONFIG#base /
+  // BASE present`; the fleet base config is now a constant, so there is no item to verify.)
   if (values['skip-preflight']) {
-    out.warn('--skip-preflight: the account identity, the config table and CONFIG#base/BASE are NOT '
-      + 'verified. Each absence otherwise surfaces downstream as an error that does not name itself (§4).');
+    out.warn('--skip-preflight: the account identity and the config table are NOT verified. Each '
+      + 'absence otherwise surfaces downstream as an error that does not name itself (§4).');
   } else {
     const baseline = await steps.assertBaseline(ctx, { ...deps, out });
     result.preflight = { account: baseline.account, checks: (baseline.results || []).map((r) => ({ n: r.n, status: r.status })) };
-    out.progress(`preflight   checks 1-3 pass (account ${baseline.account})`);
+    out.progress(`preflight   checks 1-2 pass (account ${baseline.account})`);
   }
 
   // ── 2. the agent half ──────────────────────────────────────────────────────────────────────────

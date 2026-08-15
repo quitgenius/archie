@@ -52,7 +52,7 @@ const {
 // ── constants ────────────────────────────────────────────────────────────────────────────────────
 
 // OUTSIDE `AGENT#`, deliberately. The derived per-agent role's `dynamodb:LeadingKeys` scope is
-// `[AGENT#<id>, GRANT#<id>, SKILL#*, CONFIG#base]` (derive-exec-role.mjs:104-110), so a generation or
+// `[AGENT#<id>, GRANT#<id>, SKILL#*]` (derive-exec-role.mjs:104-110), so a generation or
 // a release pointer under `AGENT#` would be readable — and, if any AGENT#* write is ever
 // reintroduced, writable — by every agent in the fleet. schema.mjs:81-93 already made this call for
 // the image pointer ("Do NOT move these under AGENT#<id>"): whoever writes it chooses the CODE that

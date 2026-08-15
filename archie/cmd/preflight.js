@@ -32,7 +32,7 @@
 //    EFS allows exactly one VPC per filesystem and the env is the thing that goes stale
 //    (agentcore-fixture.js:53-58).
 //
-// Checks 1-3 are exported as `assertBaseline` because every mutating command in the CLI runs them
+// Checks 1-2 are exported as `assertBaseline` because every mutating command in the CLI runs them
 // (reference §4, "Runs automatically before"). They are a library first and a command second.
 
 const { usage, preflight: preflightError } = require('../lib/exit');
@@ -496,24 +496,6 @@ const CHECKS = [
         return { status: FAIL, note: `${table} routing GSI is ${routing.IndexStatus}, not ACTIVE` };
       }
       return { status: PASS, note: `${table} ${described.TableStatus || 'ACTIVE'}, routing GSI ACTIVE` };
-    },
-  },
-
-  {
-    n: 3,
-    title: 'CONFIG#base / BASE present',
-    async run(w) {
-      const table = w.ctx.resources.configTable;
-      // schema.mjs:27 baseKey(). resolve-boot.mjs:35 reads it on every boot.
-      const item = await w.aws.getItem(table, { pk: 'CONFIG#base', sk: 'BASE' });
-      if (!item) {
-        return {
-          status: FAIL,
-          note: `dynamodb:GetItem ${table} CONFIG#base/BASE: absent`,
-          detail: 'every runtime exits 1 at boot without it — run `archie config hydrate`',
-        };
-      }
-      return { status: PASS, note: `${table} CONFIG#base/BASE present` };
     },
   },
 
@@ -1044,7 +1026,12 @@ const CHECKS = [
 ];
 
 const CHECK_NUMBERS = CHECKS.map((c) => c.n);
-const BASELINE = [1, 2, 3];
+// Checks 1-2. THE NUMBER 3 IS RETIRED, not reallocated: it was `CONFIG#base / BASE present`, and
+// that item no longer exists (the fleet base config is the constant schema.mjs BASE_MAIN). The
+// numbering deliberately skips it rather than renumbering 4..20 down one — the reference cites
+// checks by number throughout (`check 4`, `check 7`, `check 16`), and every one of those citations
+// would silently start naming a different check.
+const BASELINE = [1, 2];
 
 /**
  * The IAM principal behind a caller identity.
