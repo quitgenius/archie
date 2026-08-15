@@ -34,6 +34,7 @@ const COMMANDS = {
   'gateway build': { options: { tag:{type:'string'}, push:{type:'boolean'}, platform:{type:'string'}, pure:{type:'boolean'} }, module: 'gateway', task: 'W1-B', needsAws: true, summary: 'build/push the amd64 dispatcher image' },
   'gateway deploy': { options: { tag:{type:'string'}, 'wait-timeout':{type:'string'}, 'no-wait':{type:'boolean'} }, module: 'gateway', task: 'W1-B', needsAws: true, summary: 'roll the dispatcher service and monitor to healthy' },
   'gateway status': { options: { check:{type:'boolean'} }, module: 'gateway', task: 'W1-B', needsAws: true, summary: 'which task definition and image is actually running' },
+  'gateway compose': { options: {}, module: 'gateway', task: 'W3-D', needsAws: true, summary: 'compose the task definition from SSM + discovery and diff it against the running one' },
 
   // ── generation ───────────────────────────────────────────────────────────
   'generation build': { options: { tag:{type:'string'}, push:{type:'boolean'}, platform:{type:'string'}, pure:{type:'boolean'} }, module: 'generation', task: 'W1-C', needsAws: true, summary: 'build/push the arm64 Pi runtime image' },

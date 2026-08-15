@@ -2,7 +2,7 @@
   "name": "archie-cli",
   "version": "0.1.0",
   "private": true,
-  "description": "Fleet CLI for the AgentCore agent fleet \u2014 build, stage, healthcheck, release",
+  "description": "Fleet CLI for the AgentCore agent fleet — build, stage, healthcheck, release",
   "bin": {
     "archie": "./bin/archie.js"
   },
@@ -28,7 +28,9 @@
     "@aws-sdk/client-iam": "^3",
     "@aws-sdk/client-secrets-manager": "^3",
     "@aws-sdk/client-service-quotas": "^3",
+    "@aws-sdk/client-servicediscovery": "^3.1111.0",
     "@aws-sdk/client-sqs": "^3",
+    "@aws-sdk/client-ssm": "^3.1111.0",
     "@aws-sdk/client-sts": "^3",
     "@aws-sdk/client-xray": "^3",
     "@aws-sdk/credential-provider-node": "^3",

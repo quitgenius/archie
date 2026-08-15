@@ -969,8 +969,95 @@ function renderStatus(r) {
   return lines.join('\n');
 }
 
+// ── gateway compose ──────────────────────────────────────────────────────────────────────────────
+
+/**
+ * `archie gateway compose [--json]` — GATEWAY-OWNERSHIP-PLAN.md §5.3 and §6 step 5.
+ *
+ * Compose the dispatcher task definition from discovered facts and the SSM parameters Terraform
+ * publishes, and diff it against the revision that is actually running. It REGISTERS NOTHING. It is
+ * a read-only command in every mode, deliberately: the whole point is to answer "would taking
+ * ownership change anything" without taking ownership.
+ *
+ * A DIFFERENCE IS EXIT 7 (DRIFT), NOT A FAILURE. Nothing is broken and nothing was attempted — the
+ * two definitions disagree, which is a fact about the deployment rather than an error in the run,
+ * and it is the same code `gateway status --check` and `fleet drift` use for the same kind of
+ * finding. Scripts gating Phase D on this can test for 0.
+ *
+ * The image is excluded from the comparison: archie already owns which image runs, so a differing
+ * tag is the normal state between one deploy and the next, not a finding.
+ */
+async function compose(ctx, args, out, deps = {}) {
+  const { discoverFacts, readGatewayConfig } = require('../lib/deployment-facts');
+  const { composeTaskDefinition } = require('../lib/task-definition');
+  const { diffTaskDefinition } = require('../lib/td-diff');
+  const ecs = client.ecs(ctx, deps);
+
+  const [facts, config, deployed] = await Promise.all([
+    discoverFacts(ctx, deps),
+    readGatewayConfig(ctx, deps),
+    readDeployed(ecs, ctx),
+  ]);
+
+  if (config.missing.length) {
+    // Reported, never fatal here: five of the seven are legitimately absent, and `composeEnvironment`
+    // is what refuses on a missing REQUIRED one — with the parameter path in the message.
+    out.verbose(`ssm         ${config.missing.length} parameter(s) absent under ${config.prefix}: `
+      + `${config.missing.join(', ')} — absent means the environment variable is absent too`);
+  }
+
+  // The deployed image, deliberately. Composing with the tag that is already running is what makes
+  // the diff about the COMPOSITION and nothing else; passing a new tag here would put a guaranteed
+  // difference into a comparison whose entire value is being clean.
+  const composed = composeTaskDefinition({
+    resources: ctx.resources,
+    region: ctx.region,
+    facts,
+    ssm: config.values,
+    image: deployed.container.image,
+    tags: deployed.taskDefinitionTags,
+  });
+
+  const diff = diffTaskDefinition(composed, deployed.taskDefinition);
+  const result = {
+    family: composed.family,
+    deployedTaskDefinition: arnTail(deployed.taskDefinition.taskDefinitionArn),
+    ssmPrefix: config.prefix,
+    ssmMissing: config.missing,
+    facts,
+    composed,
+    diff,
+    equivalent: diff.equivalent,
+  };
+
+  if (ctx.json) return result;
+  out.answer(renderCompose(result));
+  if (!diff.equivalent) {
+    throw drift(`the composed task definition differs from ${result.deployedTaskDefinition}`, {
+      detail: 'archie composing this definition would change the running container. Reconcile before '
+        + 'Phase D removes Terraform\'s copy (GATEWAY-OWNERSHIP-PLAN.md §6).',
+    });
+  }
+  return undefined;
+}
+
+function renderCompose(r) {
+  const { renderDiff } = require('../lib/td-diff');
+  const lines = [
+    `family      ${r.family}`,
+    `deployed    ${r.deployedTaskDefinition}`,
+    `ssm         ${r.ssmPrefix}${r.ssmMissing.length ? `  (${r.ssmMissing.length} absent: ${r.ssmMissing.join(', ')})` : ''}`,
+    `discovered  fs ${r.facts.efsFileSystemId} in ${r.facts.vpcId}, runtime sg ${r.facts.runtimeSecurityGroupId}`,
+    `env         ${r.composed.containerDefinitions[0].environment.length} variables, `
+      + `${r.composed.containerDefinitions[0].secrets.length} secrets`,
+    '',
+    renderDiff(r.diff),
+  ];
+  return lines.join('\n');
+}
+
 module.exports = {
-  build, deploy, status,
+  build, deploy, status, compose,
   // Exported for tests — each is a rail that fails in a way the command's own output would not
   // distinguish, so each is asserted directly.
   checkEnvAgainstName, registerRevision, waitForRollout, waitBudgetSeconds, defaultRun,
