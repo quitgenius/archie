@@ -39,6 +39,7 @@ const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 
 const { CliError, EXIT, usage, preflight, refused, drift } = require('../lib/exit');
+const { adoptedRootFor } = require('../lib/efs-root');
 const { digestFor, tagFor, assertPure, dirtyWarning, ROOT } = require('../lib/digest');
 const { makeClient } = require('../lib/aws');
 // Pure, dependency-free dispatcher modules — safe to require at load. The heavy one
@@ -92,6 +93,17 @@ const CONFIG_SETTABLE = ['efsRootPrefix', 'efsMountPath', 'securityGroupId'];
 // And the three runtimeSpecFor hard-codes (900 / 28800 / 'HTTP'), which therefore have to be applied
 // to the produced spec rather than to the config.
 const SPEC_SETTABLE = ['idleRuntimeSessionTimeout', 'maxLifetime', 'serverProtocol'];
+
+// ...except the SAGA hard-codes the same three (`agentcore-provisioning.js:521`), so a generation
+// that sets them can be WRITTEN but never SATISFIED. Every agent provisions with 900 / 28800 / HTTP
+// whatever the generation says, the read-back sees a mismatch, and `stage` reports it 208 times —
+// once per agent — while never converging on a re-run. `agent ensure-runtime` refuses such a
+// generation for the same reason.
+//
+// Refusing at CREATE turns 208 per-agent failures into one error before anything is written. This is
+// not a permanent limitation: threading the three through `ensureAgentEnvironment` would make them
+// real, and this list is where that change lands.
+const UNAPPLIABLE = ['idleRuntimeSessionTimeout', 'maxLifetime', 'serverProtocol'];
 
 // ── small helpers ────────────────────────────────────────────────────────────────────────────────
 
@@ -506,6 +518,16 @@ function parseSets(values) {
     if (!kind) {
       throw usage(`--set ${key} is not a fleet-level field`,
         { detail: `expected one of ${Object.keys(SETTABLE).join(', ')} or runtimeEnv.<NAME>` });
+    }
+    if (UNAPPLIABLE.includes(key)) {
+      // Refused here rather than discovered per agent — see the note on UNAPPLIABLE.
+      throw refused(`--set ${key} cannot be honoured: the provisioning saga hard-codes it`, {
+        detail: 'agentcore-provisioning.js:521 fixes idleRuntimeSessionTimeout, maxLifetime and '
+          + 'serverProtocol at 900 / 28800 / HTTP. A generation setting one can be written but never '
+          + 'satisfied: every agent would provision with the hard-coded value, `stage` would report a '
+          + 'read-back mismatch once per agent, and a re-run would never converge. Threading these '
+          + 'through the saga is what would make them settable.',
+      });
     }
     fields[key] = kind === 'number' ? asPositiveInt(`--set ${key}`, value) : value;
   }
@@ -1078,9 +1100,33 @@ async function verify(ctx, args, out, deps = {}) {
     //                             already changed, so "no field differs" means the hash algorithm
     //                             moved (spec-diff.js:52-56). Verify's callers are the opposite case:
     //                             here it is precisely what a clean verify looks like.
-    const changes = diffObserved(observed, declared).filter((c) => c !== 'fingerprint-algorithm');
+    let changes = diffObserved(observed, declared).filter((c) => c !== 'fingerprint-algorithm');
+
+    // §8.10 LEGACY ADOPT — without this, verify exits 7 for the WHOLE FLEET.
+    //
+    // `derivedSpecFor` always derives `efsRootDir(agent, prefix)`, but a rekeyed agent legitimately
+    // ADOPTS its old directory rather than moving data, so its observed root can never equal the
+    // derived one. cmd/stage.js proved that at staging time and recorded `legacyEfsRoot` on the
+    // binding; cmd/fleet.js applies the same rule to `fleet drift`. This is the third caller, and it
+    // was the one missing it — the rule now lives in lib/efs-root.js so the three cannot disagree.
+    //
+    // Only an efsRoot-ONLY difference is eligible. If anything else also differs, the runtime is
+    // genuinely wrong and an adopted root does not excuse it.
+    let adopted = null;
+    if (changes.length === 1 && changes[0] === 'efsRoot') {
+      adopted = await adoptedRootFor(aws, ctx, b.agent, b, [observed && observed.efsRoot, declared.efsRoot]);
+      if (adopted) {
+        changes = [];
+        out.verbose(`${b.agent}: efsRoot differs but ${adopted} is this agent's adopted legacy root — not drift`);
+      }
+    }
+
     const ok = changes.length === 0;
-    results.push({ agent: b.agent, runtimeName: b.runtimeName, ok, changes, observedImage: observed && observed.image });
+    results.push({
+      agent: b.agent, runtimeName: b.runtimeName, ok, changes,
+      observedImage: observed && observed.image,
+      ...(adopted ? { legacyEfsRoot: adopted } : {}),
+    });
     if (ok) out.verbose(`${b.agent}: ok`);
     else {
       mismatched.push({ agent: b.agent, changes });

@@ -275,9 +275,13 @@ test('--set splits on the FIRST = so a value may contain more', () => {
   assert.equal(env.DISPATCHER_BASE_URL, 'https://x/y?a=b');
 });
 
-test('--set coerces the numeric fields — a string would change the digest and break CreateAgentRuntime', () => {
-  assert.equal(gen.parseSets(['maxLifetime=3600']).fields.maxLifetime, 3600);
-  assert.throws(() => gen.parseSets(['maxLifetime=soon']), (e) => e.exitCode === EXIT.USAGE);
+test('--set maxLifetime is REFUSED before its value is even coerced', () => {
+  // It used to coerce to a number here, because a string would change the digest and break
+  // CreateAgentRuntime. That coercion is now unreachable through --set: the saga hard-codes
+  // maxLifetime, so the field is refused outright (see UNAPPLIABLE). The refusal must come FIRST —
+  // "cannot be honoured" is more useful than "not a number", and it holds for a valid value too.
+  assert.throws(() => gen.parseSets(['maxLifetime=3600']), (e) => e.exitCode === EXIT.REFUSED);
+  assert.throws(() => gen.parseSets(['maxLifetime=soon']), (e) => e.exitCode === EXIT.REFUSED);
 });
 
 test('--set rejects an unknown field rather than silently dropping it', () => {
@@ -437,12 +441,12 @@ test('--set reaches the spec AND everything derived from it (EFS_DIR follows efs
   await gen.create(makeCtx(), args({
     image: 'archie-0.2.6',
     id: 'rel-1',
-    set: ['efsMountPath=/mnt/other', 'maxLifetime=3600', 'runtimeEnv.AGENTCORE_OTEL_MODE=full'],
+    set: ['efsMountPath=/mnt/other', 'runtimeEnv.AGENTCORE_OTEL_MODE=full'],
   }), makeOut(), deps);
   const body = JSON.parse(deps.doc.seen.find((c) => c.name === 'PutCommand').input.Item.data);
   assert.equal(body.spec.efsMountPath, '/mnt/other');
   assert.equal(body.spec.runtimeEnv.EFS_DIR, '/mnt/other', 'the env follows the config, not a post-hoc patch');
-  assert.equal(body.spec.maxLifetime, 3600);
+  assert.equal(body.spec.maxLifetime, 28800, 'the saga hard-codes this; --set on it is refused');
   assert.equal(body.spec.runtimeEnv.AGENTCORE_OTEL_MODE, 'full');
 });
 
@@ -905,4 +909,76 @@ test('--from + --set efsMountPath is refused unless EFS_DIR moves with it', asyn
   const body = JSON.parse(deps.doc.seen.find((c) => c.name === 'PutCommand' && c.input.Item.sk === 'rel-2').input.Item.data);
   assert.equal(body.spec.efsMountPath, '/mnt/other');
   assert.equal(body.spec.runtimeEnv.EFS_DIR, '/mnt/other');
+});
+
+// ── §8.10: a rekeyed agent's ADOPTED efsRoot is not drift ────────────────────────────────────────
+//
+// derivedSpecFor always derives efsRootDir(agent, prefix), but a rekeyed agent ADOPTS its old
+// directory rather than moving its data — so its observed root can never equal the derived one.
+// Without this check, verify exits 7 for the WHOLE FLEET and `archie status` reports drift that is
+// not there. cmd/stage.js and cmd/fleet.js already had this rule; verify was the one missing it.
+
+test('verify: an efsRoot-only difference the BINDING explains is not drift', async () => {
+  const legacy = 'oc-legacy-a1';
+  const deps = baseDeps({
+    items: [
+      RELEASE_ITEM,
+      generationItem('rel-3', SPEC),
+      { ...binding('a1', 'rel-3'), legacyEfsRoot: legacy },
+      binding('a2', 'rel-3'),
+    ],
+    agentcore: () => ({
+      config: {},
+      async observedSpecOf(id) {
+        const a = agentOfRuntimeId(id);
+        // a1 sits on its adopted directory; a2 is untouched.
+        return a === 'a1' ? observedFor(a, { efsRoot: `/openclaw-data/${legacy}` }) : observedFor(a);
+      },
+    }),
+  });
+  const out = makeOut();
+  await gen.verify(makeCtx(), args({ generation: 'rel-3' }), out, deps);
+  assert.match(out.stdout.join(''), /2\/2 runtimes match/, 'the adopt is not counted as a mismatch');
+});
+
+test('verify: efsRoot PLUS anything else is still drift — an adopt excuses only itself', async () => {
+  const legacy = 'oc-legacy-a1';
+  const deps = baseDeps({
+    items: [
+      RELEASE_ITEM,
+      generationItem('rel-3', SPEC),
+      { ...binding('a1', 'rel-3'), legacyEfsRoot: legacy },
+      binding('a2', 'rel-3'),
+    ],
+    agentcore: () => ({
+      config: {},
+      async observedSpecOf(id) {
+        const a = agentOfRuntimeId(id);
+        return a === 'a1'
+          ? observedFor(a, { efsRoot: `/openclaw-data/${legacy}`, image: 'repo:archie-0.2.5' })
+          : observedFor(a);
+      },
+    }),
+  });
+  await rejects(() => gen.verify(makeCtx(), args({ generation: 'rel-3' }), makeOut(), deps), EXIT.DRIFT, /image/);
+});
+
+// ── the three --set fields the saga can never honour ─────────────────────────────────────────────
+test('create: --set on a saga-hardcoded field is refused, once, before anything is written', async () => {
+  // agentcore-provisioning.js:521 fixes these at 900 / 28800 / HTTP. A generation setting one can be
+  // written but never satisfied — `stage` would report a read-back mismatch once PER AGENT (208
+  // times) and a re-run would never converge. One error here replaces all of that.
+  for (const field of ['idleRuntimeSessionTimeout', 'maxLifetime', 'serverProtocol']) {
+    assert.throws(
+      () => gen.parseSets([`${field}=1234`]),
+      (e) => e.exitCode === EXIT.REFUSED && /hard-codes it/.test(e.message),
+      field,
+    );
+  }
+});
+
+test('create: the fleet-level fields that DO reach the spec are still settable', () => {
+  const sets = gen.parseSets(['efsRootPrefix=/other-data', 'runtimeEnv.AGENTCORE_OTEL_MODE=off']);
+  assert.equal(sets.fields.efsRootPrefix, '/other-data');
+  assert.equal(sets.env.AGENTCORE_OTEL_MODE, 'off');
 });
