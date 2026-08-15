@@ -103,6 +103,22 @@ const SSM_PARAMETERS = [
   { key: 'METRICS_TABLE_NAME', required: false },
 ];
 
+// ── §4.3, second category: handles to Terraform resources with no name to look them up by ────────
+//
+// These are NOT environment variables and are deliberately not in SSM_PARAMETERS — they are inputs
+// to DISCOVERY (lib/deployment-facts.js), read from the same parameter path. Composition never
+// promotes them to the container's environment; the value derived from EFS_FILE_SYSTEM_ARN reaches
+// it as AGENTCORE_EFS_FS_ID, and the access point id reaches only the volume definition.
+//
+// Everything else archie needs is resolved BY NAME, because Terraform names it from `--name`: roles,
+// security groups, queues, repositories, Cloud Map. These two cannot be, and the reason differs for
+// each — see the block comment in modules/archie/ssm.tf. Both are REQUIRED: a deployment with no
+// file system is not a deployment with a default file system.
+const SSM_HANDLES = [
+  { key: 'EFS_FILE_SYSTEM_ARN', required: true },
+  { key: 'DISPATCHER_ACCESS_POINT_ID', required: true },
+];
+
 /** `/archie/<name>/gateway` — the same one knob Terraform composes the path from (ssm.tf). */
 const ssmPrefixFor = (name) => `/archie/${name}/gateway`;
 
@@ -293,7 +309,7 @@ function requireFacts(facts, keys) {
 }
 
 module.exports = {
-  CONSTANTS, SSM_PARAMETERS, PORT, CPU, MEMORY,
+  CONSTANTS, SSM_PARAMETERS, SSM_HANDLES, PORT, CPU, MEMORY,
   ssmPrefixFor, dispatcherBaseUrl, healthCheckCommand,
   composeEnvironment, composeTaskDefinition,
 };

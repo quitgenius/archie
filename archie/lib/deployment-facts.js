@@ -2,11 +2,11 @@
 
 // The AWS facts the dispatcher task definition is composed from.
 //
-// GATEWAY-OWNERSHIP-PLAN.md §4.1 and §5.2. Everything here is DISCOVERED — resolved from the
-// account by a name derived from `--name`, or read off a resource Terraform owns. Nothing is read
-// from process.env, and nothing is read from the DEPLOYED task definition.
+// GATEWAY-OWNERSHIP-PLAN.md §4.1 and §5.2. Every fact is resolved by a name derived from `--name`,
+// derived from another resolved fact, or read from the parameters Terraform publishes. Nothing is
+// read from process.env, and nothing is read from the DEPLOYED task definition.
 //
-// THAT SECOND EXCLUSION IS THE LOAD-BEARING ONE, and it is the opposite of what preflight does.
+// THAT LAST EXCLUSION IS THE LOAD-BEARING ONE, and it is the opposite of what preflight does.
 // `cmd/preflight.js` deliberately sources the filesystem id, the VPC and the secret names FROM the
 // running task definition, because its job is to check the deployment rather than the operator's
 // shell. Composition cannot do that: it would be circular (the composed value would always agree
@@ -14,13 +14,22 @@
 // case the whole plan exists to enable — `terraform apply` followed by `archie deploy` in an account
 // where no service has ever run.
 //
-// DISCOVERY IS ALSO MORE CORRECT THAN CONFIGURATION, not merely equivalent. The VPC comes from the
-// filesystem's mount targets, so it is the VPC that is TRUE rather than the one a variable claims;
-// this exact divergence has already happened here, and it surfaced as "no available EFS mount
-// targets in supported AZs", which reads like an AZ problem rather than a stale id. The runtime
-// security group is resolved BY NAME within that VPC for the same reason: after a VPC move the
-// recorded id pointed at the retired VPC's copy of the group — same NAME, different id. The name
-// survives; the id does not.
+// WHERE A THING IS DERIVED, DERIVING IT IS MORE CORRECT THAN CONFIGURING IT, not merely equivalent.
+// The VPC comes from the filesystem's mount targets, so it is the VPC that is TRUE rather than the
+// one a variable claims; this exact divergence has already happened here, and it surfaced as "no
+// available EFS mount targets in supported AZs", which reads like an AZ problem rather than a stale
+// id. The runtime security group is resolved BY NAME within that VPC for the same reason: after a
+// VPC move the recorded id pointed at the retired VPC's copy of the group — same NAME, different id.
+// The name survives; the id does not.
+//
+// BUT NOT EVERYTHING IS DERIVABLE, and pretending otherwise is worse than a parameter. Two things
+// have no name to look them up by: the file system (archie does not own one — it mounts the OpenClaw
+// stack's, whose name shares no prefix with anything here) and the gateway's access point (an
+// AWS-generated `fsap-…`). Terraform holds both and publishes them (modules/archie/ssm.tf), so
+// archie composes from the SAME value Terraform mounts from rather than from something that merely
+// agrees with it. An earlier version of this file resolved the file system by paging every access
+// point in the account and matching a `Name` tag; that worked, and it was wrong — a tag is mutable,
+// is not enforced unique, and resolving it wrong is the worst failure this system has.
 
 const { CliError, preflight } = require('./exit');
 const { makeClient } = require('./aws');
@@ -61,11 +70,14 @@ function clientsFor(ctx, deps = {}) {
  */
 async function readGatewayConfig(ctx, deps = {}) {
   const { GetParametersCommand } = require('@aws-sdk/client-ssm');
-  const { SSM_PARAMETERS, ssmPrefixFor } = require('./task-definition');
+  const { SSM_PARAMETERS, SSM_HANDLES, ssmPrefixFor } = require('./task-definition');
   const clients = clientsFor(ctx, deps);
   const prefix = ssmPrefixFor(ctx.name);
 
-  const names = SSM_PARAMETERS.map((p) => `${prefix}/${p.key}`);
+  // ONE read covering both categories. `composeEnvironment` consumes only the declared
+  // SSM_PARAMETERS keys and ignores everything else, so the handles ride along without any risk of
+  // being promoted into the container's environment.
+  const names = [...SSM_HANDLES, ...SSM_PARAMETERS].map((p) => `${prefix}/${p.key}`);
   let res;
   try {
     // WithDecryption for the SecureString case. Nothing here is a SecureString today — these are
@@ -94,17 +106,27 @@ async function readGatewayConfig(ctx, deps = {}) {
  * Ordered by dependency, not by tidiness: the file system must be resolved before the VPC (mount
  * targets), and the VPC before the security groups (looked up by name WITHIN it). Everything
  * independent of that chain runs alongside it.
+ *
+ * @param config  the result of readGatewayConfig — passed in rather than read here so the whole
+ *                parameter path is fetched ONCE per command, and so a caller that has already
+ *                validated it does not pay for a second read.
  */
-async function discoverFacts(ctx, deps = {}) {
+async function discoverFacts(ctx, config, deps = {}) {
   const clients = clientsFor(ctx, deps);
   const r = ctx.resources;
 
-  const [account, agentRepoUri, turnQueueUrl, roles, efs, serviceRegistryArn, secrets] = await Promise.all([
-    callerAccount(clients, ctx),
+  // IDENTITY FIRST, and alone. It is an assertion about the credentials in play, so resolving it
+  // before anything else means `--account` fails as "you are in the wrong account" rather than as
+  // whichever concurrent lookup happened to notice a symptom first. It also gives the file-system
+  // ARN a real account to check against, so a cross-account file system is caught even when
+  // `--account` was not passed — which is the case where it is most likely to be a surprise.
+  const account = await callerAccount(clients, ctx);
+
+  const [agentRepoUri, turnQueueUrl, roles, efs, serviceRegistryArn, secrets] = await Promise.all([
     repositoryUri(clients, r.agentRepo),
     queueUrl(clients, `${r.dispatcherService}-turns.fifo`),
     dispatcherRoles(clients, r),
-    dispatcherFileSystem(clients, r),
+    dispatcherFileSystem(clients, ctx, config, account),
     dispatcherRegistry(clients, ctx),
     dispatcherSecrets(clients, r),
   ]);
@@ -208,56 +230,120 @@ async function dispatcherRoles(clients, r) {
 }
 
 /**
- * The file system, via the access point Terraform created for the gateway.
+ * The file system and the gateway's access point, from the parameters Terraform publishes — and the
+ * VPC and subnets, from the file system itself.
  *
- * THE FILE SYSTEM IS NOT DERIVABLE FROM `--name`. archie does not own one: it mounts the OpenClaw
- * stack's, whose name has a different prefix entirely, and it does so because that is where ~270 GB
- * of live agent workspaces already are. So the chain starts from the one EFS object Terraform DOES
- * name from `--name` — the gateway's access point, tagged `Name = <name>-dispatcher-data`
- * (modules/archie/efs.tf) — and the file system falls out of it.
+ * THE SPLIT HERE IS THE POINT, and it is not the same rule in both directions:
  *
- * DescribeAccessPoints has no tag filter, so this pages the account's access points and matches.
- * That list is long in a real deployment (the dispatcher creates one per agent at runtime, plus
- * whatever BDD leaked), which is why the match is on the exact tag and never on a prefix.
+ *   The file system and access point are TOLD to us. Neither has a name archie can look up. archie
+ *   does not own a file system — it mounts the OpenClaw stack's, whose name shares no prefix with
+ *   anything here, because that is where ~270 GB of live agent workspaces already are; and an access
+ *   point's id is AWS-generated. Terraform holds both (`var.efs_file_system_id`,
+ *   `aws_efs_access_point.dispatcher`) and publishes them, so archie composes from the SAME value
+ *   Terraform mounts from rather than from something that merely agrees with it.
+ *
+ *   The VPC and subnets are DERIVED, and must stay derived. EFS allows exactly one VPC per file
+ *   system, so the mount targets are the authority — the VPC that is TRUE rather than the one config
+ *   claims. A recorded VPC id is precisely what rotted here before: after a VPC move it pointed at
+ *   the retired VPC, and the failure surfaced as "no available EFS mount targets in supported AZs",
+ *   which reads like an AZ problem rather than a stale id.
+ *
+ * An earlier version resolved the file system by PAGING every access point in the account and
+ * matching a `Name` tag. That worked, and was wrong: a tag is mutable by anyone with EFS write, is
+ * not enforced unique, and resolving it wrong is the worst failure this system has — every agent
+ * boots on an empty workspace while its history looks deleted, and nothing is raised.
  */
-async function dispatcherFileSystem(clients, r) {
+async function dispatcherFileSystem(clients, ctx, config, account) {
   const { DescribeAccessPointsCommand, DescribeMountTargetsCommand } = require('@aws-sdk/client-efs');
-  const wanted = `${r.dispatcherService}-data`;
+  const values = (config && config.values) || {};
+  const prefix = (config && config.prefix) || '';
 
-  let NextToken;
-  let found = null;
-  do {
-    const res = await clients.efs.send(new DescribeAccessPointsCommand({ MaxResults: 100, NextToken }));
-    for (const ap of res.AccessPoints || []) {
-      if ((ap.Tags || []).some((t) => t.Key === 'Name' && t.Value === wanted)) { found = ap; break; }
-    }
-    NextToken = found ? undefined : res.NextToken;
-  } while (NextToken);
-
-  if (!found) {
-    throw preflight(`no EFS access point tagged Name=${wanted}`, {
-      detail: 'Terraform owns the gateway access point (modules/archie/efs.tf). It is also the only '
-        + 'way to discover which file system this deployment mounts — archie does not own one.',
+  const fileSystemId = fileSystemIdFromArn(values.EFS_FILE_SYSTEM_ARN, ctx, `${prefix}/EFS_FILE_SYSTEM_ARN`, account);
+  const accessPointId = values.DISPATCHER_ACCESS_POINT_ID;
+  if (!accessPointId) {
+    throw preflight(`${prefix}/DISPATCHER_ACCESS_POINT_ID is not published`, {
+      detail: 'Terraform owns the gateway access point and publishes its id (modules/archie/ssm.tf). '
+        + 'Apply this deployment before deploying the gateway.',
     });
   }
 
-  const mountTargets = await clients.efs.send(new DescribeMountTargetsCommand({ FileSystemId: found.FileSystemId }));
+  // Verify the pair AGREES, rather than trusting two parameters to have been written together. They
+  // are written by one apply today, so a mismatch means a hand-edit or a half-finished migration —
+  // and mounting the right access point on the wrong file system is not an error ECS reports.
+  let accessPoint;
+  try {
+    const res = await clients.efs.send(new DescribeAccessPointsCommand({ AccessPointId: accessPointId }));
+    accessPoint = (res.AccessPoints || [])[0];
+  } catch (e) {
+    if (!isNotFound(e)) throw new CliError(`efs:DescribeAccessPoints ${accessPointId} failed`, { cause: e });
+    accessPoint = null;
+  }
+  if (!accessPoint) {
+    throw preflight(`EFS access point ${accessPointId} does not exist`, {
+      detail: `Published at ${prefix}/DISPATCHER_ACCESS_POINT_ID. Re-apply Terraform for this deployment.`,
+    });
+  }
+  if (accessPoint.FileSystemId !== fileSystemId) {
+    throw preflight(`access point ${accessPointId} belongs to ${accessPoint.FileSystemId}, not ${fileSystemId}`, {
+      detail: `${prefix}/EFS_FILE_SYSTEM_ARN and ${prefix}/DISPATCHER_ACCESS_POINT_ID disagree. `
+        + 'Mounting the right access point on the wrong file system is not an error ECS reports.',
+    });
+  }
+
+  const mountTargets = await clients.efs.send(new DescribeMountTargetsCommand({ FileSystemId: fileSystemId }));
   const targets = (mountTargets.MountTargets || []).filter((m) => !m.LifeCycleState || m.LifeCycleState === 'available');
   const vpcIds = [...new Set(targets.map((m) => m.VpcId).filter(Boolean))];
   if (vpcIds.length !== 1) {
     // EFS allows exactly one VPC per file system, so this cannot legitimately be anything but 1.
     // Zero means no available mount targets, which breaks runtime placement as well as this.
-    throw preflight(`${found.FileSystemId} resolves to ${vpcIds.length} VPCs (${vpcIds.join(', ') || 'none'})`, {
+    throw preflight(`${fileSystemId} resolves to ${vpcIds.length} VPCs (${vpcIds.join(', ') || 'none'})`, {
       detail: 'EFS allows one VPC per file system; 0 means no mount target is available.',
     });
   }
 
   return {
-    accessPointId: found.AccessPointId,
-    fileSystemId: found.FileSystemId,
+    accessPointId,
+    fileSystemId,
     vpcId: vpcIds[0],
     subnetIds: [...new Set(targets.map((m) => m.SubnetId).filter(Boolean))],
   };
+}
+
+/**
+ * `arn:aws:elasticfilesystem:<region>:<account>:file-system/<fs-id>` — parsed, and ASSERTED.
+ *
+ * The ARN is published rather than the bare id precisely so this assertion is possible: a `fs-…` is
+ * valid-looking in every account on earth, and a cross-account or cross-region one would compose
+ * cleanly and then fail at task start with a mount error that names neither. The region check is not
+ * theoretical — a profile's configured region is routinely not the deployment's, which is why
+ * `--region` is never defaulted anywhere in this CLI.
+ */
+function fileSystemIdFromArn(arn, ctx, path, callerAccountId) {
+  if (!arn) {
+    throw preflight(`${path} is not published`, {
+      detail: 'Terraform owns which file system this deployment mounts (var.efs_file_system_id) and '
+        + 'publishes its ARN (modules/archie/ssm.tf). archie cannot derive it: the file system is not '
+        + 'archie\'s, and its name shares no prefix with --name.',
+    });
+  }
+  const m = /^arn:[^:]*:elasticfilesystem:([^:]+):([^:]+):file-system\/(fs-[0-9a-f]+)$/.exec(String(arn).trim());
+  if (!m) throw preflight(`${path} is not an EFS file system ARN: ${arn}`);
+  const [, region, account, fileSystemId] = m;
+  if (region !== ctx.region) {
+    throw preflight(`${path} is in ${region}, but --region is ${ctx.region}`, {
+      detail: 'A file system in another region cannot be mounted; the task would fail to start.',
+    });
+  }
+  // Against the RESOLVED caller account when there is one, falling back to `--account`. The resolved
+  // one is the stronger check: it applies whether or not the operator passed the flag, and a
+  // cross-account file system is exactly the kind of thing nobody thinks to assert.
+  const expected = callerAccountId || ctx.account;
+  if (expected && account !== expected) {
+    throw preflight(`${path} is in account ${account}, but this deployment is in ${expected}`, {
+      detail: 'EFS cannot be mounted across accounts; the task would fail to start.',
+    });
+  }
+  return fileSystemId;
 }
 
 async function securityGroupId(clients, vpcId, groupName) {
@@ -344,4 +430,4 @@ async function dispatcherSecrets(clients, r) {
   return { list, credentialSecretName: connector ? r.credentialSecret : null };
 }
 
-module.exports = { discoverFacts, readGatewayConfig, clientsFor };
+module.exports = { discoverFacts, readGatewayConfig, fileSystemIdFromArn, clientsFor };

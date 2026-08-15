@@ -993,11 +993,13 @@ async function compose(ctx, args, out, deps = {}) {
   const { diffTaskDefinition } = require('../lib/td-diff');
   const ecs = client.ecs(ctx, deps);
 
-  const [facts, config, deployed] = await Promise.all([
-    discoverFacts(ctx, deps),
+  // The parameters first, and once: discovery needs the two resource handles among them, and
+  // composition needs the seven values. One read serves both.
+  const [config, deployed] = await Promise.all([
     readGatewayConfig(ctx, deps),
     readDeployed(ecs, ctx),
   ]);
+  const facts = await discoverFacts(ctx, config, deps);
 
   if (config.missing.length) {
     // Reported, never fatal here: five of the seven are legitimately absent, and `composeEnvironment`
