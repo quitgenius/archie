@@ -718,6 +718,38 @@ async function taint(ctx, args, out, deps = {}) {
 const IMAGE_PK = 'CONFIG#image';
 const imageSkFor = (agent) => (agent ? `AGENT#${agent}` : 'FLEET');
 
+
+/**
+ * Every per-agent image override in the `CONFIG#image` partition.
+ *
+ * A Query rather than a Scan: the partition is small and bounded (FLEET plus one row per pinned
+ * agent), so this costs one page and cannot see another partition's rows. `#pk` is aliased for the
+ * usual reason — `agent` and `data` are reserved words and a bare name is how an expression breaks
+ * only in production (runtime-registry.js:134-138).
+ */
+async function listAgentOverrides(aws, table) {
+  const { QueryCommand } = require('@aws-sdk/lib-dynamodb');
+  const out = [];
+  let ExclusiveStartKey;
+  do {
+    const r = await aws.doc().send(new QueryCommand({
+      TableName: table,
+      KeyConditionExpression: '#pk = :pk',
+      ExpressionAttributeNames: { '#pk': 'pk' },
+      ExpressionAttributeValues: { ':pk': IMAGE_PK },
+      ExclusiveStartKey,
+    }));
+    for (const i of r.Items || []) {
+      // FLEET is never a target. Filtered here rather than in the caller so no future caller can
+      // forget: this function returns overrides, and the fleet pointer is not one.
+      if (!String(i.sk).startsWith('AGENT#')) continue;
+      out.push({ agent: String(i.sk).slice('AGENT#'.length), tag: i.tag || null, imageDigest: i.imageDigest || null });
+    }
+    ExclusiveStartKey = r.LastEvaluatedKey;
+  } while (ExclusiveStartKey);
+  return out.sort((a, b) => (a.agent < b.agent ? -1 : 1));
+}
+
 /**
  * `archie release publish-image <tag> [--agent <id>] [--clear]` — §2.13a.
  *
@@ -750,34 +782,46 @@ async function publishImage(ctx, args, out, deps = {}) {
   if (clear && tag) throw usage('--clear takes no tag — it removes a pointer rather than moving it');
   if (!clear && !tag) throw usage('release publish-image needs a tag: `archie release publish-image <tag> [--agent <id>]`');
 
-  // CLEARING THE FLEET POINTER IS AN OUTAGE, and is refused. `image-source.js:11-15` removed the
-  // baked fallback on 2026-08-11 — with no `CONFIG#image/FLEET` every provision throws
-  // ImagePointerMissing, so "clear" means "stop the fleet", not "revert". `publish-image.mjs:117`
-  // still prints "fleet falls back to the dispatcher's baked image", which has been untrue since
-  // that change; publishing a different tag is the actual revert.
-  if (clear && !agent) {
-    throw refused('refusing to clear the FLEET image pointer', {
-      detail: 'There is no baked fallback image (image-source.js:11-15), so removing CONFIG#image/FLEET makes '
-        + 'every provision fail closed with ImagePointerMissing — a fleet-wide outage, not a rollback. To go '
-        + 'back to a previous build, publish its tag: `archie release publish-image <previous-tag>`.',
-    });
-  }
-
   const account = await resolveAccount(ctx, aws);
   const table = ctx.resources.configTable;
-  const Key = { pk: IMAGE_PK, sk: imageSkFor(agent) };
 
+  // `--clear` UNPINS AGENTS. It never touches `CONFIG#image / FLEET`, and there is deliberately no
+  // spelling that does: `image-source.js:11-15` removed the baked fallback on 2026-08-11, so an
+  // absent FLEET pointer makes every provision fail closed with ImagePointerMissing — an outage,
+  // not a rollback. The revert is publishing the previous tag. (`publish-image.mjs:117` still prints
+  // "fleet falls back to the dispatcher's baked image", which has been untrue since that change —
+  // this command is why that spelling does not survive into the CLI.)
+  //
+  // Bare `--clear` unpins EVERY agent; `--clear --agent <id>` unpins one. Both converge agents onto
+  // the fleet image, which is the safe direction — the only thing lost is which tag each was pinned
+  // to, so every cleared override is reported WITH its tag and can be re-pinned from that output.
   if (clear) {
-    // Per-agent only, by the rail above: this returns one canaried agent to whatever the fleet runs.
-    if (ctx.dryRun) {
-      out.progress(`would delete ${Key.pk} / ${Key.sk}`);
-      return { ...Key, cleared: false, dryRun: true };
+    const overrides = await listAgentOverrides(aws, table);
+    const targets = agent ? overrides.filter((o) => o.agent === agent) : overrides;
+
+    if (!targets.length) {
+      out.progress(agent
+        ? `agent ${agent} has no image override — nothing to clear`
+        : 'no agent image overrides — every agent already follows the fleet pointer');
+      return { cleared: [], count: 0 };
     }
+
+    if (ctx.dryRun) {
+      for (const o of targets) out.progress(`would unpin ${o.agent} (currently ${o.tag || '?'})`);
+      return { cleared: targets, count: targets.length, dryRun: true };
+    }
+
     const { DeleteCommand } = require('@aws-sdk/lib-dynamodb');
-    await aws.doc().send(new DeleteCommand({ TableName: table, Key }));
-    out.progress(`cleared ${Key.sk} — agent ${agent} now follows the fleet pointer`);
-    return { ...Key, agent, cleared: true };
+    for (const o of targets) {
+      await aws.doc().send(new DeleteCommand({ TableName: table, Key: { pk: IMAGE_PK, sk: imageSkFor(o.agent) } }));
+      // The tag is reported on the way out, not just counted: it is the only record of what the
+      // agent was pinned to, and re-pinning is `release publish-image <tag> --agent <id>`.
+      out.progress(`unpinned ${o.agent} (was ${o.tag || '?'}) — now follows the fleet pointer`);
+    }
+    return { cleared: targets, count: targets.length };
   }
+
+  const Key = { pk: IMAGE_PK, sk: imageSkFor(agent) };
 
   const repo = ctx.resources.agentRepo;
   const uri = imageUriFor(ctx, account, tag);

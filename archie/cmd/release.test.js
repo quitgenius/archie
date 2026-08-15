@@ -914,33 +914,68 @@ test('publish-image --agent writes the per-agent override, not the fleet key', a
   assert.equal(doc.puts().filter((p) => p.input.Item.sk === 'FLEET').length, 0);
 });
 
-test('publish-image REFUSES --clear on the FLEET pointer — it is an outage, not a rollback', async () => {
-  const doc = fakeDoc([{ pk: 'CONFIG#image', sk: 'FLEET', tag: 'pi-obs-40' }]);
+test('publish-image --clear unpins EVERY agent and never touches the fleet pointer', async () => {
+  const doc = fakeDoc([
+    { pk: 'CONFIG#image', sk: 'FLEET', tag: 'pi-obs-40' },
+    { pk: 'CONFIG#image', sk: 'AGENT#dm-u0x', tag: 'pi-obs-41' },
+    { pk: 'CONFIG#image', sk: 'AGENT#ch-c01', tag: 'pi-obs-42' },
+  ]);
   const out = fakeOut();
-  // There has been no baked fallback since 2026-08-11 (image-source.js:11-15), so clearing FLEET
-  // makes every provision fail closed. publish-image.mjs:117 still calls this "falls back to the
-  // dispatcher's baked image", which is why the CLI states the real consequence instead.
-  const e = await rel['release publish-image'](ctxFor(), { positionals: [], values: { clear: true } }, out, {
+  const r = await rel['release publish-image'](ctxFor(), { positionals: [], values: { clear: true } }, out, {
     doc, ecr: fakeEcr(), sts: fakeSts(),
-  }).then(() => null, (err) => err);
-  assert.equal(e.exitCode, EXIT.REFUSED);
-  assert.match(e.detail, /ImagePointerMissing/);
-  assert.equal(doc.writes().length, 0);
-  assert.ok(doc.store.has('CONFIG#image FLEET'), 'the fleet pointer must survive a refused clear');
+  });
+
+  assert.equal(r.count, 2);
+  assert.deepEqual(r.cleared.map((c) => c.agent), ['ch-c01', 'dm-u0x']);
+  assert.equal(doc.store.has('CONFIG#image AGENT#dm-u0x'), false);
+  assert.equal(doc.store.has('CONFIG#image AGENT#ch-c01'), false);
+  // THE INVARIANT. There is no spelling of this command that removes FLEET: with no baked fallback
+  // (image-source.js:11-15) an absent fleet pointer is ImagePointerMissing on every provision — an
+  // outage, not a rollback. Unpinning converges agents ONTO the fleet image; it cannot remove it.
+  assert.ok(doc.store.has('CONFIG#image FLEET'), 'the FLEET pointer must never be cleared');
+  // The previous tag is reported, because it is the only record of what each agent was pinned to.
+  assert.deepEqual(r.cleared.map((c) => c.tag).sort(), ['pi-obs-41', 'pi-obs-42']);
 });
 
-test('publish-image --clear --agent removes only that agent override', async () => {
+test('publish-image --clear --agent unpins only that agent', async () => {
+  const doc = fakeDoc([
+    { pk: 'CONFIG#image', sk: 'FLEET', tag: 'pi-obs-40' },
+    { pk: 'CONFIG#image', sk: 'AGENT#dm-u0x', tag: 'pi-obs-41' },
+    { pk: 'CONFIG#image', sk: 'AGENT#ch-c01', tag: 'pi-obs-42' },
+  ]);
+  const r = await rel['release publish-image'](ctxFor(), { positionals: [], values: { clear: true, agent: 'dm-u0x' } }, fakeOut(), {
+    doc, ecr: fakeEcr(), sts: fakeSts(),
+  });
+  assert.equal(r.count, 1);
+  assert.equal(doc.store.has('CONFIG#image AGENT#dm-u0x'), false);
+  assert.ok(doc.store.has('CONFIG#image AGENT#ch-c01'), 'the other agent must be untouched');
+  assert.ok(doc.store.has('CONFIG#image FLEET'));
+});
+
+test('publish-image --clear with nothing pinned is a no-op, not an error', async () => {
+  const doc = fakeDoc([{ pk: 'CONFIG#image', sk: 'FLEET', tag: 'pi-obs-40' }]);
+  const out = fakeOut();
+  const r = await rel['release publish-image'](ctxFor(), { positionals: [], values: { clear: true } }, out, {
+    doc, ecr: fakeEcr(), sts: fakeSts(),
+  });
+  assert.equal(r.count, 0);
+  assert.equal(doc.writes().length, 0);
+  assert.match(out.progressLines.join('\n'), /already follows the fleet pointer/);
+});
+
+test('publish-image --clear --dry-run names each agent it would unpin, and writes nothing', async () => {
   const doc = fakeDoc([
     { pk: 'CONFIG#image', sk: 'FLEET', tag: 'pi-obs-40' },
     { pk: 'CONFIG#image', sk: 'AGENT#dm-u0x', tag: 'pi-obs-41' },
   ]);
   const out = fakeOut();
-  const r = await rel['release publish-image'](ctxFor(), { positionals: [], values: { clear: true, agent: 'dm-u0x' } }, out, {
+  const r = await rel['release publish-image'](ctxFor({ dryRun: true }), { positionals: [], values: { clear: true } }, out, {
     doc, ecr: fakeEcr(), sts: fakeSts(),
   });
-  assert.equal(r.cleared, true);
-  assert.equal(doc.store.has('CONFIG#image AGENT#dm-u0x'), false);
-  assert.ok(doc.store.has('CONFIG#image FLEET'), 'clearing an override must not touch the fleet');
+  assert.equal(r.dryRun, true);
+  assert.equal(r.count, 1);
+  assert.equal(doc.writes().length, 0);
+  assert.match(out.progressLines.join('\n'), /would unpin dm-u0x \(currently pi-obs-41\)/);
 });
 
 test('publish-image --clear with a tag is a usage error, not a silent ignore', async () => {
