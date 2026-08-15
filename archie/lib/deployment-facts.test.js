@@ -36,7 +36,7 @@ const valueFor = (name) => {
 
 /** discoverFacts takes the parameter read as an argument, so tests supply it explicitly. */
 const config = (over = {}) => ({
-  prefix: '/archie/agent-gn0p84/gateway',
+  prefix: '/archie/gateway',
   values: { ...PARAMETERS, ...over },
   missing: [],
 });
@@ -165,7 +165,7 @@ test('an unpublished handle refuses, and says which parameter and who owns it', 
   ]) {
     const values = { ...PARAMETERS };
     delete values[key];
-    await assert.rejects(discoverFacts(CTX(), { prefix: '/archie/agent-gn0p84/gateway', values, missing: [key] },
+    await assert.rejects(discoverFacts(CTX(), { prefix: '/archie/gateway', values, missing: [key] },
       { clients: clients() }), (e) => e.exitCode === EXIT.PREFLIGHT && expected.test(e.message));
   }
 });
@@ -267,7 +267,7 @@ test('readGatewayConfig returns absent parameters as absent, not as an error', a
   // Five of the seven are conditional in Terraform, and GetParameters reports unknown names in
   // InvalidParameters rather than failing — which is exactly the semantics wanted.
   const { values, missing, prefix } = await readGatewayConfig(CTX(), { clients: clients() });
-  assert.equal(prefix, '/archie/agent-gn0p84/gateway');
+  assert.equal(prefix, '/archie/gateway');
   assert.equal(values.DEPLOYMENT_ENVIRONMENT, 'v:DEPLOYMENT_ENVIRONMENT');
   assert.deepEqual(missing.sort(), ['DATADOG_API_KEY_SECRET', 'DATADOG_APP_KEY_SECRET']);
   // ONE read covers both categories, so discovery and composition cannot see different generations
@@ -279,5 +279,5 @@ test('readGatewayConfig returns absent parameters as absent, not as an error', a
 test('an SSM permission failure names the grant rather than surfacing a bare SDK error', async () => {
   const ssm = clientFrom({ GetParametersCommand: () => { const e = new Error('AccessDenied'); e.name = 'AccessDeniedException'; throw e; } });
   await assert.rejects(readGatewayConfig(CTX(), { clients: clients({ ssm }) }),
-    (e) => /ssm:GetParameters failed under \/archie\/agent-gn0p84\/gateway/.test(e.message));
+    (e) => /ssm:GetParameters failed under \/archie\/gateway/.test(e.message));
 });

@@ -119,8 +119,20 @@ const SSM_HANDLES = [
   { key: 'DISPATCHER_ACCESS_POINT_ID', required: true },
 ];
 
-/** `/archie/<name>/gateway` — the same one knob Terraform composes the path from (ssm.tf). */
-const ssmPrefixFor = (name) => `/archie/${name}/gateway`;
+/**
+ * The parameter path — a CONSTANT, not derived from `--name`, matching modules/archie/ssm.tf.
+ *
+ * Every other resource this CLI touches is name-prefixed, and this one deliberately is not.
+ * `var.name` exists to namespace archie against the OpenClaw stack sharing the account, and its own
+ * declaration states the invariant: one archie stack per AWS account. A `<name>` segment here could
+ * therefore only ever take one value.
+ *
+ * The one-knob rule (context.js:12-16) does not argue for keeping it either. That rule exists
+ * because a wrong name does not ERROR — the OpenClaw namespaces and log group are real and
+ * populated, so it renders another system's fleet as if it were yours. Nothing else writes under
+ * `/archie/gateway`, so there is no other system for a wrong value to resolve to.
+ */
+const SSM_PREFIX = '/archie/gateway';
 
 // ── composition ──────────────────────────────────────────────────────────────────────────────────
 
@@ -197,7 +209,7 @@ function composeEnvironment({ resources, region, facts, ssm }) {
     const value = ssm ? ssm[key] : undefined;
     if (value === undefined || value === null || value === '') {
       if (required) {
-        throw new CliError(`${key} is not published at ${ssmPrefixFor(resources.name)}/${key}`, {
+        throw new CliError(`${key} is not published at ${SSM_PREFIX}/${key}`, {
           detail: 'Terraform owns this value (modules/archie/ssm.tf). Run terraform apply for this '
             + 'deployment before deploying the gateway.',
         });
@@ -310,6 +322,6 @@ function requireFacts(facts, keys) {
 
 module.exports = {
   CONSTANTS, SSM_PARAMETERS, SSM_HANDLES, PORT, CPU, MEMORY,
-  ssmPrefixFor, dispatcherBaseUrl, healthCheckCommand,
+  SSM_PREFIX, dispatcherBaseUrl, healthCheckCommand,
   composeEnvironment, composeTaskDefinition,
 };

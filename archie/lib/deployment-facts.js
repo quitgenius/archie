@@ -70,9 +70,9 @@ function clientsFor(ctx, deps = {}) {
  */
 async function readGatewayConfig(ctx, deps = {}) {
   const { GetParametersCommand } = require('@aws-sdk/client-ssm');
-  const { SSM_PARAMETERS, SSM_HANDLES, ssmPrefixFor } = require('./task-definition');
+  const { SSM_PARAMETERS, SSM_HANDLES, SSM_PREFIX } = require('./task-definition');
   const clients = clientsFor(ctx, deps);
-  const prefix = ssmPrefixFor(ctx.name);
+  const prefix = SSM_PREFIX;
 
   // ONE read covering both categories. `composeEnvironment` consumes only the declared
   // SSM_PARAMETERS keys and ignores everything else, so the handles ride along without any risk of

@@ -3,7 +3,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const {
-  CONSTANTS, SSM_PARAMETERS, PORT, ssmPrefixFor, dispatcherBaseUrl,
+  CONSTANTS, SSM_PARAMETERS, PORT, SSM_PREFIX, dispatcherBaseUrl,
   composeEnvironment, composeTaskDefinition,
 } = require('./task-definition');
 const { resourcesFor } = require('./context');
@@ -80,7 +80,7 @@ test('a missing REQUIRED parameter refuses, and names the exact path to fix', ()
   const ssm = { ...SSM };
   delete ssm.DEPLOYMENT_ENVIRONMENT;
   assert.throws(() => compose({ ssm }), (e) => (
-    /DEPLOYMENT_ENVIRONMENT is not published at \/archie\/agent-gn0p84\/gateway\/DEPLOYMENT_ENVIRONMENT/.test(e.message)
+    /DEPLOYMENT_ENVIRONMENT is not published at \/archie\/gateway\/DEPLOYMENT_ENVIRONMENT/.test(e.message)
   ));
 });
 
@@ -148,9 +148,12 @@ test('region is required, and reaches all four variables that must state it', ()
   assert.equal(env.CONNECTOR_API_KEY_SECRET_REGION, REGION);
 });
 
-test('the SSM prefix is derived from the one knob', () => {
-  assert.equal(ssmPrefixFor('agent-gn0p84'), '/archie/agent-gn0p84/gateway');
-  assert.equal(ssmPrefixFor('agent-6guk92'), '/archie/agent-6guk92/gateway');
+test('the SSM prefix is a constant, NOT name-derived — one archie per account', () => {
+  // The invariant is declared on modules/archie/variables.tf's `name`: one archie stack per AWS
+  // account. A <name> segment could only ever take one value, so it was a variable path with no
+  // variation. Asserted as a literal because the value is now a contract with Terraform's
+  // local.ssm_prefix, and the two must not drift.
+  assert.equal(SSM_PREFIX, '/archie/gateway');
 });
 
 test('every declared SSM parameter is consumed, and no undeclared key leaks in', () => {
