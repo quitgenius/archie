@@ -191,6 +191,51 @@ async function fleetDeploy(ctx, args, out, deps = {}) {
   // (§3.1 step 4, "re-run is the designed response"). Rebuilding and re-creating there would either
   // be a no-op or, if the tree has moved since, refuse with a spec collision on a generation that is
   // already half-staged. The image is the one the generation RECORDED; nothing re-derives it.
+  // ── 0. retention, BEFORE anything is created ───────────────────────────────────────────────────
+  //
+  // GC RUNS FIRST, NOT LAST, and the reason is recovery rather than tidiness.
+  //
+  // Reaping after a release destroys rollback targets in the exact window where they are most likely
+  // to be wanted — the minutes after shipping. And recovering a reaped generation is not a re-run: a
+  // re-stage issues CreateAgentRuntime under the same derived name, hits ConflictException because
+  // AgentCore holds a deleted runtime's name for 3.5-10+ minutes, and falls into waitForRuntimeDeleted
+  // (400 x 3s). Per agent, at a provisioning bound of 4-5, recovering a reaped generation across the
+  // fleet is measured in HOURS, not minutes.
+  //
+  // Running it before inverts that: the reap happens from a known-good state, against the generation
+  // that is currently live, so the two most recent rollback targets are retained by construction and
+  // nothing just-released is ever destroyed. It also front-loads quota reclamation for the 208-runtime
+  // staging pass that follows, and leaves a FAILED deploy with a freshly-cleaned quota rather than a
+  // dirty one.
+  //
+  // ARITHMETIC THIS CHANGES: the new generation arrives AFTER the reap, so `--keep N` rests at N+1
+  // rollback targets. At --keep 2 that is 4 generations (832 runtimes) rather than 3 (624), against
+  // the 1000 cap. The PEAK is unchanged — staging always adds one on top of the retained set — so
+  // nothing newly breaks; the resting headroom narrows from 376 to 168.
+  //
+  // A reap failure must NEVER block the deploy: failing to reclaim quota is not a reason to refuse to
+  // ship, and if headroom is genuinely insufficient `preflight` check 12 refuses a step later. That
+  // ordering is deliberate — reclaim, then verify.
+  if (!ctx.dryRun && !values['skip-gc']) {
+    // PER-UNIT failures continue; a THROW does not. The distinction is whether the deploy can still
+    // succeed. A runtime that would not reap costs quota, not availability, so it is warned and the
+    // deploy proceeds. But a thrown gc is 8 (headroom) or 1 (an AWS failure) — and 8 in particular is
+    // the signal that the 208-runtime staging pass about to start CANNOT fit. Swallowing it would
+    // march into a doomed stage and fail later and messier. Nothing has been created at this point,
+    // so propagating leaves the fleet exactly as it was: a clean stop, re-runnable.
+    const pre = await runStep(steps.gc, ctx, { positionals: [], values: { keep: values.keep } },
+      out, deps, { forwardFailures: false });
+    plan.gc = pre.result || null;
+    if (pre.failures.length) {
+      plan.gcFailures = pre.failures;
+      out.warn(`${pre.failures.length} runtime(s) could not be reaped: ${namesOf(pre.failures).join(', ')}. `
+        + 'Continuing — this costs quota, not availability. Nothing has been created yet.');
+    }
+    out.progress(`step 0/5  gc          ${plan.gc && plan.gc.reaped ? plan.gc.reaped.length : 0} runtime(s) reaped before staging`);
+  } else if (ctx.dryRun) {
+    out.progress('step 0/5  gc          skipped (dry run)');
+  }
+
   const named = values.generation || null;
   const existing = named ? await readGeneration(aws, ctx, named) : null;
 
@@ -206,13 +251,13 @@ async function fleetDeploy(ctx, args, out, deps = {}) {
     plan.generationId = named;
     plan.image = body.image || null;
     plan.imageTag = recordedTag || null;
-    out.progress(`step 1/6  resume      generation ${named} already exists (${plan.imageTag || 'no image tag'}) — not rebuilding`);
-    out.progress('step 2/6  create      skipped — the generation is already written');
+    out.progress(`step 1/5  resume      generation ${named} already exists (${plan.imageTag || 'no image tag'}) — not rebuilding`);
+    out.progress('step 2/5  create      skipped — the generation is already written');
   } else if (values['skip-build']) {
     // The SAME derivation `generation build` would have used (lib/digest.js), so a `--skip-build`
     // run cannot name a different tag than the build it is skipping.
     plan.imageTag = values.tag || (deps.digestFor || digestFor)('agent').tag;
-    out.progress(`step 1/6  build       skipped (--skip-build) — using tag ${plan.imageTag}`);
+    out.progress(`step 1/5  build       skipped (--skip-build) — using tag ${plan.imageTag}`);
   } else {
     const built = await runStep(steps.build, ctx, {
       positionals: [],
@@ -224,7 +269,7 @@ async function fleetDeploy(ctx, args, out, deps = {}) {
     plan.build = built.result || null;
     plan.imageTag = (plan.build && plan.build.tag) || values.tag || null;
     plan.image = (plan.build && plan.build.image) || null;
-    out.progress(`step 1/6  image       ${plan.image || plan.imageTag}`
+    out.progress(`step 1/5  image       ${plan.image || plan.imageTag}`
       + `${plan.build && plan.build.skipped ? '  (already in ECR — inputs unchanged)' : ''}`);
   }
   if (!plan.imageTag) {
@@ -251,7 +296,7 @@ async function fleetDeploy(ctx, args, out, deps = {}) {
       });
     }
     plan.create = body;
-    out.progress(`step 2/6  generation  ${plan.generationId}`
+    out.progress(`step 2/5  generation  ${plan.generationId}`
       + `${body.unchanged ? '  (already existed with this exact spec)' : ''}`);
   }
 
@@ -263,7 +308,7 @@ async function fleetDeploy(ctx, args, out, deps = {}) {
   // limit, "the pressure to skip the check is highest exactly here".
   if (hotfix) {
     plan.canary = await resolveCanary(ctx, values, aws, deps, out);
-    out.progress(`step 3/6  hotfix      staging ONE canary (${plan.canary}); the other agents provision on `
+    out.progress(`step 3/5  hotfix      staging ONE canary (${plan.canary}); the other agents provision on `
       + 'demand or via `archie fleet reconcile` (§3.2)');
   }
 
@@ -283,9 +328,8 @@ async function fleetDeploy(ctx, args, out, deps = {}) {
   // A dry run has written nothing, so there is no generation to gate and no pointer to move. Saying
   // so beats evaluating a gate that would refuse for the one reason that is not a problem.
   if (ctx.dryRun) {
-    out.progress('step 4/6  gate        not evaluated — a dry run wrote no generation and staged no agent');
+    out.progress('step 4/5  gate        not evaluated — a dry run wrote no generation and staged no agent');
     out.progress('step 5/6  release     not attempted (dry run)');
-    out.progress('step 6/6  gc          not attempted (dry run)');
     return emit(ctx, out, plan, renderDeploy);
   }
 
@@ -331,11 +375,11 @@ async function fleetDeploy(ctx, args, out, deps = {}) {
     table: ctx.resources.configTable,
   });
   if (refusal) {
-    out.progress(`step 4/6  gate        REFUSED — nothing was published, ${plan.generationId} is not live`);
+    out.progress(`step 4/5  gate        REFUSED — nothing was published, ${plan.generationId} is not live`);
     publish(ctx, out, plan, renderDeploy);
     throw refusal;
   }
-  out.progress(`step 4/6  gate        passed — ${rows.length} binding(s), every healthcheck ok`);
+  out.progress(`step 4/5  gate        passed — ${rows.length} binding(s), every healthcheck ok`);
 
   // ── 5. the flip ────────────────────────────────────────────────────────────────────────────────
   const released = await runStep(steps.releaseSet, ctx, {
@@ -345,29 +389,8 @@ async function fleetDeploy(ctx, args, out, deps = {}) {
     values: { hotfix },
   }, out, deps);
   plan.release = released.result || null;
-  out.progress(`step 5/6  release     ${plan.generationId} is live (mode ${plan.mode})`);
+  out.progress(`step 5/5  release     ${plan.generationId} is live (mode ${plan.mode})`);
 
-  // ── 6. retention ───────────────────────────────────────────────────────────────────────────────
-  //
-  // THE RELEASE IS ALREADY DONE. §3.1 step 7 is explicit that a failed reap leaves the fleet "fully
-  // released either way — failure costs quota, not availability", so gc's per-unit failures are NOT
-  // forwarded into the envelope: a forwarded failure exits 6, and exit 6 out of THIS command means
-  // "staging incomplete, pointer not moved" (§2.19). Reporting a completed release as a stage that
-  // never flipped is the one lie the exit codes must not tell. They are still said out loud, named
-  // per agent, and carried in the result — a thrown error (8 headroom, 1) propagates untouched,
-  // because those do not claim anything about the pointer.
-  const reaped = await runStep(steps.gc, ctx, {
-    positionals: [],
-    values: { keep: values.keep },
-  }, out, deps, { forwardFailures: false });
-  plan.gc = reaped.result || null;
-  if (reaped.failures.length) {
-    out.warn(`${reaped.failures.length} runtime(s) could not be reaped: ${namesOf(reaped.failures).join(', ')}. `
-      + `${plan.generationId} IS LIVE — this costs quota, not availability (§3.1 step 7). Re-run `
-      + '`archie runtime gc --keep 2 --no-dry-run`; at --keep 2 there is room to miss one GC, not two.');
-    plan.gcFailures = reaped.failures;
-  }
-  out.progress(`step 6/6  gc          ${plan.gc && plan.gc.reaped ? plan.gc.reaped.length : 0} runtime(s) reaped`);
 
   return emit(ctx, out, plan, renderDeploy);
 }

@@ -157,14 +157,18 @@ const healthyTable = () => [generationItem(), bindingItem('a1'), bindingItem('a2
 
 // ── fleet deploy: the happy path ─────────────────────────────────────────────────────────────────
 
-test('it runs the six steps in the documented order and reports the release', async () => {
+test('gc runs FIRST, then build -> create -> stage -> gate -> release', async () => {
   const s = fakeSteps();
   const out = fakeOut();
   const result = await fleet['fleet deploy'](ctxFor(), { positionals: [], values: {} }, out,
     { doc: fakeDoc(healthyTable()), steps: s.steps });
 
-  assert.deepEqual(s.names(), ['build', 'create', 'stage', 'releaseSet', 'gc'],
-    '§2.19: build -> create -> stage -> gate -> release set -> runtime gc');
+  // GC MOVED TO THE FRONT (2026-08-15). Reaping after a release destroys rollback targets in the
+  // window they are most likely to be wanted, and recovering one is not a re-run: AgentCore holds a
+  // deleted runtime's name for 3.5-10+ minutes, so a re-stage of a reaped generation is measured in
+  // hours across the fleet. Reaping first does it from a known-good state instead.
+  assert.deepEqual(s.names(), ['gc', 'build', 'create', 'stage', 'releaseSet'],
+    'gc -> build -> create -> stage -> gate -> release set');
   assert.equal(result.generationId, GEN);
   assert.equal(result.mode, 'staged');
   assert.equal(result.imageTag, TAG);
@@ -223,7 +227,9 @@ test('EXIT 4: a healthcheck failure taints and the pointer is NEVER moved', asyn
     (e) => e.exitCode === EXIT.TAINTED,
   );
   assert.ok(!s.names().includes('releaseSet'), 'exit 4 means tainted, pointer not moved (§2.19)');
-  assert.ok(!s.names().includes('gc'));
+  // gc DID run — it leads every deploy now. Harmless here: it reaped from a known-good state before
+  // anything was attempted, so a failed deploy leaves a cleaner quota rather than a dirtier one.
+  assert.deepEqual(s.names(), ['gc', 'build', 'create', 'stage'], 'it stopped at stage; nothing after it ran');
 });
 
 test('EXIT 6: stragglers stop the run BEFORE release set', async () => {
@@ -368,7 +374,7 @@ test('--generation naming an EXISTING generation resumes it: no build, no create
   const out = fakeOut();
   const result = await fleet['fleet deploy'](ctxFor(), { positionals: [], values: { generation: GEN } }, out,
     { doc: fakeDoc(healthyTable()), steps: s.steps });
-  assert.deepEqual(s.names(), ['stage', 'releaseSet', 'gc'], 'resuming re-stages; it never re-cuts');
+  assert.deepEqual(s.names(), ['gc', 'stage', 'releaseSet'], 'resuming re-stages; it never re-cuts');
   assert.equal(result.generationId, GEN);
   assert.match(out.progressLines.join('\n'), /resume/);
 });
@@ -391,7 +397,7 @@ test('--generation naming an ABSENT generation cuts one with that id', async () 
     // and, here, proof that the run got as far as the gate with the id the operator named.
     (e) => e.exitCode === EXIT.REFUSED && /no generation gen-new/.test(e.message),
   );
-  assert.deepEqual(s.names(), ['build', 'create', 'stage']);
+  assert.deepEqual(s.names(), ['gc', 'build', 'create', 'stage']);
   assert.equal(s.calls.find((c) => c.name === 'create').values.id, 'gen-new');
 });
 
@@ -414,14 +420,14 @@ test('a dry run stops after staging and never evaluates the gate or the flip', a
   const out = fakeOut();
   const result = await fleet['fleet deploy'](ctxFor({ dryRun: true }), { positionals: [], values: {} }, out,
     { doc: fakeDoc([]), steps: s.steps });
-  assert.deepEqual(s.names(), ['build', 'create', 'stage']);
+  assert.deepEqual(s.names(), ['build', 'create', 'stage'], 'a dry run reaps nothing');
   assert.equal(result.dryRun, true);
   assert.match(out.progressLines.join('\n'), /gate {8}not evaluated/);
 });
 
-// ── retention, after the release is already done ─────────────────────────────────────────────────
+// ── retention, BEFORE anything is created ────────────────────────────────────────────────────────
 
-test('a gc failure does not report a completed release as "pointer not moved"', async () => {
+test('a per-unit gc failure warns and the deploy still proceeds', async () => {
   const s = fakeSteps({
     gc: async (ctx, args, out) => {
       out.failure({ agent: 'a1', step: 'runtime delete', error: new Error('ThrottlingException') });
@@ -432,13 +438,15 @@ test('a gc failure does not report a completed release as "pointer not moved"', 
   const result = await fleet['fleet deploy'](ctxFor(), { positionals: [], values: {} }, out,
     { doc: fakeDoc(healthyTable()), steps: s.steps });
 
-  assert.equal(out.failures.length, 0,
-    'a forwarded failure exits 6, and 6 out of this command means "pointer not moved" (§2.19)');
+  // A runtime that would not reap costs quota, not availability — and nothing has been created at
+  // this point, so it cannot make the deploy wrong. A forwarded failure would exit 6, which out of
+  // this command means "pointer not moved" (§2.19).
+  assert.equal(out.failures.length, 0);
   assert.equal(result.gcFailures.length, 1, 'it is still reported, per agent, in the result');
-  assert.match(out.warnings.join('\n'), /IS LIVE/);
+  assert.ok(s.names().includes('releaseSet'), 'the deploy completed despite the failed reap');
 });
 
-test('a THROWN gc failure propagates its own code — 8 says nothing about the pointer', async () => {
+test('a THROWN gc stops the deploy BEFORE anything is created', async () => {
   const s = fakeSteps({
     gc: async () => { throw Object.assign(new Error('hit a service quota'), { exitCode: EXIT.HEADROOM }); },
   });
@@ -447,7 +455,10 @@ test('a THROWN gc failure propagates its own code — 8 says nothing about the p
       { doc: fakeDoc(healthyTable()), steps: s.steps }),
     (e) => e.exitCode === EXIT.HEADROOM,
   );
-  assert.ok(s.names().includes('releaseSet'), 'the release happened; only the reap did not');
+  // Deliberately NOT swallowed. 8 means the quota cannot fit what is about to be created, so
+  // continuing would march into a doomed 208-runtime staging pass and fail later and messier.
+  // Nothing was created, so the fleet is exactly as it was — a clean stop, re-runnable.
+  assert.deepEqual(s.names(), ['gc'], 'it stopped at gc: no build, no create, no stage, no release');
 });
 
 // ── fleet drift ──────────────────────────────────────────────────────────────────────────────────

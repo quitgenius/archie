@@ -22,7 +22,7 @@ const { CliError, EXIT } = require('./exit');
 // `phase: 2` — deliberately deferred (plan phase-1 scope block), declared so help can say so.
 const COMMANDS = {
   // ── top level ────────────────────────────────────────────────────────────
-  deploy: { options: { hotfix:{type:'boolean'}, keep:{type:'string'}, 'skip-preflight':{type:'boolean'}, pure:{type:'boolean'}, 'agent-tag':{type:'string'}, 'gateway-tag':{type:'string'} }, top: true, module: 'deploy', task: 'W2-C', needsAws: true,
+  deploy: { options: { hotfix:{type:'boolean', 'skip-gc':{type:'boolean'}}, keep:{type:'string'}, 'skip-preflight':{type:'boolean'}, pure:{type:'boolean'}, 'agent-tag':{type:'string'}, 'gateway-tag':{type:'string'} }, top: true, module: 'deploy', task: 'W2-C', needsAws: true,
     summary: 'preflight, then the agent half, then the gateway (ends with ~94s gateway outage)' },
   preflight: { options: { checks:{type:'string'}, skip:{type:'string'} }, top: true, module: 'preflight', task: 'W1-A', needsAws: true,
     summary: 'verify the target account has the infrastructure; never creates anything' },
@@ -57,7 +57,7 @@ const COMMANDS = {
   'access-point gc': { options: { tag:{type:'string'} }, module: 'runtime', task: 'W1-E', needsAws: true, dryRunDefault: true, summary: 'reap tagged EFS access points with no live runtime' },
 
   // ── fleet ────────────────────────────────────────────────────────────────
-  'fleet deploy': { options: { tag:{type:'string'}, generation:{type:'string'}, hotfix:{type:'boolean'}, canary:{type:'string'}, concurrency:{type:'string'}, keep:{type:'string'}, 'skip-build':{type:'boolean'}, pure:{type:'boolean'} }, module: 'fleet', task: 'W2-C', needsAws: true, summary: 'the agent half of a release, end to end (zero downtime)' },
+  'fleet deploy': { options: { tag:{type:'string', 'skip-gc':{type:'boolean'}}, generation:{type:'string'}, hotfix:{type:'boolean'}, canary:{type:'string'}, concurrency:{type:'string'}, keep:{type:'string'}, 'skip-build':{type:'boolean'}, pure:{type:'boolean'} }, module: 'fleet', task: 'W2-C', needsAws: true, summary: 'the agent half of a release, end to end (zero downtime)' },
   'fleet drift': { options: { fix:{type:'boolean'}, compare:{type:'string'} }, module: 'fleet', task: 'W2-C', needsAws: true, summary: 'derived spec vs what is running; an efsRoot change BLOCKS' },
   'fleet reconcile': { options: { daemon:{type:'boolean'}, concurrency:{type:'string'}, interval:{type:'string'} }, module: 'fleet', task: null, phase: 2, needsAws: true, summary: 'drain the provisioning queue and sweep for missing bindings' },
 
