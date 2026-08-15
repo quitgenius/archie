@@ -77,8 +77,15 @@ const ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 // The fleet-level fields `--set` may override, and what each must be. Anything else is a usage error:
 // a typo'd key that was silently accepted would produce a generation missing the value the operator
 // believed they had set, and nothing downstream could tell.
+//
+// `efsRootPrefix` is DELIBERATELY ABSENT. It is the one field that was expressible in two places at
+// once — as the dispatcher's AGENTCORE_EFS_ROOT_PREFIX and as a `--set` here — and the two could
+// disagree. That disagreement is not a cosmetic drift: the prefix decides which EFS directory an
+// agent's access point is rooted at, so a generation staged with a different prefix boots agents on
+// an EMPTY workspace and their entire history looks deleted. The generation still RECORDS the
+// prefix (a generation is a record of what ran); what is gone is the ability to contradict the
+// deployment with it. Changing it is a deployment change, and a reviewable one.
 const SETTABLE = {
-  efsRootPrefix: 'string',
   efsMountPath: 'string',
   securityGroupId: 'string',
   idleRuntimeSessionTimeout: 'number',
@@ -86,10 +93,10 @@ const SETTABLE = {
   serverProtocol: 'string',
 };
 
-// Of those, the three that reach the spec through the dispatcher's CONFIG (so that everything derived
+// Of those, the two that reach the spec through the dispatcher's CONFIG (so that everything derived
 // from them moves too — notably runtimeEnv's `EFS_DIR: config.efsMountPath`, which a post-hoc
 // override of `efsMountPath` alone would leave stale and inconsistent).
-const CONFIG_SETTABLE = ['efsRootPrefix', 'efsMountPath', 'securityGroupId'];
+const CONFIG_SETTABLE = ['efsMountPath', 'securityGroupId'];
 // And the three runtimeSpecFor hard-codes (900 / 28800 / 'HTTP'), which therefore have to be applied
 // to the produced spec rather than to the config.
 const SPEC_SETTABLE = ['idleRuntimeSessionTimeout', 'maxLifetime', 'serverProtocol'];

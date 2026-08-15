@@ -270,8 +270,8 @@ test('the stored body round-trips byte-exact, so specDigest can be recomputed fr
 // ── --set ────────────────────────────────────────────────────────────────────────────────────────
 
 test('--set splits on the FIRST = so a value may contain more', () => {
-  const { fields, env } = gen.parseSets(['efsRootPrefix=/agentcore-test', 'runtimeEnv.DISPATCHER_BASE_URL=https://x/y?a=b']);
-  assert.equal(fields.efsRootPrefix, '/agentcore-test');
+  const { fields, env } = gen.parseSets(['efsMountPath=/mnt/efs', 'runtimeEnv.DISPATCHER_BASE_URL=https://x/y?a=b']);
+  assert.equal(fields.efsMountPath, '/mnt/efs');
   assert.equal(env.DISPATCHER_BASE_URL, 'https://x/y?a=b');
 });
 
@@ -978,7 +978,16 @@ test('create: --set on a saga-hardcoded field is refused, once, before anything 
 });
 
 test('create: the fleet-level fields that DO reach the spec are still settable', () => {
-  const sets = gen.parseSets(['efsRootPrefix=/other-data', 'runtimeEnv.AGENTCORE_OTEL_MODE=off']);
-  assert.equal(sets.fields.efsRootPrefix, '/other-data');
+  const sets = gen.parseSets(['securityGroupId=sg-other', 'runtimeEnv.AGENTCORE_OTEL_MODE=off']);
+  assert.equal(sets.fields.securityGroupId, 'sg-other');
   assert.equal(sets.env.AGENTCORE_OTEL_MODE, 'off');
+});
+
+// `efsRootPrefix` is the one field that WAS settable and must not be again. It decides which EFS
+// directory an agent's access point is rooted at, so a generation that contradicts the deployment
+// boots agents on an EMPTY workspace — their entire history looks deleted, with no error anywhere.
+// The generation still RECORDS the prefix; it just cannot disagree with the deployment about it.
+test('--set efsRootPrefix is REFUSED — one source for the path, always', () => {
+  assert.throws(() => gen.parseSets(['efsRootPrefix=/other-data']), (e) => e.exitCode === EXIT.USAGE);
+  assert.equal(Object.keys(gen.SETTABLE ?? {}).includes('efsRootPrefix'), false);
 });
