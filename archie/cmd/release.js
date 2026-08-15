@@ -326,6 +326,17 @@ function releaseRefusal({
         + `Re-run \`archie generation stage --generation ${generationId}\`; it is additive and skips healthy agents.`,
     });
   }
+  // UNREACHABLE TODAY, and kept deliberately. `bindingStats` increments exactly one of ok/failed/
+  // pending per row (cmd/generation.js:637-643), so `bound = ok + failed + pending`; with `bound > 0`
+  // proven above and both other counters zero by the two rails above, `ok` cannot be 0. The @cli
+  // `zero-ok` leg — rows carrying no `healthcheck` attribute at all — therefore lands on the pending
+  // rail, which is the correct answer.
+  //
+  // It stays because it is the SAFE side of an invariant this function does not own: a fourth
+  // healthcheck state that incremented none of the three (`skipped`, `expired`) would silently make
+  // `bound > ok + failed + pending` true and this branch live again — and the behaviour it would then
+  // produce, refusing, is the one we want. Deleting it would trade a dead line for a release path
+  // that opens on a future edit to a different file.
   if (stats.ok === 0) {
     return refused(`generation ${generationId} has no passing healthcheck`, {
       detail: 'Nothing becomes live without one, and there is no force flag, no --i-know-what-im-doing and no '
