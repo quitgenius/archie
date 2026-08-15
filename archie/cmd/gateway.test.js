@@ -166,6 +166,105 @@ function service({ runningCount = 1, deployments = null, taskDefinitionArn = TD_
   };
 }
 
+/**
+ * The discovery half, as one injected client bag.
+ *
+ * `deploy` no longer clones the deployed task definition — it COMPOSES one from the parameters
+ * Terraform publishes plus facts discovered from the account (lib/deployment-facts.js). These fakes
+ * are what let that happen without AWS. Values line up with `taskDefinition()` above so a composed
+ * definition and the "deployed" one are equivalent, which is what makes the idempotence test mean
+ * something.
+ */
+const AP_ID = 'fsap-1';
+const FS_ID = 'fs-1';
+const SSM_VALUES = {
+  EFS_FILE_SYSTEM_ARN: `arn:aws:elasticfilesystem:us-east-1:${ACCOUNT}:file-system/${FS_ID}`,
+  DISPATCHER_ACCESS_POINT_ID: AP_ID,
+  ENABLE_EXECUTE_COMMAND: 'true',
+  DEPLOYMENT_ENVIRONMENT: 'sandbox',
+  AGENTCORE_RUNTIME_TLS_REJECT: '1',
+};
+
+function discoveryClients(over = {}) {
+  const one = (handlers) => fakeClient(handlers);
+  return {
+    sts: one({ GetCallerIdentityCommand: () => ({ Account: ACCOUNT }) }),
+    ecr: one({ DescribeRepositoriesCommand: ({ repositoryNames }) => ({ repositories: [{ repositoryUri: `${REGISTRY}/${repositoryNames[0]}` }] }) }),
+    sqs: one({ GetQueueUrlCommand: ({ QueueName }) => ({ QueueUrl: `https://sqs/${QueueName}` }) }),
+    iam: one({ GetRoleCommand: ({ RoleName }) => ({ Role: { Arn: `arn:aws:iam::${ACCOUNT}:role/${RoleName}` } }) }),
+    efs: one({
+      DescribeAccessPointsCommand: () => ({ AccessPoints: [{ AccessPointId: AP_ID, FileSystemId: FS_ID }] }),
+      DescribeMountTargetsCommand: () => ({ MountTargets: [{ VpcId: 'vpc-1', SubnetId: 'subnet-a' }, { VpcId: 'vpc-1', SubnetId: 'subnet-b' }] }),
+    }),
+    ec2: one({ DescribeSecurityGroupsCommand: ({ Filters }) => ({ SecurityGroups: [{ GroupId: `sg-${Filters.find((f) => f.Name === 'group-name').Values[0]}` }] }) }),
+    secrets: one({ DescribeSecretCommand: ({ SecretId }) => ({ ARN: `arn:secret:${SecretId}` }) }),
+    discovery: one({
+      ListNamespacesCommand: () => ({ Namespaces: [{ Id: 'ns-1', Name: 'redacted-internal-host.example' }] }),
+      ListServicesCommand: () => ({ Services: [{ Name: 'dispatcher', Arn: 'arn:servicediscovery:svc/1' }] }),
+    }),
+    ssm: one({
+      GetParametersCommand: ({ Names }) => ({
+        Parameters: Names.filter((n) => SSM_VALUES[n.split('/').pop()] !== undefined)
+          .map((Name) => ({ Name, Value: SSM_VALUES[Name.split('/').pop()] })),
+        InvalidParameters: Names.filter((n) => SSM_VALUES[n.split('/').pop()] === undefined),
+      }),
+    }),
+    ...over,
+  };
+}
+
+/**
+ * A "deployed" task definition built by the REAL composer, plus the read-only fields ECS echoes back.
+ *
+ * Hand-writing this fixture would make the idempotence test pass for the wrong reason: it would drift
+ * from the composition and the diff would be non-empty for reasons that have nothing to do with what
+ * the test is asserting.
+ */
+function deployedAsComposed(image, ssmOver = {}) {
+  const { composeTaskDefinition } = require('../lib/task-definition');
+  const composed = composeTaskDefinition({
+    resources: resourcesFor('agent-gn0p84'),
+    region: 'us-east-1',
+    facts: COMPOSED_FACTS,
+    ssm: { ...SSM_VALUES, ...ssmOver },
+    image,
+  });
+  return {
+    ...composed,
+    taskDefinitionArn: TD_69,
+    revision: 69,
+    status: 'ACTIVE',
+    requiresAttributes: [{ name: 'ecs.capability.execution-role-awslogs' }],
+    compatibilities: ['EC2', 'FARGATE'],
+    registeredAt: new Date('2026-08-14T19:00:00Z'),
+    registeredBy: 'arn:aws:iam::203366135563:role/example-iac',
+  };
+}
+
+/** The facts `discoveryClients()` above resolves to, as the composer receives them. */
+const COMPOSED_FACTS = {
+  account: ACCOUNT,
+  basePolicyArn: `arn:aws:iam::${ACCOUNT}:policy/agent-gn0p84core-base`,
+  agentRepoUri: `${REGISTRY}/agent-gn0p84core`,
+  turnQueueUrl: 'https://sqs/agent-gn0p84-dispatcher-turns.fifo',
+  efsFileSystemId: FS_ID,
+  dispatcherAccessPointId: AP_ID,
+  vpcId: 'vpc-1',
+  subnetIds: ['subnet-a', 'subnet-b'],
+  runtimeSecurityGroupId: 'sg-agent-gn0p84-runtime-sg',
+  dispatcherSecurityGroupId: 'sg-agent-gn0p84-dispatcher-sg',
+  serviceRegistryArn: 'arn:servicediscovery:svc/1',
+  executionRoleArn: `arn:aws:iam::${ACCOUNT}:role/agent-gn0p84-dispatcher-execution-role`,
+  taskRoleArn: `arn:aws:iam::${ACCOUNT}:role/agent-gn0p84-dispatcher-task-role`,
+  credentialSecretName: 'agent-gn0p84-connector-api-key',
+  secrets: [
+    { name: 'SLACK_BOT_TOKEN', valueFrom: 'arn:secret:agent-gn0p84-slack-bot-token' },
+    { name: 'SLACK_APP_TOKEN', valueFrom: 'arn:secret:agent-gn0p84-slack-app-token' },
+    { name: 'DISPATCHER_SHARED_SECRET', valueFrom: 'arn:secret:agent-gn0p84-dispatcher-shared-secret' },
+    { name: 'CONNECTOR_API_KEY', valueFrom: 'arn:secret:agent-gn0p84-connector-api-key' },
+  ],
+};
+
 /** A sequence of responses, one per call; the last one repeats so a wait cannot fall off the end. */
 function sequence(items) {
   let i = 0;
@@ -329,7 +428,10 @@ test('build: --account disagreeing with the caller is preflight (3)', async () =
 
 // ── gateway deploy ───────────────────────────────────────────────────────────────────────────────
 
-function ecsFor({ services = [service()], describeTasks = null, listTasks = null, register = null } = {}) {
+// `taskDefinition` overrides what DescribeTaskDefinition returns. It did not used to be an option,
+// and a test passing one was silently ignored — which is how a fixture can look right and assert
+// nothing.
+function ecsFor({ services = [service()], describeTasks = null, listTasks = null, register = null, taskDefinition: td = null } = {}) {
   const registered = [];
   const client = fakeClient({
     // A plain array is one fixed answer; a function is a script. Either way the wire shape is
@@ -338,7 +440,7 @@ function ecsFor({ services = [service()], describeTasks = null, listTasks = null
       const value = typeof services === 'function' ? services(input) : services;
       return Array.isArray(value) ? { services: value } : value;
     },
-    DescribeTaskDefinitionCommand: () => ({ taskDefinition: taskDefinition(), tags: [{ key: 'Deployment', value: 'archie' }] }),
+    DescribeTaskDefinitionCommand: () => ({ taskDefinition: td || taskDefinition(), tags: [{ key: 'Deployment', value: 'archie' }] }),
     RegisterTaskDefinitionCommand: (input) => {
       registered.push(input);
       return register ? register(input) : {
@@ -366,69 +468,93 @@ test('deploy: a tag absent from ECR is refused before anything is stopped', asyn
   // the old task already gone.
   const ecs = ecsFor();
   const e = await expectExit(EXIT.REFUSED, () => gateway.deploy(
-    makeCtx(), makeArgs({ tag: 'archie-0.2.99' }), makeOut(), { ecr: ecrFor(), ecs, sts: stsOk() },
+    makeCtx(), makeArgs({ tag: 'archie-0.2.99' }), makeOut(), { ecr: ecrFor(), ecs, sts: stsOk(), clients: discoveryClients() },
   ));
   assert.match(e.message, /not in ECR/);
   assert.equal(ecs.calls.length, 0, 'nothing was even read from ECS');
 });
 
-test('deploy: check 16 — a task-def env disagreeing with --name blocks the deploy (3)', async () => {
-  // The §10 shadow-config trap. A dispatcher whose AGENT_CONFIG_TABLE points at another stack
-  // "provisions runtimes onto ANOTHER STACK's file system … and its generation GC can delete that
-  // stack's runtimes" (dispatcher.tf:73-79).
-  const ecs = ecsFor();
-  ecs.send = ((original) => (command) => {
-    if (command.constructor.name === 'DescribeTaskDefinitionCommand') {
-      return Promise.resolve({
-        taskDefinition: taskDefinition({
-          env: GOOD_ENV.map((v) => (v.name === 'AGENT_CONFIG_TABLE' ? { name: v.name, value: 'agent-4ggvzl-config' } : v)),
-        }),
-        tags: [],
-      });
-    }
-    return original(command);
-  })(ecs.send.bind(ecs));
+test('deploy: a deployed env disagreeing with --name is CORRECTED, not refused', async () => {
+  // This used to be a hard refusal (check 16). It no longer can be, and the reason is that the
+  // failure it guarded against is now structurally impossible: `deploy` COMPOSES the environment from
+  // --name rather than cloning whatever the running task happens to carry, so the composed
+  // AGENT_CONFIG_TABLE is right by construction.
+  //
+  // A disagreeing DEPLOYED value therefore means the running task is misconfigured — and rolling
+  // forward is the fix, not something to block. It is still surfaced: the diff is printed before
+  // anything is registered. The refusal survives where it still means something, in
+  // `gateway status --check` and preflight, which report on the deployment rather than replace it.
+  const ecs = ecsFor({
+    taskDefinition: taskDefinition({
+      env: [{ name: 'AGENT_CONFIG_TABLE', value: 'agent-4ggvzl-config' }],
+    }),
+  });
+  const out = makeOut();
+  await gateway.deploy(makeCtx(), makeArgs({ tag: 'archie-0.2.23', 'no-wait': true }), out, {
+    ecr: ecrFor({ image: true }), ecs, sts: stsOk(), clients: discoveryClients(),
+  });
 
-  const e = await expectExit(EXIT.PREFLIGHT, () => gateway.deploy(
-    makeCtx(), makeArgs({ tag: 'archie-0.2.23' }), makeOut(), { ecr: ecrFor({ image: true }), ecs, sts: stsOk() },
-  ));
-  assert.match(e.detail, /agent-4ggvzl-config/);
-  assert.equal(ecs.calls.filter((c) => c.name === 'RegisterTaskDefinitionCommand').length, 0);
+  const registered = ecs.calls.find((c) => c.name === 'RegisterTaskDefinitionCommand');
+  const env = Object.fromEntries(registered.input.containerDefinitions[0].environment.map((e) => [e.name, e.value]));
+  assert.equal(env.AGENT_CONFIG_TABLE, 'agent-gn0p84-config', 'composed from --name, not copied');
+  assert.match(out.text(), /agent-4ggvzl-config/, 'the disagreement is still reported');
 });
 
-test('deploy: the service already on that image does nothing at all — no rollout, no outage', async () => {
+test('deploy: the same image AND an equivalent composition does nothing at all', async () => {
   // §2.27: "running it twice with no edits does nothing at all, including no gateway outage".
-  const ecs = ecsFor();
+  //
+  // The check is now TWO-SIDED, and the second side matters: an SSM value can change with no new
+  // image, and that does need a rollout. So the no-op requires the image to match AND the composed
+  // definition to be equivalent to the running one — which is why the fixture is built by the REAL
+  // composer rather than hand-written. A hand-written one would drift from the composition and make
+  // this test pass for the wrong reason.
+  const ecs = ecsFor({ taskDefinition: deployedAsComposed(`${REPO_URI}:archie-0.2.22`) });
   const out = makeOut();
   const result = await gateway.deploy(makeCtx(), makeArgs({ tag: 'archie-0.2.22' }), out, {
-    ecr: ecrFor({ image: true }), ecs, sts: stsOk(),
+    ecr: ecrFor({ image: true }), ecs, sts: stsOk(), clients: discoveryClients(),
   });
+
   assert.equal(result.unchanged, true);
   assert.equal(result.rolled, false);
-  assert.equal(ecs.calls.filter((c) => c.name === 'UpdateServiceCommand').length, 0);
+  assert.equal(result.registeredTaskDefinition, null);
+  assert.equal(ecs.calls.filter((c) => c.name === 'RegisterTaskDefinitionCommand').length, 0);
+  assert.equal(ecs.calls.filter((c) => c.name === 'UpdateServiceCommand').length, 0, 'no outage was paid');
   assert.match(out.text(), /no rollout, no outage/);
 });
 
-test('deploy: registers a revision with ONLY the image swapped, strips read-only fields', async () => {
-  // Terraform owns the task definition (dispatcher.tf:149). A revision that differs from
-  // Terraform's by more than the tag is a silent divergence nobody sees until the container behaves
-  // differently; read-only fields left in fail loudly at RegisterTaskDefinition instead.
-  const ecs = ecsFor({ services: sequence([[service()], [service({ runningCount: 0 })], [service({ runningCount: 1, taskDefinitionArn: TD_70, deployments: [{ status: 'PRIMARY', taskDefinition: TD_70, runningCount: 1 }] })]]) });
-  const clock = fakeClock('2026-08-14T20:12:53Z');
-  await gateway.deploy(makeCtx(), makeArgs({ tag: 'archie-0.2.23' }), makeOut(), {
-    ecr: ecrFor({ image: true }), ecs, sts: stsOk(), ...clock, pollIntervalMs: 47000,
+test('deploy: the same image but a CHANGED composition still rolls — config moves without a build', async () => {
+  // The case the image-only check missed entirely. Nothing was rebuilt, but DEPLOYMENT_ENVIRONMENT
+  // (or any other published value) moved, so the running container is stale in a way no tag reflects.
+  const clients = discoveryClients();
+  const ecs = ecsFor({ taskDefinition: deployedAsComposed(`${REPO_URI}:archie-0.2.22`, { DEPLOYMENT_ENVIRONMENT: 'dev' }) });
+  const result = await gateway.deploy(makeCtx(), makeArgs({ tag: 'archie-0.2.22', 'no-wait': true }), makeOut(), {
+    ecr: ecrFor({ image: true }), ecs, sts: stsOk(), clients,
+  });
+  assert.equal(result.unchanged, false, 'an SSM-only change must not be mistaken for a no-op');
+  assert.equal(ecs.calls.filter((c) => c.name === 'RegisterTaskDefinitionCommand').length, 1);
+});
+
+test('deploy: registers the COMPOSED definition, with no read-only fields', async () => {
+  // It used to clone the deployed definition and swap the image, because Terraform owned the shape.
+  // Terraform no longer has a task definition at all (modules/archie/dispatcher.tf), so there is
+  // nothing to clone — and on a from-scratch account there would be no service to clone from either.
+  const ecs = ecsFor();
+  await gateway.deploy(makeCtx(), makeArgs({ tag: 'archie-0.2.23', 'no-wait': true }), makeOut(), {
+    ecr: ecrFor({ image: true }), ecs, sts: stsOk(), clients: discoveryClients(),
   });
 
-  const input = ecs.registered[0];
-  assert.equal(input.containerDefinitions[0].image, `${REPO_URI}:archie-0.2.23`);
-  for (const readOnly of ['taskDefinitionArn', 'revision', 'status', 'requiresAttributes', 'compatibilities', 'registeredAt', 'registeredBy']) {
-    assert.equal(input[readOnly], undefined, `${readOnly} must be stripped`);
+  const registered = ecs.calls.find((c) => c.name === 'RegisterTaskDefinitionCommand').input;
+  assert.equal(registered.family, 'agent-gn0p84-dispatcher');
+  assert.equal(registered.containerDefinitions[0].image, `${REPO_URI}:archie-0.2.23`);
+  // RegisterTaskDefinition REJECTS these outright, so their absence is not cosmetic. The old clone
+  // path had to strip them; composition never produces them.
+  for (const readOnly of ['taskDefinitionArn', 'revision', 'status', 'requiresAttributes',
+    'compatibilities', 'registeredAt', 'registeredBy']) {
+    assert.equal(readOnly in registered, false, `${readOnly} must not be sent`);
   }
-  assert.equal(input.family, 'agent-gn0p84-dispatcher');
-  assert.equal(input.cpu, '1024');
-  assert.deepEqual(input.volumes, [{ name: 'agent-gn0p84-dispatcher-data' }]);
-  assert.deepEqual(input.tags, [{ key: 'Deployment', value: 'archie' }], 'Terraform\'s tags ride along');
-  assert.deepEqual(input.containerDefinitions[0].environment, GOOD_ENV, 'environment is copied, never recomputed');
+  // Discovered, not copied from the running definition.
+  assert.equal(registered.volumes[0].efsVolumeConfiguration.fileSystemId, FS_ID);
+  assert.equal(registered.volumes[0].efsVolumeConfiguration.authorizationConfig.accessPointId, AP_ID);
 });
 
 test('deploy: waits stopped -> started -> healthy and reports the measured gap', async () => {
@@ -450,6 +576,7 @@ test('deploy: waits stopped -> started -> healthy and reports the measured gap',
   const out = makeOut();
   const clock = fakeClock('2026-08-14T20:12:53Z');
   const result = await gateway.deploy(makeCtx(), makeArgs({ tag: 'archie-0.2.23' }), out, {
+    clients: discoveryClients(),
     ecr: ecrFor({ image: true }), ecs, sts: stsOk(), ...clock, pollIntervalMs: 47000,
   });
 
@@ -465,25 +592,16 @@ test('deploy: waits stopped -> started -> healthy and reports the measured gap',
   assert.doesNotMatch(text, /zero downtime|no downtime/i);
 });
 
-test('deploy: does NOT ask for a terraform follow-up — archie owns the running revision', async () => {
-  // The service carries `ignore_changes = [task_definition]` (modules/archie/dispatcher.tf), so this
-  // deploy survives the next apply. It used to not: Terraform planned the service back onto the tag
-  // in tfvars, so an unrelated apply days later silently rolled the dispatcher to an older image AND
-  // cost a second ~94s outage. The mitigation was a WARNING telling the operator to go bump the
-  // tfvar — a convention that holds until the once it matters. This asserts the warning is gone,
-  // because a stale "you must do X" is worse than none: it trains operators to ignore warnings.
-  const ecs = ecsFor({ services: sequence([[service()], [service({ runningCount: 0 })], [service({ runningCount: 1, taskDefinitionArn: TD_70, deployments: [{ status: 'PRIMARY', taskDefinition: TD_70, runningCount: 1 }] })]]) });
-  const out = makeOut();
-  const result = await gateway.deploy(makeCtx(), makeArgs({ tag: 'archie-0.2.23' }), out, {
-    ecr: ecrFor({ image: true }), ecs, sts: stsOk(), ...fakeClock('2026-08-14T20:12:53Z'), pollIntervalMs: 47000,
+test('deploy: reports no terraform follow-up — there is nothing left for Terraform to agree with', async () => {
+  // There used to be a `terraform` block in the result naming the tfvar to bump. Then it became
+  // advisory ("bootstrap image only"). Now it is gone entirely: Terraform owns neither the task
+  // definition nor the image tag, and `var.dispatcher_image_tag` no longer exists. A field telling an
+  // operator to update a variable that is not there is worse than no field.
+  const ecs = ecsFor();
+  const result = await gateway.deploy(makeCtx(), makeArgs({ tag: 'archie-0.2.23', 'no-wait': true }), makeOut(), {
+    ecr: ecrFor({ image: true }), ecs, sts: stsOk(), clients: discoveryClients(),
   });
-  // Still REPORTED in --json: a from-scratch environment does want the bootstrap tag current.
-  assert.equal(result.terraform.variable, 'archie_dispatcher_image_tag');
-  assert.equal(result.terraform.value, 'archie-0.2.23');
-  assert.equal(result.terraform.required, false);
-  assert.match(result.terraform.note, /bootstrap/);
-  // ...but no longer an instruction the operator must act on.
-  assert.doesNotMatch(out.lines.warn.join('\n'), /terraform apply|archie_dispatcher_image_tag/);
+  assert.equal('terraform' in result, false);
 });
 
 test('deploy: a stop observed between polls still reports a gap, flagged approximate', async () => {
@@ -495,6 +613,7 @@ test('deploy: a stop observed between polls still reports a gap, flagged approxi
     ]),
   });
   const result = await gateway.deploy(makeCtx(), makeArgs({ tag: 'archie-0.2.23' }), makeOut(), {
+    clients: discoveryClients(),
     ecr: ecrFor({ image: true }), ecs, sts: stsOk(), ...fakeClock('2026-08-14T20:13:00Z'), pollIntervalMs: 1000,
   });
   assert.equal(result.timeline.gapApproximate, true);
@@ -519,7 +638,7 @@ test('deploy: a STOPPED new task is exit 1 and is NOT rolled back', async () => 
   });
   const e = await expectExit(EXIT.FAILED, () => gateway.deploy(
     makeCtx(), makeArgs({ tag: 'archie-0.2.23' }), makeOut(),
-    { ecr: ecrFor({ image: true }), ecs, sts: stsOk(), ...fakeClock('2026-08-14T20:12:53Z'), pollIntervalMs: 5000 },
+    { ecr: ecrFor({ image: true }), ecs, sts: stsOk(), clients: discoveryClients(), ...fakeClock('2026-08-14T20:12:53Z'), pollIntervalMs: 5000 },
   ));
   assert.match(e.message, /CannotPullContainerError/);
   assert.match(e.detail, /NOT rolled back/);
@@ -531,7 +650,7 @@ test('deploy: an expired budget is 124, and says the rollout may still complete'
   const ecs = ecsFor({ services: () => ({ services: [service()] }) });  // never stops: budget must end this
   const e = await expectExit(EXIT.TIMEOUT, () => gateway.deploy(
     makeCtx(), makeArgs({ tag: 'archie-0.2.23', 'wait-timeout': '30' }), makeOut(),
-    { ecr: ecrFor({ image: true }), ecs, sts: stsOk(), ...fakeClock('2026-08-14T20:12:53Z'), pollIntervalMs: 5000 },
+    { ecr: ecrFor({ image: true }), ecs, sts: stsOk(), clients: discoveryClients(), ...fakeClock('2026-08-14T20:12:53Z'), pollIntervalMs: 5000 },
   ));
   assert.match(e.message, /30s expired/);
   assert.match(e.detail, /may still complete/);
@@ -541,6 +660,7 @@ test('deploy --no-wait: returns immediately and warns that nothing is watching',
   const ecs = ecsFor();
   const out = makeOut();
   const result = await gateway.deploy(makeCtx(), makeArgs({ tag: 'archie-0.2.23', 'no-wait': true }), out, {
+    clients: discoveryClients(),
     ecr: ecrFor({ image: true }), ecs, sts: stsOk(),
   });
   assert.equal(result.waited, false);
@@ -552,6 +672,7 @@ test('deploy --dry-run: prints the image swap and registers nothing', async () =
   const ecs = ecsFor();
   const out = makeOut();
   const result = await gateway.deploy(makeCtx({ dryRun: true }), makeArgs({ tag: 'archie-0.2.23' }), out, {
+    clients: discoveryClients(),
     ecr: ecrFor({ image: true }), ecs, sts: stsOk(),
   });
   assert.equal(result.registeredTaskDefinition, null);
@@ -569,6 +690,7 @@ test('deploy: a revision without a healthcheck warns and waits for RUNNING only'
   });
   const out = makeOut();
   const result = await gateway.deploy(makeCtx(), makeArgs({ tag: 'archie-0.2.23' }), out, {
+    clients: discoveryClients(),
     ecr: ecrFor({ image: true }), ecs, sts: stsOk(), ...fakeClock('2026-08-14T20:12:53Z'), pollIntervalMs: 47000,
   });
   assert.equal(result.timeline.healthcheckVerified, false);

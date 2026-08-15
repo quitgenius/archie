@@ -70,14 +70,14 @@ function clientsFor(ctx, deps = {}) {
  */
 async function readGatewayConfig(ctx, deps = {}) {
   const { GetParametersCommand } = require('@aws-sdk/client-ssm');
-  const { SSM_PARAMETERS, SSM_HANDLES, SSM_PREFIX } = require('./task-definition');
+  const { SSM_PARAMETERS, SSM_HANDLES, SSM_SERVICE, SSM_PREFIX } = require('./task-definition');
   const clients = clientsFor(ctx, deps);
   const prefix = SSM_PREFIX;
 
   // ONE read covering both categories. `composeEnvironment` consumes only the declared
   // SSM_PARAMETERS keys and ignores everything else, so the handles ride along without any risk of
   // being promoted into the container's environment.
-  const names = [...SSM_HANDLES, ...SSM_PARAMETERS].map((p) => `${prefix}/${p.key}`);
+  const names = [...SSM_HANDLES, ...SSM_SERVICE, ...SSM_PARAMETERS].map((p) => `${prefix}/${p.key}`);
   let res;
   try {
     // WithDecryption for the SecureString case. Nothing here is a SecureString today — these are

@@ -517,9 +517,11 @@ function checkEnvAgainstName(ctx, env) {
  * deliberate, stated tension, not an oversight.
  */
 async function deploy(ctx, args, out, deps = {}) {
+  const { discoverFacts, readGatewayConfig } = require('../lib/deployment-facts');
+  const { composeTaskDefinition, SERVICE } = require('../lib/task-definition');
+  const { diffTaskDefinition, renderDiff } = require('../lib/td-diff');
   const ecr = client.ecr(ctx, deps);
   const ecs = client.ecs(ctx, deps);
-  const sts = client.sts(ctx, deps);
   const now = deps.now || Date.now;
   const sleep = deps.sleep || ((ms) => new Promise((r) => { setTimeout(r, ms); }));
 
@@ -527,7 +529,6 @@ async function deploy(ctx, args, out, deps = {}) {
   // gate does not apply — the digest is used only to name the artifact this tree corresponds to.
   const { tag, derived } = resolveTag(ctx, args, out, { gate: false });
   const repo = await describeRepo(ecr, ctx);
-  await callerAccount(sts, ctx);
   const image = `${repo.repositoryUri}:${tag}`;
 
   // REFUSE A TAG ABSENT FROM ECR. Otherwise the failure appears ~40 seconds later as a Fargate
@@ -543,20 +544,54 @@ async function deploy(ctx, args, out, deps = {}) {
     });
   }
 
-  const deployed = await readDeployed(ecs, ctx);
-  const check = checkEnvAgainstName(ctx, deployed.env);
-  if (!check.ok) {
-    // Check 16 before a MUTATION is exit 3, not exit 7: nothing has been changed, and the fix is
-    // infrastructure. `gateway status --check` reports the same disagreement as drift (exit 7).
-    throw preflight(`the deployed task definition's environment does not agree with --name ${ctx.name}`, {
-      detail: [...check.mismatches.map((m) => `${m.key}: deployed ${m.deployed}, expected ${m.expected}`),
-        ...check.absent.map((m) => `${m.key}: absent, expected ${m.expected}`)].join('; '),
+  // COMPOSED, NOT CLONED. This used to register a revision of the DEPLOYED definition with only the
+  // image swapped, because Terraform owned the definition's shape and archie owned which revision
+  // ran. Terraform no longer has one (modules/archie/dispatcher.tf), so there is nothing to clone
+  // from — and on a from-scratch account there is no service to clone from either.
+  const config = await readGatewayConfig(ctx, deps);
+  const facts = await discoverFacts(ctx, config, deps);
+  const composed = composeTaskDefinition({
+    resources: ctx.resources, region: ctx.region, facts, ssm: config.values, image, tags: deployTags(ctx),
+  });
+
+  const deployed = await readDeployedOrNull(ecs, ctx);
+
+  // ── the service does not exist: create it ──────────────────────────────────────────────────────
+  if (!deployed) {
+    out.progress(`absent      ${ctx.resources.dispatcherService} does not exist in cluster ${ctx.resources.cluster}`);
+    out.progress(`create      desired=${SERVICE.desiredCount} subnets=${facts.subnetIds.join(',')} sg=${facts.dispatcherSecurityGroupId}`);
+    if (ctx.dryRun) {
+      out.progress(`would register ${composed.family} and CREATE the service on it — no outage, there is nothing running`);
+      return emit(ctx, out, {
+        tag, image, imageDigest: inEcr.digest, cluster: ctx.resources.cluster, service: ctx.resources.dispatcherService,
+        created: false, previousTaskDefinition: null, registeredTaskDefinition: null,
+        rolled: false, unchanged: false, waited: false, timeline: null,
+      }, renderDeploy);
+    }
+
+    const registered = await registerComposed(ecs, composed);
+    out.progress(`registered  ${arnTail(registered.taskDefinitionArn)}  (image ${image})`);
+    await createService(ecs, ctx, facts, config, registered.taskDefinitionArn);
+    out.progress('created     the service is new, so there is NO downtime to report — nothing was running');
+
+    const timeline = args.values['no-wait'] ? null : await waitForRollout({
+      ecs, ctx, out, now, sleep,
+      cluster: ctx.resources.cluster,
+      service: ctx.resources.dispatcherService,
+      taskDefinitionArn: registered.taskDefinitionArn,
+      hasHealthcheck: true,
+      expectStop: false,
+      budgetMs: waitBudgetSeconds(ctx, args) * 1000,
+      pollIntervalMs: deps.pollIntervalMs || POLL_INTERVAL_MS,
     });
-  }
-  for (const m of check.regionMismatches) {
-    out.warn(`deployed ${m.key}=${m.deployed} but --region is ${m.expected}`);
+    return emit(ctx, out, {
+      tag, image, imageDigest: inEcr.digest, cluster: ctx.resources.cluster, service: ctx.resources.dispatcherService,
+      created: true, previousTaskDefinition: null, registeredTaskDefinition: arnTail(registered.taskDefinitionArn),
+      rolled: true, unchanged: false, waited: Boolean(timeline), timeline,
+    }, renderDeploy);
   }
 
+  // ── the service exists: diff, then roll ────────────────────────────────────────────────────────
   const currentImage = deployed.container.image;
   const currentTd = arnTail(deployed.taskDefinition.taskDefinitionArn);
   const currentRepoUri = String(currentImage).split(':')[0];
@@ -565,16 +600,26 @@ async function deploy(ctx, args, out, deps = {}) {
       + 'service is on another stack\'s repository');
   }
 
+  // The composition is what will run, so a difference beyond the image is reported BEFORE anything
+  // is registered. This is the replacement for what `terraform plan` used to catch (§7): the plan no
+  // longer validates the task definition, and a bad one now surfaces with the only task stopped.
+  const diff = diffTaskDefinition(composed, deployed.taskDefinition);
+  if (!diff.equivalent) {
+    out.progress('changes     the composed definition differs from the running one:');
+    for (const line of renderDiff(diff).split('\n')) out.progress(`            ${line}`);
+  }
+
   // IDEMPOTENCE, and it is the point. Running a release twice with no edits must do nothing at all,
-  // "including no gateway outage" (§2.27). The service already running this exact image is exactly
-  // that case, so it stops here rather than paying 94 seconds to arrive where it already is.
-  if (currentImage === image) {
-    out.progress(`unchanged   ${currentTd} already runs ${image} — no rollout, no outage`);
+  // "including no gateway outage". Same image AND an equivalent composition is exactly that case, so
+  // it stops here rather than paying ~94 seconds to arrive where it already is. The composition
+  // check is why this is not just an image comparison: an SSM value can change with no new image,
+  // and that DOES need a rollout.
+  if (currentImage === image && diff.equivalent) {
+    out.progress(`unchanged   ${currentTd} already runs ${image}, and the composition matches — no rollout, no outage`);
     return emit(ctx, out, {
       tag, image, cluster: deployed.cluster, service: deployed.service,
-      previousTaskDefinition: currentTd, registeredTaskDefinition: null,
+      created: false, previousTaskDefinition: currentTd, registeredTaskDefinition: null,
       rolled: false, unchanged: true, waited: false, timeline: null,
-      terraform: terraformFollowUp(ctx, tag),
     }, renderDeploy);
   }
 
@@ -582,18 +627,16 @@ async function deploy(ctx, args, out, deps = {}) {
   out.progress(`         -> ${image}  (${inEcr.digest})`);
 
   if (ctx.dryRun) {
-    out.progress(`would register a revision of ${deployed.taskDefinition.family} from ${currentTd}, `
-      + 'image swapped, everything else copied');
+    out.progress(`would register ${composed.family} composed from SSM + discovery, and point the service at it`);
     out.progress(`would update ${deployed.cluster}/${deployed.service} onto it — ~94s of dispatcher downtime`);
     return emit(ctx, out, {
       tag, image, imageDigest: inEcr.digest, cluster: deployed.cluster, service: deployed.service,
-      previousTaskDefinition: currentTd, registeredTaskDefinition: null,
-      rolled: false, unchanged: false, waited: false, timeline: null,
-      terraform: terraformFollowUp(ctx, tag),
+      created: false, previousTaskDefinition: currentTd, registeredTaskDefinition: null,
+      rolled: false, unchanged: false, waited: false, timeline: null, diff,
     }, renderDeploy);
   }
 
-  const registered = await registerRevision(ecs, deployed, image);
+  const registered = await registerComposed(ecs, composed);
   const newArn = registered.taskDefinitionArn;
   out.progress(`registered  ${arnTail(newArn)}  (image ${image})`);
 
@@ -602,46 +645,109 @@ async function deploy(ctx, args, out, deps = {}) {
   }));
   out.progress('rolling     desired=1 min=0% max=100%  — stop-then-start, downtime expected');
 
-  // NO Terraform follow-up. The service carries `ignore_changes = [task_definition]`
-  // (modules/archie/dispatcher.tf), so this command owns which revision runs and `terraform apply`
-  // leaves it alone.
-  //
-  // It did not used to. Terraform planned the service back onto the tag in tfvars, so an unrelated
-  // apply days later silently rolled the dispatcher to an older image AND cost a second ~94s outage,
-  // with nothing linking the two events. The mitigation was a warning printed here telling the
-  // operator to go and bump `archie_dispatcher_image_tag` — a convention that holds until the one
-  // time it matters. `var.dispatcher_image_tag` is now the BOOTSTRAP image only: what a from-scratch
-  // apply starts on. Bumping it does not deploy anything.
-  out.verbose(`terraform  not required: the service ignores task_definition changes, so this revision `
-    + `survives the next apply. var.${terraformFollowUp(ctx, tag).variable} is the from-scratch `
-    + 'bootstrap image only.');
-
   if (args.values['no-wait']) {
     out.warn('--no-wait: nothing is monitoring the rollout. The wait is the value of this command; '
       + 'the gap, a STOPPED task and a failing healthcheck are all invisible from here.');
     return emit(ctx, out, {
       tag, image, imageDigest: inEcr.digest, cluster: deployed.cluster, service: deployed.service,
-      previousTaskDefinition: currentTd, registeredTaskDefinition: arnTail(newArn),
-      rolled: true, unchanged: false, waited: false, timeline: null, terraform: terraformFollowUp(ctx, tag),
+      created: false, previousTaskDefinition: currentTd, registeredTaskDefinition: arnTail(newArn),
+      rolled: true, unchanged: false, waited: false, timeline: null, diff,
     }, renderDeploy);
   }
 
-  const budget = waitBudgetSeconds(ctx, args);
   const timeline = await waitForRollout({
     ecs, ctx, out, now, sleep,
     cluster: deployed.cluster,
     service: deployed.service,
     taskDefinitionArn: newArn,
     hasHealthcheck: Boolean((registered.containerDefinitions || []).some((c) => c.healthCheck)),
-    budgetMs: budget * 1000,
+    budgetMs: waitBudgetSeconds(ctx, args) * 1000,
     pollIntervalMs: deps.pollIntervalMs || POLL_INTERVAL_MS,
   });
 
   return emit(ctx, out, {
     tag, image, imageDigest: inEcr.digest, cluster: deployed.cluster, service: deployed.service,
-    previousTaskDefinition: currentTd, registeredTaskDefinition: arnTail(newArn),
-    rolled: true, unchanged: false, waited: true, timeline, terraform: terraformFollowUp(ctx, tag),
+    created: false, previousTaskDefinition: currentTd, registeredTaskDefinition: arnTail(newArn),
+    rolled: true, unchanged: false, waited: true, timeline, diff,
   }, renderDeploy);
+}
+
+/**
+ * Tags on the revisions archie registers.
+ *
+ * Terraform used to tag the task definition and `registerRevision` carried those tags forward so an
+ * archie-registered revision was not the only one in the family without them. Terraform no longer
+ * registers any, so archie is the sole source — and the tags are how everything else attributes cost
+ * and ownership. `ManagedBy` says archie deliberately: it is now true, and a resource claiming
+ * terraform would send someone looking for state that does not describe it.
+ */
+const deployTags = (ctx) => [
+  { key: 'Deployment', value: ctx.resources.name },
+  { key: 'ManagedBy', value: 'archie' },
+];
+
+/** `readDeployed`, but an absent service is `null` rather than an error — the from-scratch case. */
+async function readDeployedOrNull(ecs, ctx) {
+  try {
+    return await readDeployed(ecs, ctx);
+  } catch (e) {
+    // Only "the service is not there" becomes null. A missing CLUSTER is still an error: Terraform
+    // owns it, so its absence means the account was never prepared, and creating a service would
+    // fail anyway with a message about the cluster rather than about the apply that never ran.
+    if (e && e.exitCode === EXIT.PREFLIGHT && /ECS service .* not found/.test(e.message)) return null;
+    throw e;
+  }
+}
+
+async function registerComposed(ecs, composed) {
+  try {
+    const res = await ecs.send(new RegisterTaskDefinitionCommand(composed));
+    return res.taskDefinition;
+  } catch (e) {
+    throw new CliError(`RegisterTaskDefinition failed for family ${composed.family}`, { cause: e });
+  }
+}
+
+/**
+ * Create the service. Everything not in `SERVICE`'s constants is DISCOVERED, not configured (§5.2).
+ *
+ * The subnets come from the file system's mount targets, which is not a coincidence of one
+ * deployment: mount targets exist in exactly one VPC and the runtime provisioner already derives its
+ * subnets the same way, so sharing the file system IS sharing the VPC and its subnets. Verified
+ * against the live service before the move — the three subnets matched exactly, though AWS returns
+ * both lists UNORDERED, which is why anything comparing them compares sets.
+ */
+async function createService(ecs, ctx, facts, config, taskDefinitionArn) {
+  const { CreateServiceCommand } = require('@aws-sdk/client-ecs');
+  const { SERVICE } = require('../lib/task-definition');
+  const enableExecuteCommand = String(config.values.ENABLE_EXECUTE_COMMAND || '').toLowerCase() === 'true';
+
+  try {
+    await ecs.send(new CreateServiceCommand({
+      cluster: ctx.resources.cluster,
+      serviceName: ctx.resources.dispatcherService,
+      taskDefinition: taskDefinitionArn,
+      launchType: SERVICE.launchType,
+      desiredCount: SERVICE.desiredCount,
+      deploymentConfiguration: SERVICE.deploymentConfiguration,
+      enableExecuteCommand,
+      networkConfiguration: {
+        awsvpcConfiguration: {
+          subnets: facts.subnetIds,
+          securityGroups: [facts.dispatcherSecurityGroupId],
+          assignPublicIp: SERVICE.assignPublicIp,
+        },
+      },
+      serviceRegistries: [{ registryArn: facts.serviceRegistryArn }],
+      tags: [{ key: 'Deployment', value: ctx.resources.name }, { key: 'ManagedBy', value: 'archie' }],
+      propagateTags: 'SERVICE',
+    }));
+  } catch (e) {
+    throw new CliError(`CreateService failed for ${ctx.resources.cluster}/${ctx.resources.dispatcherService}`, {
+      cause: e,
+      detail: 'The operator role needs ecs:CreateService in addition to the register/update it holds.',
+    });
+  }
 }
 
 /** `--wait-timeout` wins; the global `--timeout` also raises it (§1.2); otherwise 300s (§2.4). */
@@ -655,53 +761,7 @@ function waitBudgetSeconds(ctx, args) {
   return ctx.timeoutSeconds || DEFAULT_WAIT_SECONDS;
 }
 
-/**
- * The BOOTSTRAP tfvar — reported for context, no longer a follow-up action.
- *
- * The service ignores `task_definition` changes (modules/archie/dispatcher.tf), so a deploy no
- * longer leaves this stale in any way that matters: it is what a from-scratch apply starts on, not
- * what runs. Still emitted in --json because a from-scratch environment DOES want it current, and
- * kept derived so renaming the variable is a one-line fix.
- */
-function terraformFollowUp(ctx, tag) {
-  return {
-    variable: 'archie_dispatcher_image_tag',
-    value: tag,
-    makefileVariable: 'ARCHIE_GATEWAY_TAG',
-    required: false,
-    note: 'bootstrap image for a from-scratch apply; the service ignores task_definition changes, so this deploy survives terraform apply',
-  };
-}
 
-/**
- * Register a revision of the CURRENT task definition with only the image swapped.
- *
- * The read-only fields are STRIPPED rather than the writable ones copied. Both directions can be
- * wrong; they fail differently. A forgotten writable field (runtimePlatform, ephemeralStorage, a
- * volume) silently registers a revision that differs from Terraform's in a way nobody sees until
- * the container behaves differently. A read-only field left in fails loudly at RegisterTaskDefinition
- * — before anything is stopped, outside the downtime window. Loud and early beats silent and live.
- */
-async function registerRevision(ecs, deployed, image) {
-  const source = { ...deployed.taskDefinition };
-  for (const key of ['taskDefinitionArn', 'revision', 'status', 'requiresAttributes', 'compatibilities',
-    'registeredAt', 'registeredBy', 'deregisteredAt']) {
-    delete source[key];
-  }
-  source.containerDefinitions = (deployed.taskDefinition.containerDefinitions || []).map((c) => (
-    c.name === deployed.container.name ? { ...c, image } : { ...c }
-  ));
-  // Carry Terraform's tags onto the revision, so a revision this CLI registered is not the only one
-  // in the family without them — the tags are how everything else attributes cost and ownership.
-  if (deployed.taskDefinitionTags.length) source.tags = deployed.taskDefinitionTags;
-
-  try {
-    const res = await ecs.send(new RegisterTaskDefinitionCommand(source));
-    return res.taskDefinition;
-  } catch (e) {
-    throw new CliError(`RegisterTaskDefinition failed for family ${deployed.taskDefinition.family}`, { cause: e });
-  }
-}
 
 /**
  * Wait for the three transitions, in order. See the file header for why it cannot be two.
@@ -713,9 +773,14 @@ async function registerRevision(ecs, deployed, image) {
  */
 async function waitForRollout({
   ecs, ctx, out, now, sleep, cluster, service, taskDefinitionArn, hasHealthcheck, budgetMs, pollIntervalMs,
+  expectStop = true,
 }) {
   const startedWaitingAt = now();
-  let phase = 'stopping';
+  // A CREATED service has no task to stop, so it starts a phase later. Waiting for `stopping` on one
+  // works by accident — the count is already 0 — but it labels the wait "old task stopped; Socket
+  // Mode closed" and reports the elapsed time as DOWNTIME, which is a number describing an outage
+  // that did not happen. Someone reading that in an incident note would be misled by it.
+  let phase = expectStop ? 'stopping' : 'starting';
   let stoppedAt = null;
   let stoppedApproximate = false;
   let startedAt = null;
@@ -848,15 +913,24 @@ function renderDeploy(r) {
     return lines.join('\n');
   }
   lines.push(`image       ${r.image}${r.imageDigest ? `  (${r.imageDigest})` : ''}`);
-  lines.push(`taskdef     ${r.previousTaskDefinition} -> ${r.registeredTaskDefinition || '(not registered)'}`);
-  if (r.timeline) {
+  lines.push(`taskdef     ${r.created ? '(new service)' : r.previousTaskDefinition} -> `
+    + `${r.registeredTaskDefinition || '(not registered)'}`);
+  if (r.timeline && r.created) {
+    // NOT "downtime". A created service had nothing running to interrupt, so the elapsed time is
+    // startup, not an outage — calling it downtime would put a number into someone's incident notes
+    // that describes no incident. The measurement is still worth printing: it is the floor for what
+    // a rollout of this image costs.
+    lines.push(`startup     ${r.timeline.gapSeconds}s to HEALTHY — nothing was interrupted`);
+  } else if (r.timeline) {
     lines.push(`downtime    ${r.timeline.gapSeconds}s${r.timeline.gapApproximate ? ' (approximate)' : ''} `
       + `— ${r.timeline.stoppedAt} to ${r.timeline.healthyAt}`);
     if (!r.timeline.healthcheckVerified) lines.push('healthcheck NOT verified (the revision declares none)');
   } else if (r.rolled) {
-    lines.push('downtime    not measured (--no-wait): nothing observed the gap');
+    lines.push(`${r.created ? 'startup     ' : 'downtime    '}not measured (--no-wait): nothing observed it`);
   }
-  lines.push(`terraform   set ${r.terraform.variable} = "${r.terraform.value}" before the next apply`);
+  // NO TERRAFORM LINE. It used to name the tfvar to bump so the next apply would agree. Terraform
+  // owns neither the task definition nor an image tag now, and `var.dispatcher_image_tag` does not
+  // exist — pointing an operator at a variable that is gone is worse than saying nothing.
   return lines.join('\n');
 }
 
@@ -1062,5 +1136,6 @@ module.exports = {
   build, deploy, status, compose,
   // Exported for tests — each is a rail that fails in a way the command's own output would not
   // distinguish, so each is asserted directly.
-  checkEnvAgainstName, registerRevision, waitForRollout, waitBudgetSeconds, defaultRun,
+  checkEnvAgainstName, readDeployedOrNull, registerComposed, createService, waitForRollout,
+  waitBudgetSeconds, defaultRun,
 };

@@ -119,6 +119,38 @@ const SSM_HANDLES = [
   { key: 'DISPATCHER_ACCESS_POINT_ID', required: true },
 ];
 
+// ── §4.3, third category: SERVICE settings ───────────────────────────────────────────────────────
+//
+// archie owns the ECS service too — `aws_ecs_service.task_definition` is a required argument, so
+// Terraform could not keep the service without keeping a task definition, and the two cannot be
+// split. Almost everything about the service is a constant this file hard-codes (see SERVICE below)
+// or is discovered (subnets, security group, service registry). This is what is left.
+//
+// Also not an environment variable, so also not in SSM_PARAMETERS.
+const SSM_SERVICE = [
+  { key: 'ENABLE_EXECUTE_COMMAND', required: false },
+];
+
+// The service's fixed shape. Each of these is load-bearing, not a default nobody thought about:
+//
+//   desiredCount 1              — two tasks would open two Slack Socket Mode connections, and Slack
+//                                 load-balances events across connections for the same app, so events
+//                                 would be handled non-deterministically and sometimes twice. It
+//                                 would also break the cron store's sole-writer invariant (no mutex)
+//                                 and per-session turn serialisation.
+//   minimumHealthyPercent 0     — stop-then-start, not rolling. A rolling deployment briefly runs two
+//   maximumPercent 100            tasks, which is precisely the double-connection problem above. A
+//                                 gap is CORRECT here: Socket Mode events during it are dropped
+//                                 rather than duplicated. It is ~94s measured, and it is why
+//                                 `gateway deploy` is idempotent on an unchanged image.
+//   assignPublicIp false        — egress is via NAT; the task has no business being reachable.
+const SERVICE = {
+  desiredCount: 1,
+  deploymentConfiguration: { minimumHealthyPercent: 0, maximumPercent: 100 },
+  launchType: 'FARGATE',
+  assignPublicIp: 'DISABLED',
+};
+
 /**
  * The parameter path — a CONSTANT, not derived from `--name`, matching modules/archie/ssm.tf.
  *
@@ -321,7 +353,7 @@ function requireFacts(facts, keys) {
 }
 
 module.exports = {
-  CONSTANTS, SSM_PARAMETERS, SSM_HANDLES, PORT, CPU, MEMORY,
+  CONSTANTS, SSM_PARAMETERS, SSM_HANDLES, SSM_SERVICE, SERVICE, PORT, CPU, MEMORY,
   SSM_PREFIX, dispatcherBaseUrl, healthCheckCommand,
   composeEnvironment, composeTaskDefinition,
 };
