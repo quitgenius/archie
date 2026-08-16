@@ -123,10 +123,43 @@ const imageUriFor = (ctx, account, tag) => `${registryHostFor(account, ctx.regio
  * Deliberately a one-line pass-through rather than an abstraction over it. Every field
  * `runtimeSpecFor` returns is carried, including fields added after this was written, because
  * nothing here enumerates them. That property is the whole contract.
+ *
+ * COMPLETENESS IS CHECKED GENERICALLY, WHICH IS WHY IT DOES NOT BREAK THAT CONTRACT. This used to
+ * check `spec.image` and nothing else — one of five fields that can arrive blank — and on
+ * 2026-08-16 `efsMountPath` and `securityGroupId` both did: `cmd/stage.js` passed an empty spec into
+ * the client's overrides, and `mergeConfig`'s spread let `undefined` ERASE values the deployed task
+ * definition had resolved correctly. Every provision in the fleet failed.
+ *
+ * AgentCore reported that as `Value '[]' at 'networkConfiguration.networkModeConfig.securityGroups'
+ * failed to satisfy constraint` — the SDK drops an undefined array member, so the complaint is about
+ * an empty array rather than a missing value, and neither field name appears in it. Three layers
+ * from the assignment that caused it.
+ *
+ * Asserting "no field is blank" rather than listing required fields keeps the pass-through property
+ * — a field added to `runtimeSpecFor` tomorrow is covered with no edit here — while making the
+ * failure name itself. It also fires BEFORE provisioning creates a role, an access point and a
+ * Connector project, so there is no half-built agent to unpick afterwards.
  */
+const isBlank = (v) => v === undefined || v === null || v === ''
+  || (Array.isArray(v) && v.length === 0)
+  || (v && typeof v === 'object' && !Array.isArray(v) && Object.keys(v).length === 0);
+
 function derivedSpecFor(client, agent, imageUri) {
   const spec = client.runtimeSpecFor(agent, imageUri);
-  if (!spec || !spec.image) throw new CliError('runtimeSpecFor returned no image', { code: EXIT.FAILED });
+  if (!spec || typeof spec !== 'object') {
+    throw new CliError('runtimeSpecFor returned no spec', { code: EXIT.FAILED });
+  }
+  const blank = Object.keys(spec).filter((k) => isBlank(spec[k]));
+  if (blank.length) {
+    throw new CliError(`the derived spec for ${agent} has empty field(s): ${blank.join(', ')}`, {
+      code: EXIT.FAILED,
+      detail: 'Every field here is baked into CreateAgentRuntime and cannot be changed afterwards, so '
+        + 'a blank one provisions a runtime that is wrong from birth. This is almost always fleet '
+        + 'configuration that did not reach the client: `bin/archie.js` applies the DEPLOYED '
+        + "dispatcher's task definition before any handler runs (lib/dispatcher-env.js), and an "
+        + 'override passed as `undefined` will erase it again.',
+    });
+  }
   return spec;
 }
 

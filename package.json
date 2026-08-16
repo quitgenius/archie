@@ -7,11 +7,14 @@
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "test": "node --test eslint.config.test.mjs",
-    "swallowed-errors": "eslint . -f json | node -e \"let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const r=JSON.parse(s),t={};let n=0;for(const f of r)for(const m of f.messages){if(m.ruleId!=='local/no-statementless-catch')continue;n++;const p=f.filePath.replace(process.cwd()+'/','').split('/');const k=p[0]==='clawdbot'?p.slice(0,2).join('/'):p[0];t[k]=(t[k]||0)+1}for(const k of Object.keys(t).sort())console.log(String(t[k]).padStart(5),k);console.log(String(n).padStart(5),'TOTAL')})\""
+    "swallowed-errors": "eslint . -f json | node -e \"let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const r=JSON.parse(s),t={};let n=0;for(const f of r)for(const m of f.messages){if(m.ruleId!=='local/no-statementless-catch')continue;n++;const p=f.filePath.replace(process.cwd()+'/','').split('/');const k=p[0]==='clawdbot'?p.slice(0,2).join('/'):p[0];t[k]=(t[k]||0)+1}for(const k of Object.keys(t).sort())console.log(String(t[k]).padStart(5),k);console.log(String(n).padStart(5),'TOTAL')})\"",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "devDependencies": {
+    "@types/node": "^26.2.0",
     "eslint": "^9.39.5",
     "eslint-plugin-n": "^18.3.0",
-    "globals": "^17.11.0"
+    "globals": "^17.11.0",
+    "typescript": "^5.6.0"
   }
 }

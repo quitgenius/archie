@@ -1,0 +1,36 @@
+{
+  "// why": [
+    "TYPE-CHECK ONLY — no emit, no build step, nothing here reaches an image. This tree is plain",
+    "JavaScript and stays that way.",
+    "",
+    "IT CHECKS ONE THING: that the two identity spaces (types/identity.d.ts) are never substituted",
+    "for one another. `strict` is deliberately OFF. Turning it on against unannotated JS produced 30+",
+    "implicit-any and module-resolution errors per file — noise that buries the single signal worth",
+    "having, and a checker whose output you scroll past is a checker that is not running. Brand",
+    "incompatibility is a plain assignability error and needs none of it.",
+    "",
+    "`include` is DELIBERATELY NARROW: the two functions that mint a scope id and the key builders",
+    "that consume one. That is the path that broke twice (eb14aeefa -> a2bfb6130, 518562105).",
+    "Widening it is welcome — annotate the file in the same commit rather than letting errors",
+    "accumulate."
+  ],
+  "compilerOptions": {
+    "noEmit": true,
+    "allowJs": true,
+    "checkJs": true,
+    "strict": false,
+    "noImplicitAny": false,
+    "target": "es2022",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "types": ["node"],
+    "skipLibCheck": true
+  },
+  "include": [
+    "types/identity.d.ts",
+    "types/identity.assert.ts",
+    "clawdbot/config-resolver/schema.mjs",
+    "clawdbot/config-resolver/rekey-to-scope.mjs",
+    "slack-dispatcher/agent-scope.js"
+  ]
+}
