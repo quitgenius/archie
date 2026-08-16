@@ -12,20 +12,21 @@
 // runtime" is not answerable any other way).
 //
 // SECOND RULE: rows are never deleted. The reaper REMOVEs the arn and stamps `reapedAt` so the row
-// survives as history — without that "a rollback to a reaped generation would invoke a corpse"
+// survives as history — without that "a rollback to a reaped tag would invoke a corpse"
 // (`runtime-registry.js:30-37`). Everything destructive here goes through markReaped, never a
 // DeleteItem, and `markReaped` stays UNCONDITIONAL while `clearArn` stays conditional
 // (`runtime-registry.js:152-214`).
 //
 // THIRD RULE: reuse, do not reimplement. The reap semantics below are `gcOldGenerations`
 // (`agentcore-client.js:520`) with one difference that could not be expressed by calling it: it keeps
-// exactly ONE name per agent, and `--keep N` keeps a SET (the live generation plus N rollback
+// exactly ONE name per agent, and `--keep N` keeps a SET (the live tag plus N rollback
 // targets). Everything else is the cited primitive — `listGenerations`/`markReaped`/`runtimeIdOf`
 // from the registry, `isGenerationOf` for ownership, `waitForRuntimeDeleted` for the name release.
 
 const {
   createRuntimeRegistry, runtimeIdOf, nameFromSk, PK_PREFIX,
 } = require('../../slack-dispatcher/runtime-registry');
+const { tagOf } = require('../lib/bindings');
 const { isGenerationOf } = require('../../slack-dispatcher/agentcore-client');
 const { waitForRuntimeDeleted } = require('../../slack-dispatcher/agentcore-provisioning');
 const { CliError, EXIT, usage, refused } = require('../lib/exit');
@@ -37,24 +38,24 @@ const { makeClient } = require('../lib/aws');
 // 12; reported here so a reap says what it bought.
 const RUNTIME_QUOTA = 1000;
 
-// "N ROLLBACK TARGETS", not N runtimes and not N days. Keeping N therefore keeps N+1 generations:
+// "N ROLLBACK TARGETS", not N runtimes and not N days. Keeping N therefore keeps N+1 tags:
 // the live one plus N to roll back to.
 //
 // DEFAULT 1, not 2, because `fleet deploy` now reaps BEFORE it builds (see cmd/fleet.js step 0). The
-// new generation arrives AFTER the reap, so a deploy leaves N+1 rollback targets rather than N:
+// new tag arrives AFTER the reap, so a deploy leaves N+1 rollback targets rather than N:
 //
-//   --keep 1  ->  gc leaves 2 generations (416), staging peaks at 3 (624), rests at 3 (624)
-//   --keep 2  ->  gc leaves 3 generations (624), staging peaks at 4 (832), rests at 4 (832)
-//   --keep 3  ->  gc leaves 4 generations (832), staging peaks at 5 (1,040) — OVER the 1,000 cap
+//   --keep 1  ->  gc leaves 2 tags (416), staging peaks at 3 (624), rests at 3 (624)
+//   --keep 2  ->  gc leaves 3 tags (624), staging peaks at 4 (832), rests at 4 (832)
+//   --keep 3  ->  gc leaves 4 tags (832), staging peaks at 5 (1,040) — OVER the 1,000 cap
 //
 // So `--keep 1` under reap-first yields exactly what `--keep 2` yielded under reap-last — the live
-// generation plus two to roll back to — at a lower peak (624 vs 832) and with the resting headroom
+// tag plus two to roll back to — at a lower peak (624 vs 832) and with the resting headroom
 // restored to 376 rather than 168. A standalone `archie runtime gc` keeps the same meaning; it
-// simply is not followed by a generation being added.
+// simply is not followed by a tag being added.
 const DEFAULT_KEEP = 1;
 const MAX_SAFE_KEEP = 2;
 
-// Only a SETTLED runtime may be deleted. A CREATING generation may be another writer's in-flight
+// Only a SETTLED runtime may be deleted. A CREATING tag may be another writer's in-flight
 // provision and deleting it races that writer into a failed turn (`agentcore-client.js:568-570`).
 const SETTLED = ['READY', 'CREATE_FAILED'];
 
@@ -140,7 +141,6 @@ const SCAN_ATTRS = {
   '#runtimeId': 'runtimeId',
   '#runtimeName': 'runtimeName',
   '#agent': 'agent',
-  '#generationId': 'generationId',
   '#createdAt': 'createdAt',
   '#updatedAt': 'updatedAt',
   '#stagedAt': 'stagedAt',
@@ -180,7 +180,7 @@ async function scanConfigTable(clients, table) {
 }
 
 /**
- * The live generation, or null.
+ * The live tag, or null.
  *
  * ConsistentRead for the same reason `image-source.js:60-67` reads the image pointer consistently: a
  * release followed immediately by a gc must not read the old pointer from a stale replica and reap
@@ -189,15 +189,10 @@ async function scanConfigTable(clients, table) {
  * Phase 1 runs against TODAY's structures (plan §12 step 1) and `CONFIG#release` does not exist yet,
  * so absence is normal and is handled by every caller rather than thrown.
  */
-async function activeGeneration(clients, table) {
-  const { GetCommand } = clients.docCmds;
-  const r = await clients.doc.send(new GetCommand({
-    TableName: table,
-    Key: { pk: 'CONFIG#release', sk: 'ACTIVE' },
-    ConsistentRead: true,
-  }));
-  const id = r && r.Item && r.Item.generationId;
-  return typeof id === 'string' && id ? id : null;
+async function liveTag(clients, table) {
+  const { readFleetPointer } = require('../lib/image-pointer');
+  const p = await readFleetPointer(clients.doc, clients.docCmds, table);
+  return (p && p.tag) || null;
 }
 
 /** Binding rows for a named set of agents — the registry's own Query, one agent at a time. */
@@ -214,12 +209,12 @@ async function rowsForAgents(registry, agents) {
 /**
  * One registry row as the CLI reports it.
  *
- * `generation` is the sort-key suffix: TODAY that is the runtime name (fingerprint-keyed), after
- * plan §3's rekey it is the `generationId`, and an explicit `generationId` attribute wins over
+ * `tag` is the sort-key suffix: TODAY that is the runtime name (fingerprint-keyed), after
+ * The sort key is the runtime NAME; the release is the tag the row's `image` names.
  * either. Reading it from one place is what lets every command here survive that rekey unchanged.
  *
  * `runtimeId` goes through `runtimeIdOf`, which DERIVES the id from the arn when the field is
- * absent. Requiring the field outright once made the reaper a silent no-op: "superseded generations
+ * absent. Requiring the field outright once made the reaper a silent no-op: "superseded runtimes
  * stacked 2-3 deep per agent against the 1000-runtime quota, and nothing logged because 'no id'
  * looked exactly like 'already reaped'" (`agentcore-client.js:540-543`).
  */
@@ -228,13 +223,18 @@ function bindingOf(row) {
   const state = row.arn ? 'live' : (row.reapedAt ? 'reaped' : (row.clearedAt ? 'cleared' : 'unbound'));
   return {
     agent: row.agent || (typeof row.pk === 'string' ? row.pk.slice(PK_PREFIX.length) : null),
-    generation: row.generationId || runtimeName,
+    // THE RELEASE IDENTITY IS THE TAG the row's image names — not a second id, and not the sort key.
+    // The key is the runtime NAME (a fingerprint of the whole spec), which identifies a runtime at
+    // AWS; the tag identifies the release it belongs to. Those are different questions and conflating
+    // them is what the tag id used to do.
+    tag: tagOf(row),
+    image: row.image || null,
     runtimeName,
     runtimeId: runtimeIdOf(row),
     arn: row.arn || null,
     state,
     healthcheck: row.healthcheck || null,
-    // `stagedAt` is plan §3's field on a binding written by `generation stage`; `createdAt` is what
+    // `stagedAt` is plan §3's field on a binding written by `fleet stage`; `createdAt` is what
     // today's registry writes (`runtime-registry.js:125-133`). Both are carried so retention orders
     // correctly on either side of that rename.
     stagedAt: row.stagedAt || null,
@@ -252,14 +252,14 @@ const recencyOf = (b) => b.stagedAt || b.createdAt || b.updatedAt || '';
  * AWS, which is the half of this command that must not be wrong.
  *
  * Per agent, over LIVE rows only (a reaped row holds no runtime, so it is neither a rollback target
- * nor quota): keep the newest `keep + 1` — the live generation plus `keep` rollback targets — and
+ * nor quota): keep the newest `keep + 1` — the live tag plus `keep` rollback targets — and
  * reap the rest.
  *
- * The active generation is kept UNCONDITIONALLY on top of that window. It is normally the newest, but
- * after a rollback it is not, and "newest is live" would then reap the generation currently serving
+ * The active tag is kept UNCONDITIONALLY on top of that window. It is normally the newest, but
+ * after a rollback it is not, and "newest is live" would then reap the tag currently serving
  * every turn. When there is no pointer to read, that assumption is all there is; the caller warns.
  */
-function planReap(bindings, { keep = DEFAULT_KEEP, active = null } = {}) {
+function planReap(bindings, { keep = DEFAULT_KEEP, liveTag = null } = {}) {
   const byAgent = new Map();
   for (const b of bindings) {
     if (b.state !== 'live') continue;
@@ -271,7 +271,7 @@ function planReap(bindings, { keep = DEFAULT_KEEP, active = null } = {}) {
   for (const agent of [...byAgent.keys()].sort()) {
     const rows = byAgent.get(agent).sort((a, b) => (recencyOf(b) || '').localeCompare(recencyOf(a) || ''));
     rows.forEach((b, i) => {
-      if (i <= keep || (active && b.generation === active)) kept.push(b);
+      if (i <= keep || (liveTag && b.tag === liveTag)) kept.push(b);
       else reap.push(b);
     });
   }
@@ -297,14 +297,15 @@ function renderTable(headers, rows) {
 // ── §2.15 `archie runtime list` ──────────────────────────────────────────────
 
 /**
- * Per-agent bindings — the ~208-row companion to `generation list`'s dozen. Read-only, and
- * `--missing` returning rows is still exit 0: it is a report, and the re-run list for
- * `generation stage`.
+ * Per-agent bindings — the ~208-row companion to `image list`'s dozen. Read-only, and `--missing`
+ * returning rows is still exit 0: it is a report, and the re-run list for `fleet stage`.
  */
 async function list(ctx, args, out, deps = {}) {
   const clients = awsClients(ctx, deps.clients);
   const configTable = ctx.resources.configTable;
-  const { agent, generation, missing, failed } = args.values;
+  const { agent, missing, failed } = args.values;
+  // `--tag` still read for the two-word alias; the value an old runbook passes is a tag now.
+  const tag = args.values.tag || args.values.generation;
 
   // One agent is a registry Query; the fleet (and anything needing the roster) is one Scan. Neither
   // is `ListAgentRuntimes` — see the header.
@@ -319,22 +320,22 @@ async function list(ctx, args, out, deps = {}) {
     roster = scan.agents;
   }
 
-  const target = generation || (missing ? await activeGeneration(clients, configTable) : null);
+  const target = tag || (missing ? await liveTag(clients, configTable) : null);
   if (missing && !target) {
-    throw usage('--missing needs a generation to be missing FROM: pass --generation <id>, or publish '
-      + 'a release pointer first', { detail: 'CONFIG#release/ACTIVE is absent (reference §2.14).' });
+    throw usage('--missing needs a tag to be missing FROM: pass --tag <tag>, or publish one first',
+      { detail: 'CONFIG#image/FLEET is absent (reference §2.14).' });
   }
-  if (generation) bindings = bindings.filter((b) => b.generation === generation);
+  if (tag) bindings = bindings.filter((b) => b.tag === tag);
   if (failed) bindings = bindings.filter((b) => b.healthcheck === 'failed');
 
   let missingAgents = [];
   if (missing) {
-    const bound = new Set(bindings.filter((b) => b.generation === target && b.state === 'live').map((b) => b.agent));
+    const bound = new Set(bindings.filter((b) => b.tag === target && b.state === 'live').map((b) => b.agent));
     missingAgents = roster.filter((a) => !bound.has(a));
   }
 
   const result = {
-    generation: target,
+    tag: target,
     counts: {
       bindings: bindings.length,
       live: bindings.filter((b) => b.state === 'live').length,
@@ -351,14 +352,14 @@ async function list(ctx, args, out, deps = {}) {
   // "missing" is exactly what it looks like.
   if (missingAgents.length) {
     out.warn(`${missingAgents.length} agent(s) have no live binding for ${target}. Re-run `
-      + '`archie generation stage` to provision them. If one of them DOES have a runtime at AWS, its '
+      + '`archie fleet stage` to provision them. If one of them DOES have a runtime at AWS, its '
       + 'registry write was lost and only `archie runtime gc --reconcile-aws` can see it (§6.5).');
   }
 
   if (ctx.json) return result;
   out.answer(renderTable(
-    ['AGENT', 'GENERATION', 'STATE', 'HEALTH', 'RUNTIME ID'],
-    bindings.map((b) => [b.agent, b.generation, b.state, b.healthcheck || '-', b.runtimeId || '-']),
+    ['AGENT', 'TAG', 'RUNTIME', 'STATE', 'HEALTH', 'RUNTIME ID'],
+    bindings.map((b) => [b.agent, b.tag || '-', b.runtimeName || '-', b.state, b.healthcheck || '-', b.runtimeId || '-']),
   ) + `\n\n${result.counts.bindings} binding(s) · ${result.counts.live} live · ${result.counts.reaped} reaped`
     + (missing ? ` · ${missingAgents.length} agent(s) missing ${target}` : ''));
   return undefined;
@@ -377,43 +378,51 @@ async function list(ctx, args, out, deps = {}) {
 async function deleteRuntime(ctx, args, out, deps = {}) {
   const clients = awsClients(ctx, deps.clients);
   const configTable = ctx.resources.configTable;
-  const { agent, generation } = args.values;
-  if (!agent || !generation) throw usage('runtime delete requires --agent <a> and --generation <id>');
+  const { agent, tag } = args.values;
+  if (!agent || !tag) throw usage('runtime delete requires --agent <a> and --tag <tag>');
 
+  // Found by (agent, tag) rather than by key. The key is the runtime NAME, which an operator has no
+  // reason to know and every reason to mistype; the tag is what they were already holding.
   const registry = registryFor(ctx, clients);
-  const row = await registry.get(agent, generation);
+  const rows = (await rowsForAgents(registry, [agent])).filter((r) => tagOf(r) === tag);
+  if (rows.length > 1) {
+    throw refused(`${agent} has ${rows.length} bindings for ${tag}`,
+      { detail: `${rows.map((r) => r.runtimeName || r.sk).join(', ')} — delete by name is not exposed; `
+        + 'this means two specs produced the same tag, which `archie fleet drift` explains.' });
+  }
+  const row = rows[0];
   if (!row) {
     // Idempotent, like `deleteRuntime` (`agentcore-client.js:450`): not-found is a no-op, not an
     // error. We do NOT fall back to findRuntimeByName — that paginates the whole account
     // (`agentcore-provisioning.js:376-408`) to answer a question the registry already answered.
-    out.progress(`no registry row for ${agent}/${generation} — nothing to delete`);
-    return ctx.json ? { agent, generation, deleted: false, reason: 'no-registry-row' } : undefined;
+    out.progress(`no binding for ${agent} on ${tag} — nothing to delete`);
+    return ctx.json ? { agent, tag, deleted: false, reason: 'no-registry-row' } : undefined;
   }
   const binding = bindingOf({ ...row, agent });
   if (!binding.arn) {
-    out.progress(`${agent}/${generation} was already reaped at ${binding.reapedAt || 'an unknown time'} — nothing to delete`);
-    return ctx.json ? { agent, generation, deleted: false, reason: 'already-reaped' } : undefined;
+    out.progress(`${agent}/${tag} was already reaped at ${binding.reapedAt || 'an unknown time'} — nothing to delete`);
+    return ctx.json ? { agent, tag, deleted: false, reason: 'already-reaped' } : undefined;
   }
   if (!binding.runtimeId) {
-    throw new CliError(`${agent}/${generation} has an arn but no derivable runtime id`, {
+    throw new CliError(`${agent}/${tag} has an arn but no derivable runtime id`, {
       code: EXIT.FAILED,
       detail: `arn=${binding.arn} — GetAgentRuntime and DeleteAgentRuntime both take an id. `
         + 'This is the shape that once made the reaper a silent no-op (agentcore-client.js:540-543).',
     });
   }
 
-  // FAIL CLOSED ON THE LIVE GENERATION. Not knowing whether this is the generation serving every
+  // FAIL CLOSED ON THE LIVE GENERATION. Not knowing whether this is the tag serving every
   // turn is not a reason to proceed — `--force-active` is the declared way to say "I am certain",
   // and it is a flag the operator has to type.
-  const active = await activeGeneration(clients, configTable);
+  const live = await liveTag(clients, configTable);
   if (!args.values['force-active']) {
-    if (active === generation) {
-      throw refused(`${generation} is the ACTIVE generation — deleting ${agent}'s runtime would stop it serving`,
-        { detail: 'Roll the pointer first (`archie release set`), or pass --force-active.' });
+    if (live === tag) {
+      throw refused(`${tag} is LIVE — deleting ${agent}'s runtime would stop it serving`,
+        { detail: 'Publish a known-good tag first (`archie image publish <tag>`), or pass --force-active.' });
     }
-    if (!active) {
-      throw refused('cannot prove this is not the live generation: CONFIG#release/ACTIVE is absent',
-        { detail: 'Publish a release pointer, or pass --force-active if you are certain.' });
+    if (!live) {
+      throw refused('cannot prove this is not the live tag: nothing is published',
+        { detail: 'CONFIG#image/FLEET is absent. Publish a tag, or pass --force-active if you are certain.' });
     }
   }
 
@@ -437,13 +446,13 @@ async function deleteRuntime(ctx, args, out, deps = {}) {
       // Gone at AWS already. The row must stop claiming it, or a rollback here invokes a corpse.
       if (!ctx.dryRun) await registry.markReaped(agent, binding.runtimeName);
       out.progress(`${binding.runtimeName} is already gone at AWS — marked reaped, row kept as history`);
-      return ctx.json ? { agent, generation, deleted: false, reason: 'gone-at-aws', reaped: !ctx.dryRun } : undefined;
+      return ctx.json ? { agent, tag, deleted: false, reason: 'gone-at-aws', reaped: !ctx.dryRun } : undefined;
     }
     throw new CliError(`could not read ${binding.runtimeName} before deleting it`, { code: EXIT.FAILED, cause: err });
   }
   if (status && !SETTLED.includes(status)) {
     // Not a refusal here (§2.16 does not list one) but it IS the gc's hard rail, and for the same
-    // reason: a CREATING generation may be another writer's in-flight provision.
+    // reason: a CREATING tag may be another writer's in-flight provision.
     out.warn(`${binding.runtimeName} is ${status}, not settled — if another writer is mid-provision, `
       + 'deleting it races them into a failed turn (agentcore-client.js:568-570)');
   }
@@ -453,7 +462,7 @@ async function deleteRuntime(ctx, args, out, deps = {}) {
     out.progress(`delete runtime ${binding.runtimeName} (${binding.runtimeId}) for ${agent}`);
     out.progress('then REMOVE its arn and stamp reapedAt (the row is kept as history)');
     const plan = {
-      agent, generation, runtimeName: binding.runtimeName, runtimeId: binding.runtimeId,
+      agent, tag, runtimeName: binding.runtimeName, runtimeId: binding.runtimeId,
       observed, deleted: false, dryRun: true,
     };
     if (ctx.json) return plan;
@@ -482,13 +491,13 @@ async function deleteRuntime(ctx, args, out, deps = {}) {
         code: EXIT.TIMEOUT,
         cause: err,
         detail: 'The delete may still complete at AWS. The runtime is deleted and the row is already '
-          + 'reaped; only the NAME is still held, which blocks re-creating that exact generation.',
+          + 'reaped; only the NAME is still held, which blocks re-creating that exact runtime.',
       });
     }
   }
 
   const result = {
-    agent, generation, runtimeName: binding.runtimeName, runtimeId: binding.runtimeId,
+    agent, tag, runtimeName: binding.runtimeName, runtimeId: binding.runtimeId,
     deleted: true, nameReleased: released, observed,
   };
   if (ctx.json) return result;
@@ -529,13 +538,13 @@ function resolveDeleteBudget(ctx, args, out) {
 
 // ── §2.17 `archie runtime gc` ────────────────────────────────────────────────
 
-/** Retention-based reaping. `--keep N` = N ROLLBACK TARGETS (so N+1 generations survive). */
+/** Retention-based reaping. `--keep N` = N ROLLBACK TARGETS (so N+1 tags survive). */
 async function gcRuntimes(ctx, args, out, deps = {}) {
   const clients = awsClients(ctx, deps.clients);
   const configTable = ctx.resources.configTable;
   const keep = parseCount(args.values.keep, DEFAULT_KEEP, '--keep');
   if (keep > MAX_SAFE_KEEP) {
-    out.warn(`--keep ${keep} keeps ${keep + 1} generations. At every agent in the fleet that is ${(keep + 1) * 208} runtimes, `
+    out.warn(`--keep ${keep} keeps ${keep + 1} tags' worth. At every agent in the fleet that is ${(keep + 1) * 208} runtimes, `
       + `and ${(keep + 2) * 208} during a staging pass — over the ${RUNTIME_QUOTA}-runtime cap, where staging `
       + 'fails at exit 8 (§5.4).');
   }
@@ -553,17 +562,21 @@ async function gcRuntimes(ctx, args, out, deps = {}) {
     roster = scan.agents;
   }
 
-  const active = await activeGeneration(clients, configTable);
-  if (!active) {
-    out.warn('no CONFIG#release/ACTIVE pointer — retention falls back to "the newest binding per agent '
-      + 'is the live one". That holds unless you have rolled BACK, where the live generation is older '
-      + `than ${keep} newer ones and would be reaped. Check the plan below before --no-dry-run.`);
+  // THE ROLLBACK HOLE IS CLOSED. This used to fall back to "the newest binding per agent is the live
+  // one" whenever the image pointer was absent, and said so — that fallback is wrong after a
+  // rollback, where the live release is OLDER than `keep` newer ones and would be reaped. There is no
+  // fallback now: the live tag is read from the one pointer the dispatcher itself reads, and a
+  // missing pointer means nothing is live to protect.
+  const live = await liveTag(clients, configTable);
+  if (!live) {
+    out.warn('nothing is published (CONFIG#image/FLEET absent) — no binding is protected as live. '
+      + 'Retention will keep the newest per agent by recency only. Check the plan below before --no-dry-run.');
   }
 
-  const { kept, reap } = planReap(bindings, { keep, active });
+  const { kept, reap } = planReap(bindings, { keep, liveTag: live });
   const liveBefore = bindings.filter((b) => b.state === 'live').length;
 
-  for (const b of reap) out.verbose(`reap ${b.agent} ${b.generation} (${b.runtimeId})`);
+  for (const b of reap) out.verbose(`reap ${b.agent} ${b.tag || b.runtimeName} (${b.runtimeId})`);
   out.progress(`keep ${kept.length} binding(s) · reap ${reap.length} · ${roster.length} agent(s) in scope`);
 
   const reaped = [];
@@ -573,7 +586,7 @@ async function gcRuntimes(ctx, args, out, deps = {}) {
       try {
         const outcome = await reapOne(clients, registry, b);
         if (outcome.reaped) reaped.push({ ...b, observed: outcome.observed });
-        else skipped.push({ agent: b.agent, generation: b.generation, reason: outcome.reason });
+        else skipped.push({ agent: b.agent, tag: b.tag, runtimeName: b.runtimeName, reason: outcome.reason });
       } catch (err) {
         // Per-unit, so `failures[]` names WHICH agent failed and the run exits 6 PARTIAL rather than
         // collapsing 208 units into one code (§1.4).
@@ -587,10 +600,10 @@ async function gcRuntimes(ctx, args, out, deps = {}) {
 
   const result = {
     keep,
-    active,
-    kept: kept.map((b) => ({ agent: b.agent, generation: b.generation })),
-    planned: reap.map((b) => ({ agent: b.agent, generation: b.generation, runtimeId: b.runtimeId })),
-    reaped: reaped.map((b) => ({ agent: b.agent, generation: b.generation, runtimeId: b.runtimeId })),
+    live,
+    kept: kept.map((b) => ({ agent: b.agent, tag: b.tag, runtimeName: b.runtimeName })),
+    planned: reap.map((b) => ({ agent: b.agent, tag: b.tag, runtimeName: b.runtimeName, runtimeId: b.runtimeId })),
+    reaped: reaped.map((b) => ({ agent: b.agent, tag: b.tag, runtimeName: b.runtimeName, runtimeId: b.runtimeId })),
     skipped,
     reconcile,
     quota: {
@@ -608,7 +621,7 @@ async function gcRuntimes(ctx, args, out, deps = {}) {
 
   if (ctx.json) return result;
   out.answer([
-    `keep      ${kept.length} binding(s)${active ? ` (active ${active})` : ''}`,
+    `keep      ${kept.length} binding(s)${live ? ` (live ${live})` : ''}`,
     `reap      ${reap.length} binding(s)`,
     `${ctx.dryRun ? 'would reap' : 'reaped'} ${ctx.dryRun ? reap.length : reaped.length} · skipped ${skipped.length} · errors ${out.failureCount()}`,
     `quota     ${result.quota.registryLiveAfter}/${RUNTIME_QUOTA} runtimes after reap (${result.quota.source})`,
@@ -643,7 +656,7 @@ async function reapOne(clients, registry, b) {
     }
     throw err;
   }
-  // ONLY SETTLED. A CREATING generation may be another writer's in-flight provision.
+  // ONLY SETTLED. A CREATING tag may be another writer's in-flight provision.
   if (status && !SETTLED.includes(status)) return { reaped: false, reason: `unsettled (${status})` };
 
   await clients.control.send(new DeleteAgentRuntimeCommand({ agentRuntimeId: b.runtimeId }));

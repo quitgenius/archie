@@ -122,29 +122,31 @@ function fakeSteps(over = {}) {
   };
   const steps = {
     build: wrap('build', over.build || (async () => ({ tag: TAG, image: IMAGE, skipped: true, built: false, pushed: false }))),
-    create: wrap('create', over.create || (async () => ({ generationId: GEN, image: IMAGE, imageTag: TAG, written: true }))),
     stage: wrap('stage', over.stage || (async () => ({
-      generationId: GEN, image: IMAGE, agents: 2, coverage: 2, staged: 2, healthOk: 2, healthFailed: 0, healthPending: 0, stragglers: 0,
+      tag: TAG, image: IMAGE, agents: 2, coverage: 2, staged: 2, healthOk: 2, healthFailed: 0, healthPending: 0, stragglers: 0,
     }))),
-    releaseSet: wrap('releaseSet', over.releaseSet || (async () => ({ generationId: GEN, written: true }))),
+    publish: wrap('publish', over.publish || (async () => ({ tag: TAG, written: true }))),
     gc: wrap('gc', over.gc || (async () => ({ reaped: [], kept: [], planned: [] }))),
   };
   return { calls, names: () => calls.map((c) => c.name), steps };
 }
 
-const generationItem = (over = {}) => ({
-  pk: 'CONFIG#generation',
-  sk: GEN,
-  data: JSON.stringify({ generationId: GEN, spec: { image: IMAGE }, specDigest: 'd1', image: IMAGE, imageTag: TAG, createdAt: '2026-08-14T00:00:00.000Z' }),
+/** A taint record for TAG — the only DDB item that can stop a deploy at the gate. */
+const taintItem = (over = {}) => ({
+  pk: 'CONFIG#image',
+  sk: `TAINT#${TAG}`,
+  reason: 'healthcheck failed',
+  taintedBy: 'sandbox',
+  taintedAt: '2026-08-14T12:00:00Z',
   ...over,
 });
 
 const bindingItem = (agent, over = {}) => ({
   pk: `RUNTIME#${agent}`,
-  sk: `GEN#${agent}-${GEN}`,
+  sk: `GEN#oc_${agent}_fp000001`,
   agent,
-  generationId: GEN,
-  runtimeName: `${agent}-${GEN}`,
+  image: IMAGE,
+  runtimeName: `oc_${agent}_fp000001`,
   arn: `arn:aws:bedrock-agentcore:us-east-1:203366135563:runtime/${agent}`,
   healthcheck: 'ok',
   ...over,
@@ -152,24 +154,41 @@ const bindingItem = (agent, over = {}) => ({
 
 const routingItem = (agent) => ({ pk: `AGENT#${agent}`, sk: 'META#routing', gsi1pk: 'ROUTING', gsi1sk: agent, data: '{}' });
 
-/** A table where the gate PASSES: the generation exists and both bindings are live and healthy. */
-const healthyTable = () => [generationItem(), bindingItem('a1'), bindingItem('a2'), routingItem('a1'), routingItem('a2')];
+const fakeSts = () => ({ async send() { return { Account: '203366135563' }; } });
+
+/** ECR double. `found: false` is "the tag is not in ECR", which the gate refuses on. */
+const fakeEcr = (found = true) => ({
+  async send(cmd) {
+    const n = cmd.constructor.name;
+    if (n === 'DescribeImagesCommand') {
+      if (!found) { const e = new Error('nope'); e.name = 'ImageNotFoundException'; throw e; }
+      return { imageDetails: [{ imageDigest: 'sha256:abc', imagePushedAt: new Date(0), imageSizeInBytes: 1 }] };
+    }
+    if (n === 'BatchGetImageCommand') {
+      return { images: [{ imageManifest: JSON.stringify({ manifests: [{ platform: { architecture: 'arm64' } }] }) }] };
+    }
+    throw new Error(`fakeEcr: unexpected ${n}`);
+  },
+});
+
+/** A table where the gate PASSES: both bindings are live, healthy and on TAG. */
+const healthyTable = () => [bindingItem('a1'), bindingItem('a2'), routingItem('a1'), routingItem('a2')];
 
 // ── fleet deploy: the happy path ─────────────────────────────────────────────────────────────────
 
-test('gc runs FIRST, then build -> create -> stage -> gate -> release', async () => {
+test('gc runs FIRST, then build -> stage -> gate -> publish', async () => {
   const s = fakeSteps();
   const out = fakeOut();
   const result = await fleet['fleet deploy'](ctxFor(), { positionals: [], values: {} }, out,
-    { doc: fakeDoc(healthyTable()), steps: s.steps });
+    { doc: fakeDoc(healthyTable()), sts: fakeSts(), ecr: fakeEcr(), steps: s.steps });
 
   // GC MOVED TO THE FRONT (2026-08-15). Reaping after a release destroys rollback targets in the
   // window they are most likely to be wanted, and recovering one is not a re-run: AgentCore holds a
   // deleted runtime's name for 3.5-10+ minutes, so a re-stage of a reaped generation is measured in
   // hours across the fleet. Reaping first does it from a known-good state instead.
-  assert.deepEqual(s.names(), ['gc', 'build', 'create', 'stage', 'releaseSet'],
+  assert.deepEqual(s.names(), ['gc', 'build', 'stage', 'publish'],
     'gc -> build -> create -> stage -> gate -> release set');
-  assert.equal(result.generationId, GEN);
+  assert.equal(result.imageTag, TAG);
   assert.equal(result.mode, 'staged');
   assert.equal(result.imageTag, TAG);
 });
@@ -177,17 +196,17 @@ test('gc runs FIRST, then build -> create -> stage -> gate -> release', async ()
 test('the image tag comes from the build, and the build always pushes', async () => {
   const s = fakeSteps();
   await fleet['fleet deploy'](ctxFor(), { positionals: [], values: {} }, fakeOut(),
-    { doc: fakeDoc(healthyTable()), steps: s.steps });
+    { doc: fakeDoc(healthyTable()), sts: fakeSts(), ecr: fakeEcr(), steps: s.steps });
   const build = s.calls.find((c) => c.name === 'build');
-  assert.equal(build.values.push, true, 'an unpublished image is one no generation can name');
-  const create = s.calls.find((c) => c.name === 'create');
-  assert.equal(create.values.image, TAG, 'create names the tag the build produced, not a re-derived one');
+  assert.equal(build.values.push, true, 'an unpushed image is one no agent can pull');
+  const stage = s.calls.find((c) => c.name === 'stage');
+  assert.equal(stage.values.tag, TAG, 'staging uses the tag the build produced, not a re-derived one');
 });
 
 test('sub-steps are run in --json mode so their structured answer can be read', async () => {
   const s = fakeSteps();
   await fleet['fleet deploy'](ctxFor({ json: false }), { positionals: [], values: {} }, fakeOut(),
-    { doc: fakeDoc(healthyTable()), steps: s.steps });
+    { doc: fakeDoc(healthyTable()), sts: fakeSts(), ecr: fakeEcr(), steps: s.steps });
   assert.ok(s.calls.every((c) => c.json === true),
     'the generation id is read out of `generation create`\'s answer — a paragraph has none');
 });
@@ -196,7 +215,7 @@ test('only ONE answer reaches stdout — the composed one', async () => {
   const s = fakeSteps();
   const out = fakeOut();
   await fleet['fleet deploy'](ctxFor({ json: false }), { positionals: [], values: {} }, out,
-    { doc: fakeDoc(healthyTable()), steps: s.steps });
+    { doc: fakeDoc(healthyTable()), sts: fakeSts(), ecr: fakeEcr(), steps: s.steps });
   assert.equal(out.answers.length, 1, 'stdout carries the answer and only the answer (§1.4)');
   assert.match(out.answers[0], /downtime {4}none/);
 });
@@ -204,7 +223,7 @@ test('only ONE answer reaches stdout — the composed one', async () => {
 test('concurrency is passed through to stage unparsed — the EFS clamp lives there', async () => {
   const s = fakeSteps();
   await fleet['fleet deploy'](ctxFor(), { positionals: [], values: { concurrency: '9' } }, fakeOut(),
-    { doc: fakeDoc(healthyTable()), steps: s.steps });
+    { doc: fakeDoc(healthyTable()), sts: fakeSts(), ecr: fakeEcr(), steps: s.steps });
   assert.equal(s.calls.find((c) => c.name === 'stage').values.concurrency, '9',
     'the bound is EFS CreateAccessPoint and cmd/stage.js owns the clamp and the warning (§5.3)');
 });
@@ -212,7 +231,7 @@ test('concurrency is passed through to stage unparsed — the EFS clamp lives th
 test('--keep is passed through to runtime gc', async () => {
   const s = fakeSteps();
   await fleet['fleet deploy'](ctxFor(), { positionals: [], values: { keep: '2' } }, fakeOut(),
-    { doc: fakeDoc(healthyTable()), steps: s.steps });
+    { doc: fakeDoc(healthyTable()), sts: fakeSts(), ecr: fakeEcr(), steps: s.steps });
   assert.equal(s.calls.find((c) => c.name === 'gc').values.keep, '2');
 });
 
@@ -223,105 +242,102 @@ test('EXIT 4: a healthcheck failure taints and the pointer is NEVER moved', asyn
   const s = fakeSteps({ stage: async () => { throw tainted; } });
   await assert.rejects(
     () => fleet['fleet deploy'](ctxFor(), { positionals: [], values: {} }, fakeOut(),
-      { doc: fakeDoc(healthyTable()), steps: s.steps }),
+      { doc: fakeDoc(healthyTable()), sts: fakeSts(), ecr: fakeEcr(), steps: s.steps }),
     (e) => e.exitCode === EXIT.TAINTED,
   );
-  assert.ok(!s.names().includes('releaseSet'), 'exit 4 means tainted, pointer not moved (§2.19)');
+  assert.ok(!s.names().includes('publish'), 'exit 4 means tainted, pointer not moved (§2.19)');
   // gc DID run — it leads every deploy now. Harmless here: it reaped from a known-good state before
   // anything was attempted, so a failed deploy leaves a cleaner quota rather than a dirtier one.
-  assert.deepEqual(s.names(), ['gc', 'build', 'create', 'stage'], 'it stopped at stage; nothing after it ran');
+  assert.deepEqual(s.names(), ['gc', 'build', 'stage'], 'it stopped at stage; nothing after it ran');
 });
 
 test('EXIT 6: stragglers stop the run BEFORE release set', async () => {
   const s = fakeSteps({
     stage: async (ctx, args, out) => {
       out.failure({ agent: 'a2', step: 'provision', error: new Error('Rate exceeded') });
-      return { generationId: GEN, agents: 2, coverage: 1, healthOk: 1, healthFailed: 0 };
+      return { tag: TAG, agents: 2, coverage: 1, healthOk: 1, healthFailed: 0 };
     },
   });
   const out = fakeOut();
   await assert.rejects(
     () => fleet['fleet deploy'](ctxFor(), { positionals: [], values: {} }, out,
-      { doc: fakeDoc(healthyTable()), steps: s.steps }),
+      { doc: fakeDoc(healthyTable()), sts: fakeSts(), ecr: fakeEcr(), steps: s.steps }),
     (e) => e.exitCode === EXIT.PARTIAL && /pointer was NOT moved/.test(e.message),
   );
-  assert.ok(!s.names().includes('releaseSet'));
+  assert.ok(!s.names().includes('publish'));
   assert.equal(out.failures.length, 1, 'the per-agent failure still names WHICH agent failed');
 });
 
 test('EXIT 6: incomplete coverage stops the run even with no per-agent failure', async () => {
   // The shape this catches: an agent that was never attempted at all, so nothing called out.failure()
   // and staging still reported success for what it did do.
-  const s = fakeSteps({ stage: async () => ({ generationId: GEN, agents: 208, coverage: 207, healthOk: 207, healthFailed: 0 }) });
+  const s = fakeSteps({ stage: async () => ({ tag: TAG, agents: 208, coverage: 207, healthOk: 207, healthFailed: 0 }) });
   await assert.rejects(
     () => fleet['fleet deploy'](ctxFor(), { positionals: [], values: {} }, fakeOut(),
-      { doc: fakeDoc(healthyTable()), steps: s.steps }),
+      { doc: fakeDoc(healthyTable()), sts: fakeSts(), ecr: fakeEcr(), steps: s.steps }),
     (e) => e.exitCode === EXIT.PARTIAL && /207 of 208/.test(e.message),
   );
-  assert.ok(!s.names().includes('releaseSet'));
+  assert.ok(!s.names().includes('publish'));
 });
 
 // ── the gate is `releaseRefusal`, not a local opinion ────────────────────────────────────────────
 
-test('EXIT 5: the gate refuses a generation whose healthcheck never ran', async () => {
+test('EXIT 5: the gate refuses a tag whose healthcheck never ran', async () => {
   // Staging claims success; the BINDINGS say `pending`. The gate reads the table, not the claim.
   const s = fakeSteps();
-  const table = [generationItem(), bindingItem('a1', { healthcheck: 'pending' }), bindingItem('a2')];
+  const table = [bindingItem('a1', { healthcheck: 'pending' }), bindingItem('a2')];
   await assert.rejects(
     () => fleet['fleet deploy'](ctxFor(), { positionals: [], values: {} }, fakeOut(),
-      { doc: fakeDoc(table), steps: s.steps }),
+      { doc: fakeDoc(table), sts: fakeSts(), ecr: fakeEcr(), steps: s.steps }),
     (e) => e.exitCode === EXIT.REFUSED && /healthcheck has not run/.test(e.message),
   );
-  assert.ok(!s.names().includes('releaseSet'), 'the flip is refused before it is attempted');
+  assert.ok(!s.names().includes('publish'), 'the flip is refused before it is attempted');
 });
 
-test('EXIT 5: the gate refuses a TAINTED generation in every mode, including --hotfix', async () => {
+test('EXIT 5: the gate refuses a TAINTED tag in every mode, including --hotfix', async () => {
   const s = fakeSteps();
-  const table = [
-    generationItem({ taintedAt: '2026-08-14T10:00:00.000Z', taintReason: 'healthcheck failed' }),
-    bindingItem('a1'), routingItem('a1'),
-  ];
+  const table = [taintItem(), bindingItem('a1'), routingItem('a1')];
   await assert.rejects(
     () => fleet['fleet deploy'](ctxFor(), { positionals: [], values: { hotfix: true, canary: 'a1' } }, fakeOut(),
-      { doc: fakeDoc(table), steps: s.steps }),
+      { doc: fakeDoc(table), sts: fakeSts(), ecr: fakeEcr(), steps: s.steps }),
     (e) => e.exitCode === EXIT.REFUSED && /TAINTED/.test(e.message),
   );
-  assert.ok(!s.names().includes('releaseSet'));
+  assert.ok(!s.names().includes('publish'));
 });
 
-test('EXIT 5: the gate refuses a generation with a FAILED healthcheck row', async () => {
+test('EXIT 5: the gate refuses a tag with a FAILED healthcheck row', async () => {
   const s = fakeSteps();
-  const table = [generationItem(), bindingItem('a1', { healthcheck: 'failed' }), bindingItem('a2')];
+  const table = [bindingItem('a1', { healthcheck: 'failed' }), bindingItem('a2')];
   await assert.rejects(
     () => fleet['fleet deploy'](ctxFor(), { positionals: [], values: {} }, fakeOut(),
-      { doc: fakeDoc(table), steps: s.steps }),
+      { doc: fakeDoc(table), sts: fakeSts(), ecr: fakeEcr(), steps: s.steps }),
     (e) => e.exitCode === EXIT.REFUSED && /FAILED healthcheck/.test(e.message),
   );
 });
 
 test('there is no force flag: an unknown value cannot turn the refusal off', async () => {
   const s = fakeSteps();
-  const table = [generationItem(), bindingItem('a1', { healthcheck: 'failed' })];
+  const table = [bindingItem('a1', { healthcheck: 'failed' })];
   for (const values of [{ force: true }, { yes: true }, { hotfix: true, canary: 'a1' }]) {
     await assert.rejects(
       () => fleet['fleet deploy'](ctxFor(), { positionals: [], values }, fakeOut(),
-        { doc: fakeDoc([...table, routingItem('a1')]), steps: fakeSteps().steps }),
+        { doc: fakeDoc([...table, routingItem('a1')]), sts: fakeSts(), ecr: fakeEcr(), steps: fakeSteps().steps }),
       (e) => e.exitCode === EXIT.REFUSED,
     );
   }
-  assert.ok(!s.names().includes('releaseSet'));
+  assert.ok(!s.names().includes('publish'));
 });
 
 // ── hotfix ───────────────────────────────────────────────────────────────────────────────────────
 
 test('--hotfix stages ONE canary and flips with mode=hotfix', async () => {
-  const s = fakeSteps({ stage: async () => ({ generationId: GEN, agents: 1, coverage: 1, healthOk: 1, healthFailed: 0 }) });
+  const s = fakeSteps({ stage: async () => ({ tag: TAG, agents: 1, coverage: 1, healthOk: 1, healthFailed: 0 }) });
   const result = await fleet['fleet deploy'](ctxFor(), { positionals: [], values: { hotfix: true } }, fakeOut(),
-    { doc: fakeDoc(healthyTable()), steps: s.steps });
+    { doc: fakeDoc(healthyTable()), sts: fakeSts(), ecr: fakeEcr(), steps: s.steps });
 
   const stage = s.calls.find((c) => c.name === 'stage');
   assert.equal(stage.values.agents, 'a1', 'one canary, deterministic (first in sorted order)');
-  assert.equal(s.calls.find((c) => c.name === 'releaseSet').values.hotfix, true);
+  assert.equal(s.calls.find((c) => c.name === 'publish').values.hotfix, true);
   assert.equal(result.canary, 'a1');
 });
 
@@ -330,16 +346,16 @@ test('--hotfix narrows COVERAGE, never VERIFICATION — the canary is healthchec
   const s = fakeSteps({ stage: async () => { throw tainted; } });
   await assert.rejects(
     () => fleet['fleet deploy'](ctxFor(), { positionals: [], values: { hotfix: true, canary: 'a2' } }, fakeOut(),
-      { doc: fakeDoc(healthyTable()), steps: s.steps }),
+      { doc: fakeDoc(healthyTable()), sts: fakeSts(), ecr: fakeEcr(), steps: s.steps }),
     (e) => e.exitCode === EXIT.TAINTED,
   );
-  assert.ok(!s.names().includes('releaseSet'), '§3.2: the hotfix does not ship, the old generation still serves');
+  assert.ok(!s.names().includes('publish'), '§3.2: the hotfix does not ship, the old generation still serves');
 });
 
 test('--canary must name a real agent', async () => {
   await assert.rejects(
     () => fleet['fleet deploy'](ctxFor(), { positionals: [], values: { hotfix: true, canary: 'nope' } }, fakeOut(),
-      { doc: fakeDoc(healthyTable()), steps: fakeSteps().steps }),
+      { doc: fakeDoc(healthyTable()), sts: fakeSts(), ecr: fakeEcr(), steps: fakeSteps().steps }),
     (e) => e.exitCode === EXIT.USAGE && /no routing entry/.test(e.message),
   );
 });
@@ -347,7 +363,7 @@ test('--canary must name a real agent', async () => {
 test('--canary without --hotfix is a usage error, not a silently ignored flag', async () => {
   await assert.rejects(
     () => fleet['fleet deploy'](ctxFor(), { positionals: [], values: { canary: 'a1' } }, fakeOut(),
-      { doc: fakeDoc(healthyTable()), steps: fakeSteps().steps }),
+      { doc: fakeDoc(healthyTable()), sts: fakeSts(), ecr: fakeEcr(), steps: fakeSteps().steps }),
     (e) => e.exitCode === EXIT.USAGE,
   );
 });
@@ -357,48 +373,38 @@ test('--canary without --hotfix is a usage error, not a silently ignored flag', 
 test('--skip-build skips the build and uses the tag it is given', async () => {
   const s = fakeSteps();
   await fleet['fleet deploy'](ctxFor(), { positionals: [], values: { 'skip-build': true, tag: TAG } }, fakeOut(),
-    { doc: fakeDoc(healthyTable()), steps: s.steps });
+    { doc: fakeDoc(healthyTable()), sts: fakeSts(), ecr: fakeEcr(), steps: s.steps });
   assert.ok(!s.names().includes('build'));
-  assert.equal(s.calls.find((c) => c.name === 'create').values.image, TAG);
+  assert.equal(s.calls.find((c) => c.name === 'stage').values.tag, TAG);
 });
 
 test('--skip-build with no --tag derives the same content tag the build would have', async () => {
   const s = fakeSteps();
   await fleet['fleet deploy'](ctxFor(), { positionals: [], values: { 'skip-build': true } }, fakeOut(),
-    { doc: fakeDoc(healthyTable()), steps: s.steps, digestFor: () => ({ digest: 'abcdef0123456789ff', tag: 'content-abcdef0123456789' }) });
-  assert.equal(s.calls.find((c) => c.name === 'create').values.image, 'content-abcdef0123456789');
+    {
+      // The gate reads bindings for the DERIVED tag, so the table has to hold them under that tag —
+      // otherwise this asserts "unstaged tags are refused", which is a different test.
+      doc: fakeDoc([bindingItem('a1', { image: `203366135563.dkr.ecr.us-east-1.amazonaws.com/${NAME}-agentcore:content-abcdef0123456789` }), routingItem('a1')]),
+      sts: fakeSts(),
+      ecr: fakeEcr(),
+      steps: s.steps,
+      digestFor: () => ({ digest: 'abcdef0123456789ff', tag: 'content-abcdef0123456789' }),
+    });
+  assert.equal(s.calls.find((c) => c.name === 'stage').values.tag, 'content-abcdef0123456789');
 });
 
-test('--generation naming an EXISTING generation resumes it: no build, no create', async () => {
-  const s = fakeSteps();
-  const out = fakeOut();
-  const result = await fleet['fleet deploy'](ctxFor(), { positionals: [], values: { generation: GEN } }, out,
-    { doc: fakeDoc(healthyTable()), steps: s.steps });
-  assert.deepEqual(s.names(), ['gc', 'stage', 'releaseSet'], 'resuming re-stages; it never re-cuts');
-  assert.equal(result.generationId, GEN);
-  assert.match(out.progressLines.join('\n'), /resume/);
-});
-
-test('resuming a generation whose image disagrees with --tag is refused', async () => {
-  await assert.rejects(
-    () => fleet['fleet deploy'](ctxFor(), { positionals: [], values: { generation: GEN, tag: 'content-ffffffffffffffff' } }, fakeOut(),
-      { doc: fakeDoc(healthyTable()), steps: fakeSteps().steps }),
-    (e) => e.exitCode === EXIT.REFUSED && /never rewritten/.test(e.detail),
-  );
-});
-
-test('--generation naming an ABSENT generation cuts one with that id', async () => {
-  // `create` echoes the id it was given, as the real one does.
-  const s = fakeSteps({ create: async (ctx, args) => ({ generationId: args.values.id, image: IMAGE, imageTag: TAG }) });
-  await assert.rejects(
-    () => fleet['fleet deploy'](ctxFor(), { positionals: [], values: { generation: 'gen-new' } }, fakeOut(),
-      { doc: fakeDoc([]), steps: s.steps }),
-    // Nothing is bound to gen-new in the fake table, so the gate refuses — which is the right answer
-    // and, here, proof that the run got as far as the gate with the id the operator named.
-    (e) => e.exitCode === EXIT.REFUSED && /no generation gen-new/.test(e.message),
-  );
-  assert.deepEqual(s.names(), ['gc', 'build', 'create', 'stage']);
-  assert.equal(s.calls.find((c) => c.name === 'create').values.id, 'gen-new');
+test('re-running with an unchanged tree is the resume: the build skips, staging is additive', () => {
+  // `--generation <id>` used to mean "carry on with THAT generation". There is nothing to carry on
+  // with, and nothing was lost: the tag is a content digest of the build's own inputs, so an
+  // unchanged tree derives the SAME tag, finds it in ECR, skips the build and stages over what is
+  // already staged. Resuming is what running it again does.
+  //
+  // Asserted as a property of the digest rather than through the composed command, because that is
+  // where it actually holds: two derivations of the same inputs, one string.
+  const { digestFor, tagFor } = require('../lib/digest');
+  const a = digestFor('agent');
+  const b = digestFor('agent');
+  assert.equal(tagFor(a.digest), tagFor(b.digest));
 });
 
 test('a refusal still publishes the report — a thrown handler returns nothing', async () => {
@@ -406,21 +412,21 @@ test('a refusal still publishes the report — a thrown handler returns nothing'
   const out = fakeOut();
   await assert.rejects(
     () => fleet['fleet deploy'](ctxFor(), { positionals: [], values: {} }, out,
-      { doc: fakeDoc([generationItem(), bindingItem('a1', { healthcheck: 'pending' })]), steps: s.steps }),
+      { doc: fakeDoc([bindingItem('a1', { healthcheck: 'pending' })]), sts: fakeSts(), ecr: fakeEcr(), steps: s.steps }),
     (e) => e.exitCode === EXIT.REFUSED,
   );
   assert.equal(out.answers.length, 1);
-  assert.equal(out.answers[0].generationId, GEN, 'the --json envelope still says what was attempted');
+  assert.equal(out.answers[0].imageTag, TAG, 'the --json envelope still says what was attempted');
 });
 
 // ── dry run ──────────────────────────────────────────────────────────────────────────────────────
 
 test('a dry run stops after staging and never evaluates the gate or the flip', async () => {
-  const s = fakeSteps({ stage: async () => ({ generationId: GEN, wouldStage: [{ agent: 'a1' }], skipped: 0, dryRun: true }) });
+  const s = fakeSteps({ stage: async () => ({ tag: TAG, wouldStage: [{ agent: 'a1' }], skipped: 0, dryRun: true }) });
   const out = fakeOut();
   const result = await fleet['fleet deploy'](ctxFor({ dryRun: true }), { positionals: [], values: {} }, out,
-    { doc: fakeDoc([]), steps: s.steps });
-  assert.deepEqual(s.names(), ['build', 'create', 'stage'], 'a dry run reaps nothing');
+    { doc: fakeDoc([]), sts: fakeSts(), ecr: fakeEcr(), steps: s.steps });
+  assert.deepEqual(s.names(), ['build', 'stage'], 'a dry run reaps nothing');
   assert.equal(result.dryRun, true);
   assert.match(out.progressLines.join('\n'), /gate {8}not evaluated/);
 });
@@ -436,14 +442,14 @@ test('a per-unit gc failure warns and the deploy still proceeds', async () => {
   });
   const out = fakeOut();
   const result = await fleet['fleet deploy'](ctxFor(), { positionals: [], values: {} }, out,
-    { doc: fakeDoc(healthyTable()), steps: s.steps });
+    { doc: fakeDoc(healthyTable()), sts: fakeSts(), ecr: fakeEcr(), steps: s.steps });
 
   // A runtime that would not reap costs quota, not availability — and nothing has been created at
   // this point, so it cannot make the deploy wrong. A forwarded failure would exit 6, which out of
   // this command means "pointer not moved" (§2.19).
   assert.equal(out.failures.length, 0);
   assert.equal(result.gcFailures.length, 1, 'it is still reported, per agent, in the result');
-  assert.ok(s.names().includes('releaseSet'), 'the deploy completed despite the failed reap');
+  assert.ok(s.names().includes('publish'), 'the deploy completed despite the failed reap');
 });
 
 test('a THROWN gc stops the deploy BEFORE anything is created', async () => {
@@ -452,7 +458,7 @@ test('a THROWN gc stops the deploy BEFORE anything is created', async () => {
   });
   await assert.rejects(
     () => fleet['fleet deploy'](ctxFor(), { positionals: [], values: {} }, fakeOut(),
-      { doc: fakeDoc(healthyTable()), steps: s.steps }),
+      { doc: fakeDoc(healthyTable()), sts: fakeSts(), ecr: fakeEcr(), steps: s.steps }),
     (e) => e.exitCode === EXIT.HEADROOM,
   );
   // Deliberately NOT swallowed. 8 means the quota cannot fit what is about to be created, so
@@ -553,21 +559,21 @@ test('an unreadable META leaves an efsRoot difference blocking — an unproven d
 
 test('--fix stages the drifted agents onto the ACTIVE generation', async () => {
   const now = { ...AGENTS, a1: { ...AGENTS.a1, name: 'a1-gen2' } };
-  const s = fakeSteps({ stage: async () => ({ generationId: GEN, agents: 1, coverage: 1, healthOk: 1 }) });
-  const doc = fakeDoc([{ pk: 'CONFIG#release', sk: 'ACTIVE', data: JSON.stringify({ generationId: GEN, mode: 'staged' }) }]);
+  const s = fakeSteps({ stage: async () => ({ tag: TAG, agents: 1, coverage: 1, healthOk: 1 }) });
+  const doc = fakeDoc([{ pk: 'CONFIG#image', sk: 'FLEET', tag: TAG }]);
   const r = await runDrift({ compare: 'b.json', fix: true },
     driftDeps(baselineReport(now), { file: baselineReport(), doc, steps: s.steps }));
   const stage = s.calls.find((c) => c.name === 'stage');
-  assert.equal(stage.values.generation, GEN);
+  assert.equal(stage.values.tag, TAG);
   assert.equal(stage.values.agents, 'a1');
   assert.equal(r.fixed.agents.length, 1);
 });
 
-test('--fix with no release pointer fails rather than guessing a generation', async () => {
+test('--fix with nothing published fails rather than guessing a tag', async () => {
   const now = { ...AGENTS, a1: { ...AGENTS.a1, name: 'a1-gen2' } };
   await assert.rejects(
     () => runDrift({ compare: 'b.json', fix: true }, driftDeps(baselineReport(now), { file: baselineReport() })),
-    (e) => e.exitCode === EXIT.FAILED && /active release pointer/.test(e.message),
+    (e) => e.exitCode === EXIT.FAILED && /active image pointer/.test(e.message),
   );
 });
 

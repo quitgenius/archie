@@ -61,7 +61,7 @@ const FAILING = new Set([FAIL, ERROR]);
 // environment.
 const SUPPORTED_AZ_IDS = ['use1-az1', 'use1-az2', 'use1-az4'];
 
-// every agent in the fleet x 1 runtime = 208 CreateAgentRuntime per generation (plan §8). The account cap is the
+// every agent in the fleet x 1 runtime = 208 CreateAgentRuntime per tag (plan §8). The account cap is the
 // fallback only: the real number is asked for at Service Quotas first.
 const RUNTIME_QUOTA_FALLBACK = 1000;
 const RUNTIME_QUOTA_WARN_FRACTION = 0.75;
@@ -422,10 +422,10 @@ function createWorld(ctx, aws) {
   // Check 4's answer, reused by check 6: the tag to validate is whatever the pointer actually names.
   world.imagePointer = once(async () => {
     const table = ctx.resources.configTable;
-    // CONFIG#release/ACTIVE is the plan's pointer and does not exist yet (primitives §3, "grep
-    // returns zero hits"); CONFIG#image/FLEET is the one the running dispatcher reads today. Both
-    // are accepted so preflight does not start failing the day the CLI migrates the pointer.
-    for (const key of [{ pk: 'CONFIG#release', sk: 'ACTIVE' }, { pk: 'CONFIG#image', sk: 'FLEET' }]) {
+    // ONE pointer: `CONFIG#image / FLEET`, the item the running dispatcher reads on every turn.
+    // This used to accept `CONFIG#release/ACTIVE` as well, "so preflight does not start failing the
+    // day the CLI migrates the pointer" — accepting either is what let the two disagree unnoticed.
+    for (const key of [{ pk: 'CONFIG#image', sk: 'FLEET' }]) {
       // ConsistentRead, matching image-source.js:63-66: a publish followed immediately by a
       // preflight must not read the old value off a stale replica.
       const item = await aws.getItem(table, key, { consistentRead: true });
@@ -508,7 +508,7 @@ const CHECKS = [
 
   {
     n: 4,
-    title: 'release pointer (ConsistentRead)',
+    title: 'image pointer (ConsistentRead)',
     async run(w) {
       const pointer = await w.imagePointer();
       if (!pointer) {
@@ -516,7 +516,7 @@ const CHECKS = [
         // failure mode of NOT saying it is an operator "fixing" a bootstrap by hand.
         return {
           status: FAIL,
-          note: `${w.ctx.resources.configTable} has no usable CONFIG#release/ACTIVE or CONFIG#image/FLEET`,
+          note: `${w.ctx.resources.configTable} has no usable CONFIG#image/FLEET`,
           detail: 'CORRECT on a genuinely empty account: nothing has been published yet, and bootstrap '
             + '(reference §3.4) is what fixes it. On a live account it means every turn fails '
             + 'ImagePointerMissing — there is deliberately no baked fallback (image-source.js:11-15)',

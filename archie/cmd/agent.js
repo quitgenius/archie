@@ -54,7 +54,9 @@ const derivedRole = require('../../slack-dispatcher/derived-role');
 const routingBuild = require('../../slack-dispatcher/routing-build');
 const { createRuntimeRegistry } = require('../../slack-dispatcher/runtime-registry');
 const { efsRootDir, generationRuntimeName } = require('../../slack-dispatcher/agentcore-client');
-const generationCmd = require('./generation');
+const { derivedSpecFor, imageUriFor } = require('../lib/spec');
+const { readFleetPointer, readTaint } = require('../lib/image-pointer');
+const { describeImage } = require('../lib/ecr');
 const { CliError, EXIT, usage, preflight, refused, tainted } = require('../lib/exit');
 const { makeClient } = require('../lib/aws');
 const { basePolicyArnFor } = require('../lib/context');
@@ -87,8 +89,8 @@ const AP_TAG_VALUE = 'agentcore';
 const AP_SETTLE_MS = 4000;
 
 // The lifecycle values `agentcore-provisioning.js:521` HARDCODES into every CreateAgentRuntime. A
-// generation may declare them (`generation create --set maxLifetime=…`), and the saga cannot honour
-// them — so a generation that disagrees is refused rather than provisioned into a runtime that will
+// tag may declare them (`tag create --set maxLifetime=…`), and the saga cannot honour
+// them — so a tag that disagrees is refused rather than provisioned into a runtime that will
 // never match its own declared spec.
 const SAGA_FIXED_SPEC = { idleRuntimeSessionTimeout: 900, maxLifetime: 28800, serverProtocol: 'HTTP' };
 
@@ -160,6 +162,10 @@ function awsClients(ctx, deps) {
     stsCmds,
     secrets: makeClient(ctx, '@aws-sdk/client-secrets-manager', 'SecretsManagerClient'),
     secretsCmds,
+    // `ensure-runtime` asks ECR whether the tag exists before provisioning onto it — the check that
+    // replaced "does a CONFIG#tag item exist", and a stronger one: an item proves someone
+    // wrote something down, an image proves a runtime can pull.
+    ecr: makeClient(ctx, '@aws-sdk/client-ecr', 'ECRClient'),
   };
 }
 
@@ -175,7 +181,7 @@ function awsClients(ctx, deps) {
  * The BASE POLICY ARN used to be on that fallback list, described as honest. It was not: the
  * dispatcher's default is a bare `agentcore-base`, which does not exist in an archie account, so
  * every `ensure-role`/`ensure-runtime` here would have failed closed on NoSuchEntityException —
- * the failure `generation stage` actually hit during the first sandbox rehearsal.
+ * the failure `fleet stage` actually hit during the first sandbox rehearsal.
  *
  * Constructing the client does not construct any SDK client (they are lazy), so this is free for the
  * commands that only want `client.config`.
@@ -365,11 +371,11 @@ async function ensureRole(ctx, args, out, deps) {
   const secretBase = applyConnectorSecretEnv(ctx, deps);
 
   // Accepted for symmetry with the saga and REPORTED, but it changes nothing: the role is
-  // `role/agentcore/<agent>`, a pure function of the agent id and not of its caps or its generation
-  // (derived-role.js:225-231). There is no tier to cross, so no generation can require a different
+  // `role/agentcore/<agent>`, a pure function of the agent id and not of its caps or its tag
+  // (derived-role.js:225-231). There is no tier to cross, so no tag can require a different
   // role — saying so beats letting an operator believe the flag did something.
-  const generation = args.values.generation || null;
-  if (generation) out.verbose(`--generation ${generation} noted; the derived role is a pure function of the agent id, so it does not vary by generation`);
+  const tag = args.values.tag || args.values.generation || null;
+  if (tag) out.verbose(`--tag ${tag} noted; the derived role is a pure function of the agent id, so it does not vary by tag`);
 
   const { derivedRoleName, AGENTCORE_ROLE_PATH } = await deps.modules.deriveExecRole();
   const roleName = derivedRoleName(agent);
@@ -398,7 +404,7 @@ async function ensureRole(ctx, args, out, deps) {
     out.progress('would CreateRole (never GetRole first), then AttachRolePolicy + PutRolePolicy `grants`');
     return {
       dryRun: true, agent, roleName, path: AGENTCORE_ROLE_PATH, account, caps,
-      baseManagedPolicyArn: config.baseManagedPolicyArn, credentialSecretBase: secretBase, generation,
+      baseManagedPolicyArn: config.baseManagedPolicyArn, credentialSecretBase: secretBase, tag,
     };
   }
 
@@ -413,7 +419,7 @@ async function ensureRole(ctx, args, out, deps) {
   }
   return {
     agent, roleName: r.roleName, roleArn: r.roleArn, created: r.created === true, caps, account,
-    credentialSecretBase: secretBase, generation,
+    credentialSecretBase: secretBase, tag,
   };
 }
 
@@ -757,7 +763,7 @@ async function seedWorkspace(ctx, args, out, deps) {
  * CreateAgentRuntime → poll READY (agentcore-provisioning.js:567).
  *
  * IT DOES NOT HEALTHCHECK. A READY runtime is a control-plane assertion, not a serving one — that is
- * `generation healthcheck` (§2.9, W2-A) and, composed, `generation stage`.
+ * `fleet healthcheck` (§2.9, W2-A) and, composed, `fleet stage`.
  *
  * Everything the saga refuses to do it refuses INSIDE, and that is why this calls it rather than
  * re-issuing the steps: `allSettled` on the parallel legs so a rejection cannot leave an access point
@@ -765,7 +771,7 @@ async function seedWorkspace(ctx, args, out, deps) {
  * malformed input AND a not-yet-assumable role (:159-163); the IAM propagation deadline for a
  * newly-minted role (:285-296); the 140-attempt READY budget ≈ 369s (:553); the name grammar
  * `[a-zA-Z0-9_]`, max 48, suffix budget reserved FIRST so a long id truncates rather than colliding
- * with a sibling generation of itself (agentcore-client.js:226-233).
+ * with a sibling tag of itself (agentcore-client.js:226-233).
  *
  * WHAT IS OURS: the binding row. The saga returns an ARN and records nothing, so this writes
  * `RUNTIME#<agent>/GEN#<name>` through the registry — otherwise the runtime exists at AWS and is
@@ -776,49 +782,49 @@ async function ensureRuntime(ctx, args, out, deps) {
   const agent = agentIdOf(args);
   const clients = awsClients(ctx, deps);
   const account = await resolveAccount(ctx, clients);
-  const { generationId, spec } = await resolveGeneration(ctx, clients, args, out, deps);
+  const { tag, imageUri } = await resolveTag(ctx, clients, args, out, deps, account);
 
-  // The per-agent spec the generation IMPLIES, from the STORED template rather than from today's
-  // environment — that is the whole point of a generation (cmd/generation.js:467-488). The runtime
-  // NAME is the fingerprint of exactly this object, so the name and the content cannot disagree.
-  const declared = generationCmd.derivedSpecFor(spec, agent, deps);
+  // The per-agent spec THIS DEPLOYMENT derives — the dispatcher's own `runtimeSpecFor`, so the name
+  // computed here is the name the dispatcher computes on the agent's next turn. The runtime NAME is
+  // the fingerprint of exactly this object, so the name and the content cannot disagree.
+  // agent.js has its OWN client seam (`deps.modules.agentcore`), used by every other command in
+  // this file; lib/spec's `dispatcherClientFor` has a different one. Using this one keeps a single
+  // injection point per file rather than two that must both be stubbed.
+  const specClient = deps.specClient || dispatcherClient(ctx, account, deps, {});
+  const declared = derivedSpecFor(specClient, agent, imageUri);
   const runtimeName = generationRuntimeName(agent, declared);
 
-  // The saga hardcodes lifecycle and protocol (agentcore-provisioning.js:521). A generation may
-  // declare otherwise, and provisioning it would produce a runtime that can never match its own
-  // declared spec — a permanent `generation verify` drift with no way to fix it from here.
+  // The saga hardcodes lifecycle and protocol (agentcore-provisioning.js:521). If the derived spec
+  // ever disagrees, provisioning would produce a runtime that can never match its own spec — a
+  // permanent `fleet verify` drift with no way to fix it from here.
   const unsupported = Object.entries(SAGA_FIXED_SPEC)
     .filter(([k, v]) => declared[k] !== undefined && declared[k] !== v)
     .map(([k, v]) => `${k}=${declared[k]} (CreateAgentRuntime is always given ${v})`);
   if (unsupported.length) {
-    throw refused(`generation ${generationId} declares values the provisioning saga cannot apply`, {
+    throw refused('the derived spec declares values the provisioning saga cannot apply', {
       detail: `${unsupported.join(', ')} — agentcore-provisioning.js:521 hardcodes them. Provisioning would `
-        + 'produce a runtime that never matches this generation, i.e. permanent drift.',
+        + 'produce a runtime that never matches its own spec, i.e. permanent drift.',
     });
   }
 
-  const client = dispatcherClient(ctx, account, deps, {
-    // The fleet-level fields a generation freezes. Passed through CONFIG (not post-hoc onto the spec)
-    // so everything derived from them moves too — notably runtimeEnv's `EFS_DIR: efsMountPath`.
-    ...(spec.efsRootPrefix ? { efsRootPrefix: spec.efsRootPrefix } : {}),
-    ...(spec.efsMountPath ? { efsMountPath: spec.efsMountPath } : {}),
-    ...(spec.securityGroupId ? { securityGroupId: spec.securityGroupId } : {}),
-  });
+  // No per-field overrides: the spec above was derived from THIS deployment's client, so overriding
+  // the very fields it derived from would be circular. A tag used to freeze them, which is
+  // what these three lines carried; the deployment is now the only source.
+  const client = dispatcherClient(ctx, account, deps, {});
 
-  out.progress(`${agent} → generation ${generationId}: runtime ${runtimeName} on ${declared.image}`);
+  out.progress(`${agent} → ${tag}: runtime ${runtimeName} on ${declared.image}`);
   if (ctx.dryRun) {
     out.progress('would run the saga: role → (mount targets ∥ access point ∥ connector) → CreateAgentRuntime → poll READY');
     out.progress(`then record RUNTIME#${agent}/GEN#${runtimeName}`);
-    return { dryRun: true, agent, generation: generationId, runtimeName, image: declared.image, spec: declared };
+    return { dryRun: true, agent, tag, runtimeName, image: declared.image, spec: declared };
   }
 
   const env = await client.ensureAgentEnvironment(agent, {
     runtimeName,
     image: declared.image,
-    // The DECLARED environment, verbatim. `ensureAgentEnvironment` would otherwise recompute it from
-    // the dispatcher's own config (agentcore-client.js:861), which is the coupling generations exist
-    // to remove — a runtime provisioned from a generation must carry that generation's env, not this
-    // laptop's.
+    // The DERIVED environment, verbatim — passed rather than left to `ensureAgentEnvironment`'s own
+    // recomputation (agentcore-client.js:861) so the env that lands on the runtime is exactly the env
+    // whose fingerprint became its name. Those must not be two computations.
     envs: declared.envs,
     logger: loggerFor(out),
   });
@@ -832,7 +838,7 @@ async function ensureRuntime(ctx, args, out, deps) {
 
   return {
     agent,
-    generation: generationId,
+    tag,
     runtimeName,
     runtimeArn: env.runtimeArn,
     runtimeId,
@@ -845,55 +851,51 @@ async function ensureRuntime(ctx, args, out, deps) {
 }
 
 /**
- * Which generation to provision, and its stored template.
+ * Which tag to provision, and its stored template.
  *
- * `--generation` is how §2.22 spells this command. The release pointer is accepted as a fallback
+ * `--tag` is how §2.22 spells this command. The image pointer is accepted as a fallback
  * because "provision this agent onto whatever is live" is the repair an operator actually types after
  * a straggler — but it is announced, never silent, and its absence is a usage error rather than a
  * guess. Phase 1 runs against today's structures (plan §12 step 1), where `CONFIG#release` may not
  * exist yet.
  */
-async function resolveGeneration(ctx, clients, args, out, deps) {
-  const aws = { doc: () => clients.doc };
-  let generationId = args.values.generation || null;
-  if (!generationId) {
-    const release = await getItem(clients, ctx.resources.configTable, generationCmd.RELEASE_KEY);
-    const body = generationCmd.readBody(release);
-    generationId = (body && body.generationId) || null;
-    if (!generationId) {
-      throw usage('--generation <id> is required', {
-        detail: 'There is no CONFIG#release/ACTIVE pointer to fall back to — `archie generation list` shows '
-          + 'what exists.',
+async function resolveTag(ctx, clients, args, out, deps, account) {
+  const docCmds = require('@aws-sdk/lib-dynamodb');
+  const aws = { doc: () => clients.doc, ecr: () => clients.ecr };
+  let tag = args.values.tag || args.values.generation || null;
+  if (!tag) {
+    const published = await readFleetPointer(clients.doc, docCmds, ctx.resources.configTable);
+    tag = (published && published.tag) || null;
+    if (!tag) {
+      throw usage('--tag <tag> is required', {
+        detail: 'Nothing is published to fall back to — `archie image list` shows what exists.',
       });
     }
-    out.progress(`--generation not given; using the ACTIVE release pointer (${generationId})`);
+    out.progress(`--tag not given; using the published tag (${tag})`);
   }
-  const item = await generationCmd.readGeneration(aws, ctx, generationId);
-  if (!item) {
-    throw new CliError(`no generation ${generationId}`, {
-      code: EXIT.FAILED,
-      detail: `CONFIG#generation / ${generationId} is not in ${ctx.resources.configTable} — \`archie generation list\` shows what is`,
-    });
-  }
-  const body = generationCmd.readBody(item);
-  const spec = body && body.spec;
-  if (!spec || !spec.image) {
+
+  const imageUri = imageUriFor(ctx, account, tag);
+  const found = await describeImage(aws, { account, repo: ctx.resources.agentRepo, tag });
+  if (!found) {
     // The no-baked-fallback rule (§5.7): a floor "sounds like resilience and behaves like a silent
-    // downgrade". A generation with no image is a fault, not a reason to guess.
-    throw new CliError(`generation ${generationId} declares no image`, {
+    // downgrade". A tag that is not in ECR is a fault, not a reason to guess.
+    throw new CliError(`no image ${tag}`, {
       code: EXIT.FAILED,
-      detail: 'There is deliberately no fallback image anywhere in this system (image-source.js:11-15).',
+      detail: `${imageUri} is not in ECR. There is deliberately no fallback image anywhere in this `
+        + 'system (image-source.js:11-15).',
     });
   }
-  if (body.taintedAt) {
-    // Exit 4, not 5. The pair that matters (§1.5): 4 means STOP — the generation can never ship and
+
+  const taint = await readTaint(clients.doc, docCmds, ctx.resources.configTable, tag);
+  if (taint) {
+    // Exit 4, not 5. The pair that matters (§1.5): 4 means STOP — the tag can never ship and
     // re-running is wasted time — while 5 is "I refused, here is the flag". There is no flag here.
-    throw tainted(`generation ${generationId} is TAINTED (${body.taintReason || 'no reason recorded'})`, {
-      detail: 'Taint is permanent and unconditional (§5.2) — a tainted generation can never be pointed at, '
-        + 'so provisioning agents onto it only burns runtimes against the 1000-runtime cap.',
+    throw tainted(`${tag} is TAINTED (${taint.reason || 'no reason recorded'})`, {
+      detail: 'Taint is permanent and unconditional (§5.2) — a tainted tag can never be published, so '
+        + 'provisioning agents onto it only burns runtimes against the 1000-runtime cap.',
     });
   }
-  return { generationId, spec };
+  return { tag, imageUri };
 }
 
 // ── §2.22 `archie agent migrate` ─────────────────────────────────────────────────────────────────
@@ -909,7 +911,7 @@ async function resolveGeneration(ctx, clients, args, out, deps) {
  *   `config hydrate`, phase 3 IS `cron hydrate`, and both are called here as such, so their refusals
  *   (the floating-ref warning, the one-time-at-flip cron marker) apply unchanged.
  *
- *   Phase 2's in-process `agentCore.ensureRuntime` (:73) BECOMES `generation stage` (§2.22). Staging
+ *   Phase 2's in-process `agentCore.ensureRuntime` (:73) BECOMES `fleet stage` (§2.22). Staging
  *   is W1-D and adds healthcheck + binding on top of provisioning; until it lands this drives
  *   `ensure-runtime` per agent at the same concurrency, which is the provisioning half of it and
  *   nothing else. It does NOT healthcheck, and it says so.
@@ -939,14 +941,13 @@ async function migrate(ctx, args, out, deps) {
     out.progress(`runtimes: ensuring ${agents.length} runtime(s) at concurrency ${MIGRATE_CONCURRENCY} — `
       + 'bounded by EFS CreateAccessPoint, which is clean at 40 concurrent and fails outright once the '
       + 'bucket drains (agentcore-client.js:1072-1079), not by AgentCore');
-    out.progress('this provisions only; READY is not serving. `archie generation stage` (W1-D) is the '
+    out.progress('this provisions only; READY is not serving. `archie fleet stage` is the '
       + 'healthchecked, binding form of this phase and supersedes it.');
-    // `agent migrate` declares no `--generation` in the registry (lib/registry.js), so this is
-    // normally undefined and every agent lands on the ACTIVE release pointer — which is what
-    // migrating a fleet means. The pass-through is here so that declaring the flag is a one-line
-    // change in the registry rather than a change here as well.
+    // Normally no `--tag`, so every agent lands on the PUBLISHED one — which is what migrating a
+    // fleet means. The pass-through is here so that declaring the flag is a one-line change in the
+    // registry rather than a change here as well.
     const runs = await pool(agents, MIGRATE_CONCURRENCY, (agent) => (
-      ensureRuntime(ctx, { positionals: [agent], values: { generation: args.values.generation } }, out, deps)
+      ensureRuntime(ctx, { positionals: [agent], values: { tag: args.values.tag || args.values.generation } }, out, deps)
     ));
     const ok = [];
     runs.forEach((r, i) => {
@@ -1059,7 +1060,7 @@ async function rekey(ctx, args, out, deps) {
     // provisioned, and its derived role (`role/agentcore/<id>`) is a different role that does not
     // exist yet. Both are repaired by the next stage/ensure-runtime — but only if someone knows.
     out.warn(`${r.scopeId} has no runtime binding and no derived IAM role yet: both are keyed by agent id. `
-      + `Run \`archie agent ensure-runtime ${r.scopeId} --generation <id>\` (or stage the fleet) before its `
+      + `Run \`archie agent ensure-runtime ${r.scopeId} --tag <tag>\` (or stage the fleet) before its `
       + 'next turn, or that turn fails closed.');
   }
   return { agent, ...r };

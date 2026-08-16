@@ -201,7 +201,7 @@ async function findImage(ecr, repositoryName, tag) {
  *
  * Only asserted when --account is given; the value it protects is stated at dispatcher.tf:76-82 —
  * a dispatcher pointed at the wrong account "provisions runtimes onto ANOTHER STACK's file system
- * and security group, reads its secrets, and its generation GC can delete that stack's runtimes".
+ * and security group, reads its secrets, and its tag GC can delete that stack's runtimes".
  */
 async function callerAccount(sts, ctx) {
   let account;

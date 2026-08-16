@@ -1,15 +1,22 @@
 'use strict';
 
-// `archie generation stage` — RUNTIME-CLI-REFERENCE.md §2.8, plan §6 step 3 and §7.
+// `archie fleet stage` — RUNTIME-CLI-REFERENCE.md §2.8, plan §6 step 3 and §7.
 //
 // WHAT THIS COMMAND IS. The only thing that creates runtimes. Per agent: derive the per-agent spec
-// from the STORED generation, run the provisioning saga (role → mount targets ∥ access point ∥
-// Connector → CreateAgentRuntime → poll READY), run a real warm-up invoke, read `GetAgentRuntime`
-// back and assert the observed runtime IS what the generation declared, and only then write the
-// `RUNTIME#<agent> / GEN#<generationId>` binding. Nothing here moves traffic: the release pointer is
-// `release set`'s alone (W2-B), and this file never writes `CONFIG#release` in any mode.
+// from THIS DEPLOYMENT (the dispatcher's own `runtimeSpecFor`), run the provisioning saga (role →
+// mount targets ∥ access point ∥ Connector → CreateAgentRuntime → poll READY), run a real warm-up
+// invoke, read `GetAgentRuntime` back and assert the observed runtime IS what that spec declared,
+// and only then write the `RUNTIME#<agent> / GEN#<runtimeName>` binding. Nothing here moves traffic:
+// the image pointer is `image publish`'s alone.
 //
-// REUSE, NOT REIMPLEMENTATION — the same rule cmd/generation.js follows, for a sharper reason here.
+// THE BINDING IS THE POINT. The sort key is the runtime NAME, which is a fingerprint of the whole
+// derived spec — the same string the dispatcher derives, from the same code, on the agent's next
+// turn. So a row written here is a registry HIT rather than a create that collides and adopts. Get
+// that key wrong and staging still "succeeds", loudly and visibly, while doing nothing at all: it
+// did, for one day, and the cost was a wasted CreateAgentRuntime plus a full ListAgentRuntimes scan
+// per agent per release (see writeBinding).
+//
+// REUSE, NOT REIMPLEMENTATION — the rule this whole CLI follows, for a sharper reason here.
 // A provisioning CLI existed in this repo once (`provision.ts`) and was DELETED, because having one
 // was how test and production behaviour drifted apart (plan §5, "where the primitives live"). The
 // saga is `agentcore-provisioning.js:567` and the injection contract that lets an external caller
@@ -38,7 +45,7 @@
 //     absence is loud in the output, lands as `healthcheck: 'pending'` on the binding, and records a
 //     per-unit failure so the run exits 6 (re-run) rather than 0. A binding written `ok` without a
 //     healthcheck is a false gate — precisely what the plan's hard control limit exists to prevent
-//     (§5.1), since `release set` trusts this field.
+//     (§5.1), since `image publish` trusts this field.
 //
 //  4. `agent` AND `data` ARE DYNAMODB RESERVED WORDS. Unaliased, `agent` broke every turn for every
 //     agent live on 2026-08-13 (`runtime-registry.js:134-138`), and unit tests cannot catch it: they
@@ -46,9 +53,10 @@
 //     (`registry-e2e.js:5-15`). Every attribute name in every expression below is aliased, without
 //     exception; the test file asserts that structurally, and an e2e is the real gate.
 
-const {
-  readGeneration, readBody, scanBindings, derivedSpecFor, canonicalGeneration, GENERATION_PK,
-} = require('./generation');
+const { scanBindings, tagOf } = require('../lib/bindings');
+const { derivedSpecFor, specDigestFor, imageUriFor } = require('../lib/spec');
+const { describeImage, assertArm64 } = require('../lib/ecr');
+const { readTaint, taintTag } = require('../lib/image-pointer');
 const { diffObserved } = require('../../slack-dispatcher/spec-diff');
 const { collectFromDdb } = require('../../slack-dispatcher/routing-build');
 const { pkFor: bindingPkFor, skFor: bindingSkFor } = require('../../slack-dispatcher/runtime-registry');
@@ -106,18 +114,19 @@ function classifyHeadroom(err) {
 
 /**
  * Lazily-constructed AWS clients, every one injectable, so `node --test` touches neither credentials
- * nor the network. Shaped as `{ doc() }` because cmd/generation.js's exported readers take exactly
+ * nor the network. Shaped as `{ doc() }` because cmd/tag.js's exported readers take exactly
  * this object (`readGeneration(aws, ctx, id)`, `scanBindings(aws, ctx)`).
  */
 function clientsFor(ctx, deps = {}) {
   // `--profile` also has to reach the clients the DISPATCHER'S client constructs for itself
   // (`agentcore-client.js:346-364` builds its own control/EFS/IAM clients from the default
   // credential chain — there is no credentials seam to inject). AWS_PROFILE is the only channel that
-  // reaches those. Same reasoning, same line, as cmd/generation.js's clientsFor.
+  // reaches those. Same reasoning, same line, as cmd/tag.js's clientsFor.
   if (ctx.profile && process.env.AWS_PROFILE !== ctx.profile) process.env.AWS_PROFILE = ctx.profile;
 
   let doc = deps.doc || null;
   let sts = deps.sts || null;
+  let ecr = deps.ecr || null;
   return {
     doc() {
       if (!doc) {
@@ -130,6 +139,12 @@ function clientsFor(ctx, deps = {}) {
       if (!sts) sts = makeClient(ctx, '@aws-sdk/client-sts', 'STSClient');
       return sts;
     },
+    // Staging asks ECR whether the tag exists and is arm64 before it provisions 208 runtimes that
+    // could not pull it.
+    ecr() {
+      if (!ecr) ecr = makeClient(ctx, '@aws-sdk/client-ecr', 'ECRClient');
+      return ecr;
+    },
   };
 }
 
@@ -137,9 +152,9 @@ function clientsFor(ctx, deps = {}) {
  * The account the CLI is operating on. `--account` is an ASSERTION (§1.2), so it is checked against
  * the caller rather than trusted.
  *
- * NOTE: identical to cmd/generation.js's private `resolveAccount`. Duplicated rather than exported,
- * because W1-C owns that file and this one owns only itself; when W2-B lands, both belong in a
- * shared `lib/`.
+ * NOTE: `lib/spec.js` now owns the shared copy (the duplication note here said it belonged there
+ * "when W2-B lands"; it has). Kept local only until the stage/fleet merge lands, so this change stays
+ * a rename of identity rather than a reshuffle of files.
  */
 async function resolveAccount(ctx, aws) {
   const { GetCallerIdentityCommand } = require('@aws-sdk/client-sts');
@@ -156,10 +171,10 @@ async function resolveAccount(ctx, aws) {
 /**
  * The dispatcher's AgentCore client, configured FROM THE STORED GENERATION — not from `process.env`.
  *
- * That is the whole point of a generation: `runtimeSpecFor` runs off the dispatcher's environment
+ * That is the whole point of a tag: `runtimeSpecFor` runs off the dispatcher's environment
  * (`agentcore-client.js:904-915`), so a client built from today's environment would provision
  * whatever the currently-deployed task definition happens to say and then "verify" it against the
- * generation. Every fleet field the generation declares is pushed in as an override, and the
+ * tag. Every fleet field the tag declares is pushed in as an override, and the
  * per-agent environment is passed per call (`envs`) rather than letting `runtimeEnv()` recompute it.
  */
 function dispatcherClientFor(ctx, account, spec, deps = {}) {
@@ -201,10 +216,10 @@ function runtimeNameFn(deps = {}) {
 /**
  * THE SEAM, and why it defaults to throwing.
  *
- * The warm-up invoke is `archie generation healthcheck` — task W2-A, `cmd/healthcheck.js`, not yet
+ * The warm-up invoke is `archie fleet healthcheck` — task W2-A, `cmd/healthcheck.js`, not yet
  * written. Staging cannot wait for it (the provisioning half is what unblocks everything else), and
  * it equally cannot pretend: a binding written `healthcheck: 'ok'` without an invoke having happened
- * is a FALSE GATE, and `release set` reads exactly that field to enforce the plan's hard control
+ * is a FALSE GATE, and `image publish` reads exactly that field to enforce the plan's hard control
  * limit (§5.1). So the default implementation throws, the caller records `healthcheck: 'pending'`,
  * and the run cannot exit 0.
  *
@@ -214,7 +229,7 @@ function runtimeNameFn(deps = {}) {
  *                          budgetSeconds, ctx, out }) -> { ok: true, attempts, ms }
  *
  * Resolving is a PASS. Throwing (or resolving `{ ok: false }`) is a FAILURE and taints the
- * generation — including the shape that must not be mistaken for a pass: a turn emitting an `error`
+ * tag — including the shape that must not be mistaken for a pass: a turn emitting an `error`
  * event and then `final {text:''}` is a failure, which is what silently reset `consecutiveErrors`
  * for a cron job on 2026-08-12 (`agentcore-client.js:1309-1314`). `sessionId` is the isolated
  * session key from plan §7 (`prewarm:<agent>:<generationId>`), so the synthetic turn gets its own
@@ -275,7 +290,7 @@ function parseBudget(ctx, value) {
     if (seconds < DEFAULT_HEALTHCHECK_BUDGET_SECONDS) {
       // REFUSED, not warned. §2.8: "Raise, never lower". The first failure means nothing (§6.2), a
       // healthcheck failure taints, and taint is permanent and unconditional with no untaint and no
-      // force flag (§5.2) — so a lowered budget does not cost a re-run, it costs the generation.
+      // force flag (§5.2) — so a lowered budget does not cost a re-run, it costs the tag.
       throw refused(`--healthcheck-budget ${seconds}s is below the ${DEFAULT_HEALTHCHECK_BUDGET_SECONDS}s floor`, {
         detail: 'READY is not serving-ready: a shell ~1s after READY got HTTP 500 and served ~15s later, and '
           + 'cold boot to first serve can reach ~90s. Lowering this converts platform variance into false '
@@ -333,17 +348,17 @@ async function enumerateAgents(aws, ctx, values, deps = {}) {
 /**
  * Which agents still need staging — PURE, so the re-runnability rule is testable without AWS.
  *
- * SKIP means: this agent already has a binding for THIS generation that is both healthy
+ * SKIP means: this agent already has a binding for THIS tag that is both healthy
  * (`healthcheck === 'ok'`) and live (an `arn` is present). Anything else is re-staged, and the saga
  * is idempotent — it adopts an existing runtime by name rather than duplicating it
  * (`agentcore-provisioning.js:448-470`). A row whose arn was REMOVEd is history, not a binding: the
  * reaper strips the arn precisely so a rollback does not "invoke a corpse"
  * (`runtime-registry.js:30-37`), so it must re-provision.
  */
-function planStage(agents, bindings, generationId) {
+function planStage(agents, bindings, tag) {
   const byAgent = new Map();
   for (const b of bindings) {
-    if (b.generationId !== generationId) continue;
+    if (tagOf(b) !== tag) continue;
     byAgent.set(b.agent, b);
   }
   const todo = [];
@@ -403,7 +418,7 @@ function updateFor({ table, key, set, remove = [], createdAtFrom = null }) {
     sets.push(`#${attr} = :${attr}`);
   }
   if (createdAtFrom) {
-    // The ORIGINAL creation time survives a re-stage of the same generation, so the row reads as
+    // The ORIGINAL creation time survives a re-stage of the same tag, so the row reads as
     // history rather than as new (`runtime-registry.js:120-124`).
     names['#createdAt'] = 'createdAt';
     sets.push(`#createdAt = if_not_exists(#createdAt, :${createdAtFrom})`);
@@ -428,31 +443,43 @@ function updateFor({ table, key, set, remove = [], createdAtFrom = null }) {
 }
 
 /**
- * THE BINDING — one item per agent per generation (plan §3).
+ * THE BINDING — one item per agent per runtime.
  *
- *   pk: 'RUNTIME#<agent>'          sk: 'GEN#<generationId>'
- *   { agent, generationId, runtimeName, arn, runtimeId, image, accessPointArn, roleArn,
+ *   pk: 'RUNTIME#<agent>'          sk: 'GEN#<runtimeName>'
+ *   { agent, runtimeName, arn, runtimeId, image, accessPointArn, roleArn,
  *     agentSpecDigest, healthcheck: 'ok'|'failed'|'pending', stagedAt, verifiedAt,
  *     createdAt, updatedAt }
  *
- * BOTH the sort key AND explicit `generationId`/`runtimeName` attributes, deliberately. The sort key
- * is moving from `GEN#<runtimeName>` (today's fingerprint-keyed registry, `runtime-registry.js:43`)
- * to `GEN#<generationId>` (plan §3 / §12 step 3), and `scanBindings` reads the explicit attributes in
- * preference to the key (`cmd/generation.js:596-603`). Writing both means a half-migrated table reads
- * correctly from either side, and neither the rename nor its rollback needs a backfill.
+ * TWO IDENTITIES, KEPT APART. The sort key is the RUNTIME NAME — a fingerprint of the derived spec,
+ * which is what identifies a runtime at AWS and what the dispatcher does its single GetItem on. The
+ * RELEASE this binding belongs to is the tag its `image` names. Those answer different questions,
+ * and a tag id conflated them: it was neither, so both halves had to be recovered from it.
  *
- * `healthcheck` is the field `release set` gates on, and `arn` is the liveness claim the reaper
- * REMOVEs — so a re-stage of a previously reaped generation must clear `reapedAt`/`clearedAt`, or the
+ * For one day (2026-08-15/16) the key was `GEN#<generationId>`, and the writer filed every
+ * pre-warmed runtime under a key the reader does not consult. Nothing errored. Every agent's first
+ * turn of every release missed, issued CreateAgentRuntime, took the ConflictException and paid the
+ * adopt path's full ListAgentRuntimes scan — ~208 of them on a fleet roll — and `healthcheck: ok`
+ * sat on a row the turn path never read.
+ *
+ * `healthcheck` is the field `image publish` gates on, and `arn` is the liveness claim the reaper
+ * REMOVEs — so a re-stage of a previously reaped runtime must clear `reapedAt`/`clearedAt`, or the
  * row would advertise a live runtime and a reaping in the same breath.
  */
 async function writeBinding(aws, ctx, b) {
   const { UpdateCommand } = require('@aws-sdk/lib-dynamodb');
   await aws.doc().send(new UpdateCommand(updateFor({
     table: ctx.resources.configTable,
-    key: { pk: bindingPkFor(b.agent), sk: bindingSkFor(b.generationId) },
+    // THE SORT KEY IS THE RUNTIME NAME — the same string the dispatcher derives and does its single
+    // GetItem on. This is the whole point of staging: a row written here is a registry HIT on the
+    // agent's next turn instead of a create that collides, takes ConflictException and adopts.
+    //
+    // It was `GEN#<generationId>` for one day (2026-08-15/16) and that was the bug: the writer filed
+    // the pre-warmed runtime under a key the reader does not consult, so every agent's first turn of
+    // every release paid a wasted CreateAgentRuntime and a full ListAgentRuntimes scan — ~208 of them
+    // on a full fleet roll — and `healthcheck: ok` sat on a row the turn path never read.
+    key: { pk: bindingPkFor(b.agent), sk: bindingSkFor(b.runtimeName) },
     set: {
       agent: b.agent,
-      generationId: b.generationId,
       runtimeName: b.runtimeName,
       arn: b.arn,
       runtimeId: b.runtimeId,
@@ -473,25 +500,18 @@ async function writeBinding(aws, ctx, b) {
 }
 
 /**
- * Taint the generation. Recorded ON THE ITEM, not held in a process, so the decision survives an
+ * Taint the tag. Recorded ON THE ITEM, not held in a process, so the decision survives an
  * operator retrying in a different shell — the specific failure the rail exists to prevent (§5.2).
  *
  * `if_not_exists` on all three fields so the FIRST failure is the recorded reason: a later agent
  * failing for an unrelated reason must not overwrite the diagnosis. The mutable taint attributes ride
- * TOP-LEVEL rather than inside `data`, because a generation's body is written once and never
+ * TOP-LEVEL rather than inside `data`, because a tag's body is written once and never
  * rewritten — that is what lets `specDigest` be recomputed from the stored bytes
- * (`cmd/generation.js:757-771`).
+ * (`cmd/tag.js:757-771`).
  */
-async function taintGeneration(aws, ctx, generationId, { reason, by, at }) {
-  const { UpdateCommand } = require('@aws-sdk/lib-dynamodb');
-  await aws.doc().send(new UpdateCommand({
-    TableName: ctx.resources.configTable,
-    Key: { pk: GENERATION_PK, sk: generationId },
-    UpdateExpression: 'SET #taintedAt = if_not_exists(#taintedAt, :at), '
-      + '#taintReason = if_not_exists(#taintReason, :reason), #taintedBy = if_not_exists(#taintedBy, :by)',
-    ExpressionAttributeNames: { '#taintedAt': 'taintedAt', '#taintReason': 'taintReason', '#taintedBy': 'taintedBy' },
-    ExpressionAttributeValues: { ':at': at, ':reason': reason, ':by': by },
-  }));
+async function taintGeneration(aws, ctx, tag, { reason, by, at }) {
+  const docCmds = require('@aws-sdk/lib-dynamodb');
+  await taintTag(aws.doc(), docCmds, ctx.resources.configTable, tag, { reason, by, at });
 }
 
 /** Who ran this. Attribution only — nothing authorises on it. */
@@ -513,7 +533,7 @@ const nowIso = (deps) => new Date(deps.now ? deps.now() : Date.now()).toISOStrin
  *
  * §8.10 rekey: a scope-keyed agent (`dm-u0…`) carries `META.efsRoot` = its FORMER name, and the saga
  * mounts THAT directory so the rekeyed agent keeps its workspace, memory and sessions
- * (`agentcore-client.js:621-630, 862-868`). The generation's declared spec cannot know that — it
+ * (`agentcore-client.js:621-630, 862-868`). The tag's declared spec cannot know that — it
  * derives `efsRootDir(agent, prefix)` — so the read-back would report a phantom `efsRoot` change for
  * every rekeyed agent and fail them all. Read the SAME META item the dispatcher reads, and only when
  * the read-back actually disagreed about `efsRoot`: proving the difference is an adopted legacy root
@@ -538,7 +558,7 @@ async function legacyEfsRootOf(aws, ctx, agent) {
 }
 
 /**
- * Assert the runtime AWS actually created is the one the generation declared.
+ * Assert the runtime AWS actually created is the one the tag declared.
  *
  * Both sides are the dispatcher's own — `observedSpecOf` (`agentcore-client.js:476`) and
  * `diffObserved` (`spec-diff.js:26`) — so they are shaped by the same code that shapes them at
@@ -549,7 +569,7 @@ async function legacyEfsRootOf(aws, ctx, agent) {
  * `fingerprint-algorithm` is filtered: `specDiff` returns it INSTEAD of an empty array because its
  * usual caller only diffs when the runtime name already changed, so "no field differs" means the hash
  * moved. Here it is precisely what a clean read-back looks like — treating it as a difference would
- * invert the result for every healthy agent (`cmd/generation.js:1074-1081`).
+ * invert the result for every healthy agent (`cmd/tag.js:1074-1081`).
  */
 async function readBackAndAssert(aws, ctx, client, { agent, runtimeId, declared }) {
   const observed = await client.observedSpecOf(runtimeId);
@@ -578,7 +598,7 @@ async function readBackAndAssert(aws, ctx, client, { agent, runtimeId, declared 
   if (changes.length) {
     throw new CliError(`${agent}: the runtime does not match the declared spec (${changes.join(', ')})`, {
       code: EXIT.FAILED,
-      detail: 'no binding written — a binding asserts "this runtime IS this generation", and this one is not.',
+      detail: 'no binding written — a binding asserts "this runtime IS this tag", and this one is not.',
     });
   }
   return { observed, legacyEfsRoot };
@@ -594,13 +614,13 @@ async function readBackAndAssert(aws, ctx, client, { agent, runtimeId, declared 
  */
 async function stageOne(run, agent, position) {
   const {
-    ctx, out, aws, client, spec, generationId, deps,
+    ctx, out, aws, client, imageUri, tag, deps,
   } = run;
   const label = `[${String(position).padStart(String(run.total).length)}/${run.total}] ${agent.padEnd(20)}`;
-  const declared = derivedSpecFor(spec, agent, deps);
+  const declared = derivedSpecFor(client, agent, imageUri);
   const runtimeName = run.runtimeNameFor(agent, declared);
   const startedAt = Date.now();
-  const record = { agent, runtimeName, generationId };
+  const record = { agent, runtimeName, tag };
 
   // 1. THE SAGA. role → (mount targets ∥ access point ∥ Connector) → CreateAgentRuntime → poll READY,
   //    with compensating cleanup on failure. Not reimplemented, not raced: `allSettled` on those
@@ -612,8 +632,8 @@ async function stageOne(run, agent, position) {
       // REQUIRED per call. The client removed its `|| config.imageUri` fallback because "that is
       // precisely how a roll became a silent no-op once already" (`agentcore-client.js:858-860`).
       image: declared.image,
-      // The generation's OWN environment, not `runtimeEnv(agent)` recomputed from the dispatcher's
-      // process — that recomputation is exactly what a generation freezes (plan §1).
+      // The tag's OWN environment, not `runtimeEnv(agent)` recomputed from the dispatcher's
+      // process — that recomputation is exactly what a tag freezes (plan §1).
       envs: declared.envs,
       // NOTE: `efsRoot` is deliberately NOT passed. The client resolves the §8.10 legacy-EFS root from
       // the agent's own META (`agentcore-client.js:841-847`), and passing the declared PATH here would
@@ -633,9 +653,9 @@ async function stageOne(run, agent, position) {
 
   // From here on a runtime EXISTS AT AWS. Every failure below therefore leaves a runtime with no row,
   // which the registry cannot see and the reaper cannot reach — "recovered only by adopt-on-conflict
-  // when that generation is next requested" (`agentcore-client.js:528-533`). Each one says so.
+  // when that tag is next requested" (`agentcore-client.js:528-533`). Each one says so.
   const orphanNote = `runtime ${runtimeName} (${runtimeId}) EXISTS AT AWS with no binding row — `
-    + 're-running `generation stage` adopts it by name; nothing else will find it (§6.5)';
+    + 're-running `fleet stage` adopts it by name; nothing else will find it (§6.5)';
 
   // 2. THE READ-BACK, before any binding is written.
   let verified;
@@ -658,12 +678,12 @@ async function stageOne(run, agent, position) {
   try {
     healthResult = await run.healthcheck({
       agent,
-      generationId,
+      tag,
       runtimeArn: env.runtimeArn,
       runtimeId,
       // Plan §7 session isolation: its own microVM session and its own EFS session file, so the
       // synthetic turn never lands in the agent's real conversation.
-      sessionId: `prewarm:${agent}:${generationId}`,
+      sessionId: `prewarm:${agent}:${tag}`,
       budgetSeconds: run.budgetSeconds,
       ctx,
       out,
@@ -674,7 +694,7 @@ async function stageOne(run, agent, position) {
       health = 'pending';
       healthError = HEALTHCHECK_NOT_IMPLEMENTED;
       // A per-unit failure, not a warning: PENDING IS NOT STAGED. Recording it is what makes the run
-      // exit 6 (re-run) instead of 0, so an unhealthchecked generation can never look complete.
+      // exit 6 (re-run) instead of 0, so an unhealthchecked tag can never look complete.
       out.failure({ agent, step: 'healthcheck', error: err });
     } else {
       health = 'failed';
@@ -685,12 +705,12 @@ async function stageOne(run, agent, position) {
   }
 
   // 4. THE BINDING — after the read-back and after the healthcheck, carrying whichever of the three
-  //    states actually happened. A `failed` row is written too: `generation show` and
+  //    states actually happened. A `failed` row is written too: `tag show` and
   //    `runtime list --failed` are how the operator finds the agent whose crash reason to read.
   const stagedAt = nowIso(deps);
   const binding = {
     agent,
-    generationId,
+    tag,
     runtimeName,
     arn: env.runtimeArn,
     runtimeId,
@@ -748,83 +768,83 @@ async function stageOne(run, agent, position) {
 // ── the command ──────────────────────────────────────────────────────────────────────────────────
 
 /**
- * `archie generation stage` — §2.8.
+ * `archie fleet stage` — §2.8.
  *
  * EXITS, and the pair that matters most (§1.5): 4 means STOP, 6 means GO AGAIN.
  *   0  full coverage, every healthcheck passed.
- *   1  the generation could not be read.
- *   4  a healthcheck FAILED — the generation is now tainted and may never be pointed at.
- *   5  refused (tainted generation, lowered healthcheck budget).
+ *   1  the tag could not be read.
+ *   4  a healthcheck FAILED — the tag is now tainted and may never be pointed at.
+ *   5  refused (tainted tag, lowered healthcheck budget).
  *   6  stragglers, nothing tainted — re-running is the DESIGNED response.
  *   8  sustained EFS throttling or a quota ceiling — re-running now buys nothing.
  * Getting 4 and 6 the wrong way round is the difference between fixing an image and burning an hour
- * re-running a generation that is already dead.
+ * re-running a tag that is already dead.
  */
 async function stage(ctx, args, out, deps = {}) {
   const values = (args && args.values) || {};
   const aws = clientsFor(ctx, deps);
 
-  // `--generation` ONLY — this command declares no positional (`lib/registry.js:43`), and accepting
-  // one anyway is unsafe here rather than merely lax: the entry point's first parse pass is
-  // non-strict over the GLOBAL options alone, so a command-specific option's VALUE arrives as a
-  // positional (`archie generation stage --concurrency 9` yields positionals ['9']). A positional
-  // fallback would have taken `9` as the generation id.
-  const generationId = values.generation;
-  if (!generationId) throw usage('--generation <id> is required', { detail: '`archie generation list` shows what exists.' });
+  // `--tag` ONLY — this command declares no positional, and accepting one anyway is unsafe here
+  // rather than merely lax: the entry point's first parse pass is non-strict over the GLOBAL options
+  // alone, so a command-specific option's VALUE arrives as a positional (`archie fleet stage
+  // --concurrency 9` yields positionals ['9']). A positional fallback would have staged tag `9`.
+  //
+  // `--tag` is still read, silently, for the two-word aliases: a runbook that says
+  // `archie tag stage --tag X` resolves here and X is a tag now.
+  const tag = values.tag || values.generation;
+  if (!tag) throw usage('--tag <tag> is required', { detail: '`archie image list` shows what exists.' });
 
   const concurrency = parseConcurrency(values.concurrency, out);
   const budgetSeconds = parseBudget(ctx, values['healthcheck-budget']);
 
-  // 1. THE GENERATION. Absent is exit 1 (§2.8), not a usage error: the command was well formed, the
-  //    thing it names is not there.
-  const item = await readGeneration(aws, ctx, generationId);
-  if (!item) {
-    throw new CliError(`no generation ${generationId}`, {
+  // 1. THE IMAGE. Absent is exit 1 (§2.8), not a usage error: the command was well formed, the thing
+  //    it names is not there. Checked against ECR rather than a table — the image is the release, so
+  //    "does this release exist" and "can a runtime pull it" are the same question now.
+  const account = await resolveAccount(ctx, aws);
+  const imageUri = imageUriFor(ctx, account, tag);
+  const found = await describeImage(aws, { account, repo: ctx.resources.agentRepo, tag });
+  if (!found) {
+    throw new CliError(`no image ${tag}`, {
       code: EXIT.FAILED,
-      detail: `CONFIG#generation / ${generationId} is not in ${ctx.resources.configTable} — `
-        + '`archie generation list` shows what is.',
+      detail: `${imageUri} is not in ECR — build it first (\`archie fleet build\`), or `
+        + '`archie image list` shows what has been staged before.',
     });
   }
+  assertArm64(found, imageUri);
+
   // 2. TAINT IS PERMANENT AND UNCONDITIONAL (§5.2). There is no untaint and no force flag: re-staging
-  //    after fixing the image means a NEW generation. Refusing here rather than at `release set` saves
-  //    ~208 provisions that could never be published.
-  if (item.taintedAt) {
-    throw refused(`generation ${generationId} is TAINTED and may never be pointed at`, {
-      detail: `tainted ${item.taintedAt}${item.taintReason ? ` — ${item.taintReason}` : ''}. `
-        + 'There is no untaint: cut a new generation (`archie generation create --from ' + generationId + '`).',
-    });
-  }
-  const body = readBody(item) || {};
-  const spec = body.spec;
-  if (!spec || !spec.image) {
-    throw new CliError(`generation ${generationId} has no spec to stage`, {
-      code: EXIT.FAILED,
-      detail: 'the stored body carries no `spec.image` — this item was not written by `generation create`.',
+  //    after fixing the image means a NEW TAG, which a content digest gives you by construction.
+  //    Refusing here rather than at publish saves ~208 provisions that could never be published.
+  const taint = await readTaint(aws.doc(), require('@aws-sdk/lib-dynamodb'), ctx.resources.configTable, tag);
+  if (taint) {
+    throw refused(`${tag} is TAINTED and may never be published`, {
+      detail: `tainted ${taint.taintedAt}${taint.reason ? ` — ${taint.reason}` : ''}. `
+        + 'There is no untaint: fix the image and build again — the fixed image IS a new tag.',
     });
   }
 
   // 3. THE ROSTER and what is already done.
   const { agents } = await enumerateAgents(aws, ctx, values, deps);
   const bindings = await scanBindings(aws, ctx);
-  const { todo, skipped } = planStage(agents, bindings, generationId);
+  const { todo, skipped } = planStage(agents, bindings, tag);
 
-  out.progress(`staging ${todo.length} of ${agents.length} agent(s) onto ${generationId}  (concurrency ${concurrency})`
+  out.progress(`staging ${todo.length} of ${agents.length} agent(s) onto ${tag}  (concurrency ${concurrency})`
     + (skipped.length ? ` · ${skipped.length} already staged and healthy` : ''));
 
   const healthcheck = healthcheckFor(deps);
   const healthcheckAvailable = healthcheck !== healthcheckNotImplemented;
   if (!healthcheckAvailable) {
     // LOUD, and in three places: here, on every binding (`healthcheck: 'pending'`), and in the exit
-    // code. A silently skipped healthcheck would make an unpublishable generation look ready.
+    // code. A silently skipped healthcheck would make an unpublishable tag look ready.
     out.warn(`${HEALTHCHECK_NOT_IMPLEMENTED}. Every agent staged by this run will be bound with `
-      + 'healthcheck: "pending" and reported as a straggler (exit 6). No generation may be released '
+      + 'healthcheck: "pending" and reported as a straggler (exit 6). No tag may be published '
       + 'until W2-A lands and a real warm-up invoke passes — that gate has no bypass (§5.1).');
   }
 
   if (ctx.dryRun) {
     const plan = {
-      generationId,
-      image: spec.image,
+      tag,
+      image: imageUri,
       concurrency,
       healthcheckBudgetSeconds: budgetSeconds,
       healthcheckAvailable,
@@ -838,7 +858,7 @@ async function stage(ctx, args, out, deps = {}) {
     // both modes go through one call and the dry-run answer cannot drift from the real one.
     if (ctx.json) { out.answer(plan); return undefined; }
     out.answer([
-      `generation ${generationId}  ${spec.image}`,
+      `tag ${tag}  ${imageUri}`,
       `  would stage  ${todo.length} agent(s) at concurrency ${concurrency}`,
       `  would skip   ${skipped.length} already staged and healthy`,
       `  healthcheck  ${healthcheckAvailable ? `${budgetSeconds}s budget` : 'NOT IMPLEMENTED (W2-A) — would bind as pending'}`,
@@ -847,11 +867,14 @@ async function stage(ctx, args, out, deps = {}) {
     return undefined;
   }
 
-  // 4. PROVISION. One dispatcher client for the whole run, configured from the STORED generation.
-  const account = await resolveAccount(ctx, aws);
-  const client = deps.client || dispatcherClientFor(ctx, account, spec, deps);
+  // 4. PROVISION. One dispatcher client for the whole run, configured from THIS DEPLOYMENT — the
+  //    task definition the gateway is actually running, applied by bin/archie.js before dispatch.
+  //    There is no stored spec to configure it from any more, and that is the point: the name this
+  //    derives has to be the name the dispatcher will derive, which means deriving from the same
+  //    place rather than from a record of what someone once declared.
+  const client = deps.client || dispatcherClientFor(ctx, account, {}, deps);
   const runtimeNameFor = runtimeNameFn(deps);
-  const digestOf = (declared) => canonicalGeneration(declared, deps).specDigest;
+  const digestOf = (declared) => specDigestFor(declared, deps).specDigest;
 
   const run = {
     ctx,
@@ -859,8 +882,8 @@ async function stage(ctx, args, out, deps = {}) {
     aws,
     deps,
     client,
-    spec,
-    generationId,
+    imageUri,
+    tag,
     total: todo.length,
     budgetSeconds,
     healthcheck,
@@ -896,7 +919,7 @@ async function stage(ctx, args, out, deps = {}) {
   let taintedNow = false;
   if (run.healthFailures.length) {
     const reason = run.healthFailures.map((f) => `${f.agent}: ${f.error}`).join(' · ').slice(0, 900);
-    await taintGeneration(aws, ctx, generationId, {
+    await taintGeneration(aws, ctx, tag, {
       reason: `healthcheck failed during stage — ${reason}`,
       by: whoami(deps),
       at: nowIso(deps),
@@ -905,8 +928,8 @@ async function stage(ctx, args, out, deps = {}) {
   }
 
   const result = {
-    generationId,
-    image: spec.image,
+    tag,
+    image: imageUri,
     concurrency,
     healthcheckBudgetSeconds: budgetSeconds,
     healthcheckAvailable,
@@ -933,8 +956,8 @@ async function stage(ctx, args, out, deps = {}) {
   }
   if (notAttempted.length) lines.push(`${notAttempted.length} agent(s) not attempted — the run stopped on a quota error`);
   lines.push(taintedNow
-    ? `generation ${generationId} is TAINTED — ${failedHealth.length} healthcheck(s) failed. It can never be released; cut a new generation.`
-    : `generation ${generationId} NOT tainted${stragglers.length ? ` — re-run to pick up the ${stragglers.length} straggler(s)` : ''}`);
+    ? `${tag} is TAINTED — ${failedHealth.length} healthcheck(s) failed. It can never be published; fix the image and build again.`
+    : `${tag} NOT tainted${stragglers.length ? ` — re-run to pick up the ${stragglers.length} straggler(s)` : ''}`);
   // In --json the summary is a document on stdout, so the human lines still have to be SAID — stderr
   // carries them, and is never suppressed by --json (§1.4). In text mode they ARE the answer.
   if (ctx.json) {
@@ -944,21 +967,21 @@ async function stage(ctx, args, out, deps = {}) {
     out.answer(lines.join('\n'));
   }
 
-  // EXIT PRECEDENCE. Taint outranks everything: the generation is dead, and telling the operator to
+  // EXIT PRECEDENCE. Taint outranks everything: the tag is dead, and telling the operator to
   // re-run (6) or to wait for headroom (8) would send them to burn an hour on it.
   if (taintedNow) {
-    throw tainted(`${failedHealth.length} healthcheck(s) failed — generation ${generationId} is tainted`, {
+    throw tainted(`${failedHealth.length} healthcheck(s) failed — ${tag} is tainted`, {
       detail: run.healthFailures.map((f) => `${f.agent}: ${f.error}`).join(' · ')
         + ' — taint is permanent and unconditional; there is no untaint and no force flag (§5.2).',
     });
   }
   if (run.headroom.quota || run.headroom.throttle >= SUSTAINED_THROTTLE_FAILURES) {
     throw headroom(run.headroom.quota
-      ? `hit a service quota while staging ${generationId}`
-      : `sustained throttling while staging ${generationId} (${run.headroom.throttle} throttled provisions)`, {
+      ? `hit a service quota while staging ${tag}`
+      : `sustained throttling while staging ${tag} (${run.headroom.throttle} throttled provisions)`, {
       detail: run.headroom.quota
-        ? 'Re-running now buys nothing. Reap superseded generations first (`archie runtime gc`) — at '
-          + 'every agent in the fleet, keeping 3 generations is 1,040 runtimes against the 1,000 cap (§5.4).'
+        ? 'Re-running now buys nothing. Reap superseded runtimes first (`archie runtime gc`) — at '
+          + 'every agent in the fleet, keeping 3 tags is 1,040 runtimes against the 1,000 cap (§5.4).'
         : 'The bound is EFS CreateAccessPoint and the token bucket does not refill inside a run (§5.3). '
           + 'Lower --concurrency, wait, then re-run to pick up the stragglers.',
     });
@@ -973,7 +996,7 @@ module.exports = {
   // THE FULL COMMAND KEY, never a bare `stage`. `registry.load()` resolves `mod[key] || mod[verb]`,
   // and a verb-keyed export answers for every noun that shares the verb — the shape that would let
   // `archie access-point gc` run the runtime reaper (`lib/registry.js:156-166`, `cmd/runtime.js:843`).
-  'generation stage': stage,
+  'fleet stage': stage,
 
   // Internals, for this file's tests and for W2-A/W2-C, which compose this command.
   stage,

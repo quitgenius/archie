@@ -63,7 +63,7 @@ test('an unbuilt command names the task that owns it, rather than "unknown"', as
   // "unknown command" would be a lie: it is known, it is just not written yet. The distinction is
   // "I typed it wrong" vs "this is not built".
   const c = capture();
-  const code = await main(['generation', 'stage', '--region', 'us-east-1'], {
+  const code = await main(['fleet', 'stage', '--region', 'us-east-1'], {
     streams: c.streams,
     env: {},
     require: () => { const e = new Error("Cannot find module '../cmd/stage'"); e.code = 'MODULE_NOT_FOUND'; throw e; },
@@ -133,9 +133,9 @@ test('a thrown CliError carries its own exit code; anything else is 1', async ()
   const { refused } = require('../lib/exit');
   const c1 = capture();
   assert.equal(await main(['status', '--region', 'r'], {
-    streams: c1.streams, env: {}, require: fakeRequire({ status: async () => { throw refused('tainted generation'); } }),
+    streams: c1.streams, env: {}, require: fakeRequire({ status: async () => { throw refused('tainted tag'); } }),
   }), EXIT.REFUSED);
-  assert.match(c1.stderr(), /ERROR: tainted generation/);
+  assert.match(c1.stderr(), /ERROR: tainted tag/);
 
   const c2 = capture();
   assert.equal(await main(['status', '--region', 'r'], {
@@ -146,14 +146,14 @@ test('a thrown CliError carries its own exit code; anything else is 1', async ()
 test('positionals after the verb reach the handler', async () => {
   const c = capture();
   let seen = null;
-  await main(['release', 'set', 'rel-2026-08-14-01', '--region', 'r'], {
-    streams: c.streams, env: {}, require: fakeRequire({ set: async (ctx, args) => { seen = args.positionals; } }),
+  await main(['image', 'publish', 'content-2026abcd', '--region', 'r'], {
+    streams: c.streams, env: {}, require: fakeRequire({ publish: async (ctx, args) => { seen = args.positionals; } }),
   });
-  assert.deepEqual(seen, ['rel-2026-08-14-01']);
+  assert.deepEqual(seen, ['content-2026abcd']);
 });
 
 test('plan-era aliases still resolve, and report the canonical name', async () => {
-  assert.equal(resolve(['set-active-runtime', 'rel-1']).key, 'release set');
+  assert.equal(resolve(['set-active-runtime', 'content-1']).key, 'image publish');
   assert.equal(resolve(['deploy-agents']).key, 'fleet deploy');
   assert.deepEqual(resolve(['set-active-runtime', 'rel-1']).args, ['rel-1']);
 
@@ -161,12 +161,19 @@ test('plan-era aliases still resolve, and report the canonical name', async () =
   await main(['set-active-runtime', 'rel-1', '--region', 'r', '--json'], {
     streams: c.streams, env: {}, now: () => 0, require: fakeRequire({ set: async () => ({}) }),
   });
-  assert.equal(JSON.parse(c.stdout()).command, 'release set');
+  assert.equal(JSON.parse(c.stdout()).command, 'image publish');
 });
 
 test('two-word commands win over one-word prefixes', () => {
-  assert.equal(resolve(['generation', 'list']).key, 'generation list');
-  assert.equal(resolve(['generation']), null);       // `generation` alone is not a command
+  assert.equal(resolve(['image', 'list']).key, 'image list');
+  assert.equal(resolve(['image']), null);            // `image` alone is not a command
+  // The removed nouns still resolve, to their replacements, and report the CANONICAL name.
+  assert.equal(resolve(['generation', 'stage']).key, 'fleet stage');
+  assert.equal(resolve(['generation', 'stage']).viaAlias, 'generation stage');
+  assert.equal(resolve(['release', 'set']).key, 'image publish');
+  assert.equal(resolve(['generation', 'taint']).key, 'image taint');
+  // `generation create` is gone rather than aliased: there is nothing for it to do.
+  assert.equal(resolve(['generation', 'create']), null);
   assert.equal(resolve(['status']).key, 'status');
 });
 
@@ -179,7 +186,7 @@ test('a declared command whose module lacks the verb fails clearly', () => {
 
 test('help lists every declared command and marks deferred ones', () => {
   const h = helpText();
-  assert.match(h, /generation stage/);
+  assert.match(h, /fleet stage/);
   assert.match(h, /fleet reconcile.*\[phase 2\]/);
   assert.match(h, /4 TAINTED \(stop\)/);
 });
@@ -199,18 +206,18 @@ test('command-specific options are accepted; unknown ones still are not', async 
   assert.equal(await main(['status', '--region', 'r', '--keep', '3'], { streams: c2.streams, env: {} }), EXIT.USAGE);
 });
 
-test('--set is repeatable on generation create', async () => {
+test('a repeatable option collects every occurrence', async () => {
   const c = capture();
   let seen = null;
-  await main(['generation', 'create', '--region', 'r', '--image', 't', '--set', 'a=1', '--set', 'b=2'], {
+  await main(['agent', 'migrate', '--region', 'r', '--agents', 'a,b'], {
     streams: c.streams,
     env: {},
-    // `generation create` provisions, so it is dispatched with the deployed fleet config applied.
+    // `agent migrate` provisions, so it is dispatched with the deployed fleet config applied.
     // Stubbed because this test is about PARSING; the assertion below is unchanged.
     dispatcherEnv: async () => ({ env: {}, revision: 'stub' }),
-    require: fakeRequire({ create: async (ctx, args) => { seen = args.values.set; } }),
+    require: fakeRequire({ migrate: async (ctx, args) => { seen = args.values.agents; } }),
   });
-  assert.deepEqual(seen, ['a=1', 'b=2']);
+  assert.equal(seen, 'a,b');
 });
 
 test('every declared command has an options object, so none can be unusable', () => {
@@ -224,11 +231,11 @@ test('every declared command has an options object, so none can be unusable', ()
 test('a command-specific flag VALUE never arrives as a positional', async () => {
   // Pass 1 knows only the global options, so `--concurrency 9` parses as a boolean flag plus a
   // positional `9` there. Resolving args from that pass handed `9` to the command as its id —
-  // for `release set` or `generation taint` that is a flag value masquerading as a generation.
+  // for `image publish` or `image taint` that is a flag value masquerading as a tag.
   const { parse } = require('./archie');
-  assert.deepEqual(parse(['generation', 'stage', '--concurrency', '9']).found.args, []);
-  assert.deepEqual(parse(['generation', 'taint', 'rel-1', '--reason', 'bad image']).found.args, ['rel-1']);
-  assert.deepEqual(parse(['release', 'set', '--hotfix', 'rel-1']).found.args, ['rel-1']);
+  assert.deepEqual(parse(['fleet', 'stage', '--concurrency', '9']).found.args, []);
+  assert.deepEqual(parse(['image', 'taint', 'content-1', '--reason', 'bad image']).found.args, ['content-1']);
+  assert.deepEqual(parse(['image', 'publish', 'content-1']).found.args, ['content-1']);
   assert.deepEqual(parse(['runtime', 'gc', '--keep', '3']).found.args, []);
 });
 
@@ -236,15 +243,17 @@ test('a command-specific flag VALUE never arrives as a positional', async () => 
 //
 // REGRESSION (first sandbox rehearsal). `createAgentCoreClient` resolves what it is not given as
 // `process.env.X || <pre-archie constant>`. Running on a laptop, where none of those variables are
-// set, `generation create` recorded the OpenClaw stack's security group, dispatcher URL and secret
-// names into a generation, computed specDigest over them, and REPORTED SUCCESS. `generation stage`
-// then failed closed on a filesystem that had been deleted. The silent one was the dangerous one.
+// set, staging recorded the OpenClaw stack's security group, dispatcher URL and secret names into
+// the derived spec and REPORTED SUCCESS, then failed closed on a filesystem that had been deleted.
+// The silent one was the dangerous one — and it matters MORE now that the runtime name is derived on
+// both sides rather than stored on one: a wrong environment here does not write a wrong record, it
+// produces a different NAME from the one the dispatcher derives, and the two halves stop meeting.
 
 test('commands that provision are dispatched with the DEPLOYED dispatcher config applied', async () => {
   const seen = {};
   const env = { AGENTCORE_EFS_FS_ID: 'fs-fromLaptop', ARCHIE_NAME: 'agent-gn0p84' };
   const c = capture();
-  const code = await main(['generation', 'create', '--image', 'x', '--region', 'us-east-1'], {
+  const code = await main(['fleet', 'stage', '--tag', 'content-x', '--region', 'us-east-1'], {
     streams: c.streams,
     env,
     // Stands in for the ECS read. The point of the assertion is the ORDER: the handler must see the
@@ -254,7 +263,7 @@ test('commands that provision are dispatched with the DEPLOYED dispatcher config
       env: { AGENTCORE_EFS_FS_ID: 'fs-fromFleet', AGENTCORE_SECURITY_GROUP_ID: 'sg-fromFleet' },
     }),
     require: fakeRequire({
-      'generation create': async () => {
+      'fleet stage': async () => {
         seen.fs = env.AGENTCORE_EFS_FS_ID;
         seen.sg = env.AGENTCORE_SECURITY_GROUP_ID;
         return { ok: true };
@@ -263,7 +272,7 @@ test('commands that provision are dispatched with the DEPLOYED dispatcher config
   });
   assert.equal(code, EXIT.OK, c.stderr());
   // The FLEET's value wins over the ambient one: an AGENTCORE_* left exported in a shell is exactly
-  // how one laptop bakes itself into a fleet-wide generation.
+  // how one laptop's environment decides what the whole fleet provisions.
   assert.equal(seen.fs, 'fs-fromFleet', 'an ambient env var overrode the deployed fleet config');
   assert.equal(seen.sg, 'sg-fromFleet', 'a field the CLI never overrides did not reach the handler');
 });
@@ -271,15 +280,15 @@ test('commands that provision are dispatched with the DEPLOYED dispatcher config
 test('read-only commands do not require a deployed dispatcher', async () => {
   let called = false;
   const c = capture();
-  const code = await main(['generation', 'list', '--region', 'us-east-1'], {
+  const code = await main(['image', 'list', '--region', 'us-east-1'], {
     streams: c.streams,
     env: { ARCHIE_NAME: 'agent-gn0p84' },
     dispatcherEnv: async () => { called = true; return { env: {}, revision: 'x' }; },
-    require: fakeRequire({ 'generation list': async () => ({ ok: true }) }),
+    require: fakeRequire({ 'image list': async () => ({ ok: true }) }),
   });
   assert.equal(code, EXIT.OK, c.stderr());
-  // `generation list` reads DynamoDB. Making it depend on an ECS service it never talks to would be
-  // a dependency invented by the fix rather than required by the command.
+  // `image list` reads DynamoDB. Making it depend on an ECS service it never talks to would be a
+  // dependency invented by the fix rather than required by the command.
   assert.equal(called, false, 'a read-only command paid for an ECS round trip');
 });
 

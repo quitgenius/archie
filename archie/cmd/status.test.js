@@ -50,13 +50,15 @@ function fakeDoc(state = {}) {
     async send(cmd) {
       const input = cmd.input;
       calls.push(input);
-      if (input.Key) return { Item: input.Key.pk === 'CONFIG#release' ? (state.release || undefined) : undefined };
+      if (input.Key) return { Item: input.Key.sk === 'FLEET' ? (state.release || undefined) : undefined };
       if (input.IndexName === 'routing') {
         return { Items: (state.agents || []).map((a) => ({ gsi1pk: 'ROUTING', gsi1sk: a, data: '{}' })) };
       }
       const pk = input.ExpressionAttributeValues[':pk'];
-      if (pk === 'CONFIG#generation') return { Items: state.generations || [] };
-      if (pk === 'CONFIG#image') return { Items: state.images || [] };
+      if (pk === 'CONFIG#image') {
+        const wantTaints = String(input.ExpressionAttributeValues[':sk'] || '') === 'TAINT#';
+        return { Items: wantTaints ? (state.taints || []) : (state.images || []) };
+      }
       if (String(pk).startsWith('RUNTIME#')) {
         const agent = String(pk).slice('RUNTIME#'.length);
         if ((state.failAgents || []).includes(agent)) throw new Error(`ProvisionedThroughputExceeded on ${agent}`);
@@ -72,19 +74,26 @@ function fakeCw(results = []) {
   return { calls, async send(cmd) { calls.push(cmd.input); return { MetricDataResults: results, Messages: [] }; } };
 }
 
-const binding = (generationId, extra = {}) => ({ pk: 'RUNTIME#x', sk: `GEN#${generationId}`, arn: `arn:aws:…:runtime/${generationId}-abc`, ...extra });
+// A binding row: keyed by RUNTIME NAME, and the release it belongs to is the tag its image names.
+const binding = (tag, extra = {}) => ({
+  pk: 'RUNTIME#x',
+  sk: `GEN#oc_x_${tag.replace(/[^a-z0-9]/gi, '').slice(-8)}`,
+  runtimeName: `oc_x_${tag.replace(/[^a-z0-9]/gi, '').slice(-8)}`,
+  image: `repo/agent-gn0p84core:${tag}`,
+  arn: `arn:aws:…:runtime/oc_x_${tag.replace(/[^a-z0-9]/gi, '').slice(-8)}-abc`,
+  ...extra,
+});
 
 /** The shape of a fleet where nothing is wrong: pointer, generation, image, three bound+ok agents. */
 function healthyState() {
   return {
     agents: ['ch_platform', 'ch_growth', 'dm_UJCBAR1FB'],
-    release: { pk: 'CONFIG#release', sk: 'ACTIVE', generationId: 'rel-2026-08-14-01', mode: 'staged', publishedAt: '2026-08-14T20:03:11Z', publishedBy: 'sandbox' },
-    generations: [{ pk: 'CONFIG#generation', sk: 'rel-2026-08-14-01', image: 'repo:archie-0.2.6', createdAt: '2026-08-14T19:00:00Z' }],
+    release: { pk: 'CONFIG#image', sk: 'FLEET', tag: 'archie-0.2.6', publishedAt: '2026-08-14T20:03:11Z', publishedBy: 'sandbox' },
     images: [{ pk: 'CONFIG#image', sk: 'FLEET', tag: 'archie-0.2.6' }],
     bindings: {
-      ch_platform: [binding('rel-2026-08-14-01', { healthcheck: 'ok' })],
-      ch_growth: [binding('rel-2026-08-14-01', { healthcheck: 'ok' })],
-      dm_UJCBAR1FB: [binding('rel-2026-08-14-01', { healthcheck: 'ok' })],
+      ch_platform: [binding('archie-0.2.6', { healthcheck: 'ok' })],
+      ch_growth: [binding('archie-0.2.6', { healthcheck: 'ok' })],
+      dm_UJCBAR1FB: [binding('archie-0.2.6', { healthcheck: 'ok' })],
     },
   };
 }
@@ -119,7 +128,7 @@ test('a healthy fleet exits 0 and reports the pointer, coverage and no drift', a
   const { c, exit } = await run(healthyState());
   assert.equal(exit, EXIT.OK);
   const s = c.stdout();
-  assert.match(s, /^release {3}rel-2026-08-14-01 {3}mode=staged {3}published 2026-08-14T20:03:11Z by sandbox$/m);
+  assert.match(s, /^live {6}tag archie-0\.2\.6 {3}published 2026-08-14T20:03:11Z by sandbox$/m);
   assert.match(s, /^coverage {2}3\/3 staged, 3 healthcheck=ok, 0 failed, 0 missing$/m);
   assert.match(s, /^drift {5}none$/m);
   // The registry-only caveat is part of the answer, not a footnote we can drop.
@@ -133,7 +142,7 @@ test('--json returns the same facts as a document', async () => {
   const envelope = JSON.parse(c.stdout());
   assert.equal(envelope.ok, true);
   assert.equal(envelope.exit, EXIT.OK);
-  assert.equal(envelope.result.release.generationId, 'rel-2026-08-14-01');
+  assert.equal(envelope.result.release.tag, 'archie-0.2.6');
   assert.equal(envelope.result.coverage.staged, 3);
   assert.deepEqual(envelope.result.drift, []);
   // The full lists live in --json even when the human report elides them.
@@ -151,14 +160,15 @@ test('`missing` bindings alone are exit 0 — they are the reconciler\'s job, no
   assert.match(c.stdout(), /2\/3 staged/);
 });
 
-test('an absent release pointer is reported as a fault, never as a benign empty state', async () => {
+test('an absent image pointer is reported as a fault, never as a benign empty state', async () => {
   const state = healthyState();
   delete state.release;
+  state.images = [];
   const { c, exit } = await run(state);
   assert.equal(exit, EXIT.DRIFT);
   const s = c.stdout();
-  assert.match(s, /^release {3}NONE — no CONFIG#release\/ACTIVE item/m);
-  assert.match(s, /release-pointer-absent: CONFIG#release\/ACTIVE does not exist/);
+  assert.match(s, /^live {6}NOTHING PUBLISHED/m);
+  assert.match(s, /image-pointer-absent: CONFIG#image\/FLEET does not exist/);
   // With no active generation there is nothing to measure coverage against — say so, do not print
   // a 0/3 that reads as "the fleet is unprovisioned".
   assert.match(s, /^coverage {2}3\/3 agents hold at least one LIVE binding$/m);
@@ -170,7 +180,7 @@ test('an absent fleet image pointer names its consequence: every turn fails clos
   state.images = [];
   const { c, exit } = await run(state);
   assert.equal(exit, EXIT.DRIFT);
-  assert.match(c.stdout(), /NO baked fallback/);
+  assert.match(c.stdout(), /NO\n\s+baked fallback/);
   assert.match(c.stdout(), /ImagePointerMissing/);
 });
 
@@ -183,7 +193,7 @@ test('an agent whose registry read FAILED is `unknown`, never `missing`, and exi
   assert.match(s, /^unknown {3}ch_growth {3}\(the registry read FAILED — not the same as missing\)$/m);
   assert.doesNotMatch(s, /^missing/m);
   // The report is still printed: an operator at 2am needs the other five reads.
-  assert.match(s, /^release {3}rel-2026-08-14-01/m);
+  assert.match(s, /^live {6}tag archie-0\.2\.6/m);
   // The cause chain names the table and the underlying exception — "wrong region" and "throttled"
   // are indistinguishable without it (lib/exit.js, agent-image.js:52-56).
   assert.match(c.stderr(), /1 backing read failed/);
@@ -216,16 +226,18 @@ test('every DynamoDB expression this command builds is FULLY aliased', async () 
 
 // ── taint, rollback and drift ──────────────────────────────────────────────────────────────────
 
-test('a TAINTED active generation exits 7 and says taint is permanent', async () => {
+test('a TAINTED live tag exits 7 and says taint is permanent', async () => {
   const state = healthyState();
-  state.generations[0].taintedAt = '2026-08-13T18:22:00Z';
-  state.generations[0].taintReason = 'healthcheck: 3 agents';
+  state.taints = [{
+    pk: 'CONFIG#image', sk: 'TAINT#archie-0.2.6', reason: 'healthcheck: 3 agents',
+    taintedBy: 'sandbox', taintedAt: '2026-08-13T18:22:00Z',
+  }];
   const { c, exit } = await run(state);
   assert.equal(exit, EXIT.DRIFT);
   const s = c.stdout();
   assert.match(s, /\*\*\* TAINTED \*\*\*/);
-  assert.match(s, /active-generation-tainted:.*is TAINTED/s);
-  assert.match(s, /cut a new generation, do not retry this one/);
+  assert.match(s, /live-tag-tainted:.*is TAINTED/s);
+  assert.match(s, /fix the image and build again, do not retry this one/);
 });
 
 test('a failed healthcheck on an UNTAINTED live generation is drift, not just a statistic', async () => {
@@ -233,7 +245,7 @@ test('a failed healthcheck on an UNTAINTED live generation is drift, not just a 
   // bindings on a live, untainted generation therefore means the taint write was lost or the pointer
   // was moved onto it anyway — neither is visible from the coverage line alone.
   const state = healthyState();
-  state.bindings.ch_growth = [binding('rel-2026-08-14-01', { healthcheck: 'failed' })];
+  state.bindings.ch_growth = [binding('archie-0.2.6', { healthcheck: 'failed' })];
   const { c, exit } = await run(state);
   assert.equal(exit, EXIT.DRIFT);
   assert.match(c.stdout(), /^failed {4}ch_growth$/m);
@@ -246,26 +258,22 @@ test('taint is read tolerantly — the writer (W2-B) has not fixed the attribute
   assert.equal(taintOf({ tainted: true, updatedAt: '2026-08-13T00:00:00Z' }).at, '2026-08-13T00:00:00Z');
 });
 
-test('rollback targets exclude reaped and tainted generations', () => {
+test('rollback targets exclude reaped and tainted tags', () => {
   const generations = new Map([
-    ['rel-03', { generationId: 'rel-03', bindings: 3, live: 3, ok: 3, failed: 0 }],
-    ['rel-02', { generationId: 'rel-02', bindings: 3, live: 0, ok: 3, failed: 0 }], // reaped: arn removed
-    ['rel-01', { generationId: 'rel-01', bindings: 3, live: 3, ok: 0, failed: 3 }], // tainted
+    ['tag-03', { tag: 'tag-03', bindings: 3, live: 3, ok: 3, failed: 0, stagedAt: '2026-08-13T00:00:00Z' }],
+    ['tag-02', { tag: 'tag-02', bindings: 3, live: 0, ok: 3, failed: 0, stagedAt: '2026-08-12T00:00:00Z' }], // reaped
+    ['tag-01', { tag: 'tag-01', bindings: 3, live: 3, ok: 0, failed: 3, stagedAt: '2026-08-11T00:00:00Z' }], // tainted
   ]);
-  const specs = new Map([
-    ['rel-03', { createdAt: '2026-08-13T00:00:00Z' }],
-    ['rel-02', { createdAt: '2026-08-12T00:00:00Z' }],
-    ['rel-01', { createdAt: '2026-08-11T00:00:00Z', taintedAt: '2026-08-11T09:00:00Z' }],
-  ]);
-  const targets = rollbackTargets(generations, specs, 'rel-04');
-  // A reaped generation's row survives as history but its arn is gone — pointing at it would invoke
-  // a corpse (runtime-registry.js:30-37).
-  assert.deepEqual(targets.map((t) => t.generationId), ['rel-03']);
+  const taints = new Map([['tag-01', { tag: 'tag-01', reason: 'healthcheck failed', taintedAt: '2026-08-11T09:00:00Z' }]]);
+  const targets = rollbackTargets(generations, taints, 'tag-04');
+  // A reaped tag's rows survive as history but their arns are gone — publishing one would invoke a
+  // corpse (runtime-registry.js:30-37).
+  assert.deepEqual(targets.map((t) => t.tag), ['tag-03']);
 });
 
 test('a binding whose arn was CLEARED by a failed invoke is drift, and is not counted as staged', async () => {
   const state = healthyState();
-  state.bindings.ch_growth = [{ pk: 'RUNTIME#x', sk: 'GEN#rel-2026-08-14-01', clearedAt: '2026-08-14T20:40:00Z' }];
+  state.bindings.ch_growth = [{ pk: 'RUNTIME#x', sk: 'GEN#oc_x_archie02', runtimeName: 'oc_x_archie02', image: 'repo/agent-gn0p84core:archie-0.2.6', clearedAt: '2026-08-14T20:40:00Z' }];
   const { c, exit } = await run(state);
   assert.equal(exit, EXIT.DRIFT);
   assert.match(c.stdout(), /2\/3 staged/);
@@ -275,12 +283,13 @@ test('a binding whose arn was CLEARED by a failed invoke is drift, and is not co
 // ── coverage arithmetic ────────────────────────────────────────────────────────────────────────
 
 test('a binding with no healthcheck field counts as UNRECORDED, never as ok', () => {
-  // Phase 1 writes today's row shape, which has no healthcheck field at all (plan §12 step 1).
-  // Counting those as ok would claim a release gate that never ran.
+  // A row written before the healthcheck field existed has none at all. Counting those as ok would
+  // claim a release gate that never ran.
+  const row = (extra) => ({ sk: 'GEN#oc_x_g1', runtimeName: 'oc_x_g1', image: 'repo/x:g1', arn: 'arn:1', ...extra });
   const bindingsByAgent = new Map([
-    ['a', [{ sk: 'GEN#g1', runtimeName: 'g1', arn: 'arn:1' }]],
-    ['b', [{ sk: 'GEN#g1', runtimeName: 'g1', arn: 'arn:1', healthcheck: 'ok' }]],
-    ['c', [{ sk: 'GEN#g1', runtimeName: 'g1', arn: 'arn:1', healthcheck: 'failed' }]],
+    ['a', [row({})]],
+    ['b', [row({ healthcheck: 'ok' })]],
+    ['c', [row({ healthcheck: 'failed' })]],
   ]);
   const { coverage, healthcheckFailures } = summariseBindings(['a', 'b', 'c'], bindingsByAgent, 'g1');
   assert.equal(coverage.staged, 3);
@@ -290,14 +299,19 @@ test('a binding with no healthcheck field counts as UNRECORDED, never as ok', ()
   assert.deepEqual(healthcheckFailures.map((f) => f.agent), ['c']);
 });
 
-test('bindings are matched by generationId first, sort-key suffix second (the phase-1 rename)', () => {
-  const rows = [{ sk: 'GEN#agent-gn0p84-a-fp8abc', runtimeName: 'agent-gn0p84-a-fp8abc', arn: 'arn:1', generationId: 'rel-01' }];
+test('a binding names its release through its IMAGE, never through the sort key', () => {
+  // The sort key is a runtime NAME (a spec fingerprint); the release is the tag the image names.
+  // Reading the release out of the key is what conflated the two identities.
+  const rows = [{ sk: 'GEN#oc_a_fp8abc12', runtimeName: 'oc_a_fp8abc12', arn: 'arn:1', image: 'repo/x:rel-01' }];
   const byId = summariseBindings(['a'], new Map([['a', rows]]), 'rel-01');
   assert.equal(byId.coverage.staged, 1);
-  // …and the same row with no generationId still matches on the sort-key suffix.
-  const legacy = [{ sk: 'GEN#agent-gn0p84-a-fp8abc', runtimeName: 'agent-gn0p84-a-fp8abc', arn: 'arn:1' }];
-  const bySk = summariseBindings(['a'], new Map([['a', legacy]]), 'agent-gn0p84-a-fp8abc');
-  assert.equal(bySk.coverage.staged, 1);
+  // A row with NO image names no release at all — it is counted as a binding but can never be
+  // coverage for a tag. Silently attributing it to the live one would report a fleet as staged that
+  // is running something nobody can name.
+  const noImage = [{ sk: 'GEN#oc_a_fp8abc12', runtimeName: 'oc_a_fp8abc12', arn: 'arn:1' }];
+  const none = summariseBindings(['a'], new Map([['a', noImage]]), 'rel-01');
+  assert.equal(none.coverage.staged, 0);
+  assert.deepEqual(none.coverage.missing, ['a']);
 });
 
 test('per-agent image overrides are REPORTED, not treated as drift (a canary is deliberate)', async () => {
@@ -386,7 +400,7 @@ test('a CloudWatch failure still prints the DynamoDB half of the report, and exi
   const cw = { calls: [], async send() { throw new Error('AccessDenied: cloudwatch:GetMetricData'); } };
   const { c, exit } = await run(healthyState(), { cw });
   assert.equal(exit, EXIT.FAILED);
-  assert.match(c.stdout(), /^release {3}rel-2026-08-14-01/m);
+  assert.match(c.stdout(), /^live {6}tag archie-0\.2\.6/m);
   assert.match(c.stdout(), /^health {4}UNAVAILABLE: AccessDenied/m);
   // --brief is the way past it, and the error detail says which read failed.
   assert.match(c.stderr(), /GetMetricData/);
@@ -408,7 +422,7 @@ test('status never reaches for ListAgentRuntimes', () => {
 test('render() never claims a number it does not have', () => {
   const report = {
     name: 'agent-gn0p84',
-    release: { present: false, generationId: null, mode: null, publishedAt: null, publishedBy: null, generationKnown: false, declaredImage: null, tainted: false },
+    release: { present: false, tag: null, publishedAt: null, publishedBy: null, imageDigest: null, tainted: false },
     image: { fleet: null, overrides: [] },
     scope: { filtered: false, fleetAgents: 0 },
     coverage: { agents: 0, staged: 0, healthcheckOk: 0, healthcheckFailed: 0, healthcheckPending: 0, healthcheckUnrecorded: 0, missing: [], reaped: [], cleared: [], unknown: [] },
@@ -424,6 +438,6 @@ test('render() never claims a number it does not have', () => {
   const s = render(report);
   // A brand-new account: everything absent, nothing invented, and the rollback line says outright
   // that there is nothing to roll back to rather than printing an empty field.
-  assert.match(s, /^rollback {2}NONE — no other generation still holds a live binding$/m);
-  assert.match(s, /^image {5}NONE/m);
+  assert.match(s, /^rollback {2}NONE — no other tag still holds a live binding$/m);
+  assert.match(s, /^live {6}NOTHING PUBLISHED/m);
 });

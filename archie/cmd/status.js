@@ -42,14 +42,13 @@ const { makeClient } = require('../lib/aws');
 const { collectFromDdb } = require('../../slack-dispatcher/routing-build');
 const { createRuntimeRegistry } = require('../../slack-dispatcher/runtime-registry');
 const { readImageItem } = require('../../slack-dispatcher/image-source');
+const { listTaints } = require('../lib/image-pointer');
 const corpus = require('../../clawdbot/agentcore-observability/insight-queries');
 
-// Item keys. The release/generation pair is RUNTIME-RELEASE-PLAN.md §3 and does NOT exist in any
-// account yet — it is introduced by `generation create` / `release set` (W1-C, W2-B). The image
-// pointer is what the dispatcher reads TODAY (`config-resolver/schema.mjs:94`), which is why status
-// reads both: during phase 1 the release pointer is the intent and CONFIG#image is the reality.
-const RELEASE_KEY = { pk: 'CONFIG#release', sk: 'ACTIVE' };
-const GENERATION_PK = 'CONFIG#generation';
+// Item keys. ONE pointer: `CONFIG#image / FLEET`, which is what the dispatcher reads on every turn.
+// There is no separate image pointer to reconcile against it any more — status used to read both
+// and describe one as "the intent" and the other as "the reality", which is an accurate description
+// of a bug (see lib/image-pointer.js) rather than a design.
 const IMAGE_PK = 'CONFIG#image';
 const IMAGE_FLEET_SK = 'FLEET';
 const IMAGE_AGENT_PREFIX = 'AGENT#';
@@ -154,16 +153,15 @@ async function queryPartition(doc, tableName, pk) {
 }
 
 /**
- * The release pointer, or null.
+ * The image pointer, or null.
  *
  * ConsistentRead for the same reason the image pointer is read consistently (`image-source.js:64-67`):
- * an operator running `release set` and then `status` must not be shown the pre-write value from a
+ * an operator running `image publish` and then `status` must not be shown the pre-write value from a
  * stale replica and conclude the write was lost.
  */
 async function readReleasePointer(doc, tableName) {
-  const { GetCommand } = require('@aws-sdk/lib-dynamodb');
-  const r = await doc.send(new GetCommand({ TableName: tableName, Key: RELEASE_KEY, ConsistentRead: true }));
-  return r.Item || null;
+  const { readFleetPointer } = require('../lib/image-pointer');
+  return readFleetPointer(doc, require('@aws-sdk/lib-dynamodb'), tableName);
 }
 
 /**
@@ -208,10 +206,10 @@ const fmtImage = (v) => (v ? (v.uri || `tag ${v.tag}`) : 'unusable');
 /**
  * Taint, read tolerantly.
  *
- * `generation taint` is W2-B's and the plan does not fix the attribute names, so this accepts the
- * plausible spellings rather than silently reporting a tainted generation as shippable. Taint is
+ * `image taint` is W2-B's and the plan does not fix the attribute names, so this accepts the
+ * plausible spellings rather than silently reporting a tainted tag as shippable. Taint is
  * permanent and unconditional (§5.2) — a false negative here would offer a rollback target that
- * `release set` will then refuse, which is a worse experience than being told up front.
+ * `image publish` will then refuse, which is a worse experience than being told up front.
  */
 function taintOf(gen) {
   const at = gen.taintedAt || gen.tainted_at || (gen.tainted === true ? gen.updatedAt || gen.createdAt || true : null);
@@ -224,15 +222,12 @@ function taintOf(gen) {
 }
 
 /**
- * Which generation a binding row belongs to.
+ * Which release a binding row belongs to — the tag its image names.
  *
- * PHASE-1 DUALITY, deliberate: today the sort key is `GEN#<runtimeName>` keyed by spec fingerprint
- * (`runtime-registry.js:39-43`), and plan §12 step 1 has the CLI write that same shape before
- * anything is renamed; §3 rekeys it to `GEN#<generationId>` later. Reading `generationId` first and
- * falling back to the sort-key suffix means status works across the rename in both directions,
- * including on a table that is half-migrated.
+ * The sort key is a runtime NAME and the release is the TAG, so this reads the image rather than
+ * the key. Reading a release out of a sort key is what conflated the two identities.
  */
-const generationOf = (row) => row.generationId || row.runtimeName || null;
+const tagOfRow = (row) => require('../lib/bindings').tagOf(row);
 
 /** A row claims a LIVE runtime only while it still holds an arn — the reaper REMOVEs it and keeps the row as history. */
 const isLive = (row) => Boolean(row && row.arn);
@@ -240,10 +235,10 @@ const isLive = (row) => Boolean(row && row.arn);
 /**
  * Everything derived from the registry, in one pass.
  *
- * Returns per-generation rollups and the per-agent view of the active generation.
+ * Returns per-generation rollups and the per-agent view of the live tag.
  */
-function summariseBindings(agents, bindingsByAgent, activeGenerationId) {
-  const generations = new Map();
+function summariseBindings(agents, bindingsByAgent, liveTag) {
+  const tags = new Map();
   const staged = [];
   const missing = [];
   const reaped = [];
@@ -260,18 +255,20 @@ function summariseBindings(agents, bindingsByAgent, activeGenerationId) {
     if (rows === undefined) { unknown.push(agent); continue; }
 
     for (const row of rows) {
-      const gen = generationOf(row);
+      const gen = tagOfRow(row);
       if (!gen) continue;
-      const g = generations.get(gen) || { generationId: gen, bindings: 0, live: 0, ok: 0, failed: 0 };
+      const g = tags.get(gen) || { tag: gen, bindings: 0, live: 0, ok: 0, failed: 0, stagedAt: null };
       g.bindings += 1;
+      const at = row.stagedAt || row.createdAt || null;
+      if (at && (!g.stagedAt || at > g.stagedAt)) g.stagedAt = at;
       if (isLive(row)) g.live += 1;
       if (row.healthcheck === 'ok') g.ok += 1;
       if (row.healthcheck === 'failed') g.failed += 1;
-      generations.set(gen, g);
+      tags.set(gen, g);
     }
 
-    if (!activeGenerationId) continue;
-    const row = rows.find((r) => generationOf(r) === activeGenerationId);
+    if (!liveTag) continue;
+    const row = rows.find((r) => tagOfRow(r) === liveTag);
     if (!row) { missing.push(agent); continue; }
     if (!isLive(row)) {
       // A row with no arn is history, not coverage. `clearedAt` means an invoke found the runtime
@@ -284,13 +281,13 @@ function summariseBindings(agents, bindingsByAgent, activeGenerationId) {
     if (row.healthcheck === 'ok') ok += 1;
     else if (row.healthcheck === 'failed') {
       failed += 1;
-      healthcheckFailures.push({ agent, generationId: activeGenerationId, at: row.verifiedAt || row.stagedAt || null });
+      healthcheckFailures.push({ agent, tag: liveTag, at: row.verifiedAt || row.stagedAt || null });
     } else if (row.healthcheck === 'pending') pending += 1;
     else unrecorded += 1;
   }
 
   return {
-    generations,
+    tags,
     coverage: {
       agents: agents.length,
       staged: staged.length,
@@ -310,30 +307,30 @@ function summariseBindings(agents, bindingsByAgent, activeGenerationId) {
 /**
  * Rollback targets, newest first.
  *
- * A generation qualifies only while it still has LIVE bindings. A reaped generation's row survives as
+ * A tag qualifies only while it still has LIVE bindings. A reaped tag's rows survive as
  * history with its arn removed, and pointing at one "would invoke a corpse"
- * (`runtime-registry.js:30-37`) — so a reaped generation is never offered, per reference §2.12.
- * Tainted generations are excluded for the same reason `release set` would refuse them (§5.2).
+ * (`runtime-registry.js:30-37`) — so a reaped tag is never offered, per reference §2.12.
+ * Tainted tags are excluded for the same reason `image publish` would refuse them (§5.2).
  */
-function rollbackTargets(generations, generationSpecs, activeGenerationId) {
+function rollbackTargets(tags, taints, liveTag) {
   const out = [];
-  for (const g of generations.values()) {
-    if (g.generationId === activeGenerationId) continue;
+  for (const g of tags.values()) {
+    if (g.tag === liveTag) continue;
     if (!g.live) continue;
-    const spec = generationSpecs.get(g.generationId);
-    if (spec && taintOf(spec)) continue;
+    if (taints.has(g.tag)) continue;
     out.push({
-      generationId: g.generationId,
+      tag: g.tag,
       bindings: g.bindings,
       live: g.live,
       healthcheckOk: g.ok,
-      createdAt: (spec && spec.createdAt) || null,
+      stagedAt: g.stagedAt || null,
     });
   }
-  // createdAt when the generation is self-describing, id otherwise — `rel-YYYY-MM-DD-NN` sorts
-  // chronologically, and today's fingerprint names do not, which is exactly why the id is the
-  // fallback and not the primary sort.
-  out.sort((a, b) => String(b.createdAt || b.generationId).localeCompare(String(a.createdAt || a.generationId)));
+  // Newest staged first: the question is almost always "what can I roll back to", and a content
+  // digest does not sort chronologically — which is exactly why staging time is the primary key and
+  // the tag is only the tie-break.
+  out.sort((a, b) => String(b.stagedAt || '').localeCompare(String(a.stagedAt || ''))
+    || String(b.tag).localeCompare(String(a.tag)));
   return out;
 }
 
@@ -456,22 +453,17 @@ function render(report) {
   const lines = [];
   const { release, image, coverage, selfHealth } = report;
 
-  if (release.generationId) {
-    const mode = release.mode ? `mode=${release.mode}` : 'mode=unrecorded';
-    const pub = release.publishedAt
+  // ONE LINE, because there is one pointer. It used to be two — a release line and an image line —
+  // and the day they disagreed nothing said so.
+  if (image.fleet) {
+    const pub = release && release.publishedAt
       ? `published ${release.publishedAt}${release.publishedBy ? ` by ${release.publishedBy}` : ''}`
       : 'published (unrecorded)';
-    lines.push(`${label('release')}${release.generationId}   ${mode}   ${pub}`
-      + (release.tainted ? '   *** TAINTED ***' : ''));
+    lines.push(`${label('live')}${fmtImage(image.fleet)}   ${pub}`
+      + (release && release.tainted ? '   *** TAINTED ***' : ''));
   } else {
-    lines.push(`${label('release')}NONE — no CONFIG#release/ACTIVE item (the release pointer is not in use in this account)`);
-  }
-
-  if (image.fleet) {
-    lines.push(`${label('image')}${fmtImage(image.fleet)}   (CONFIG#image/FLEET — what the dispatcher provisions on today)`);
-  } else {
-    lines.push(`${label('image')}NONE — CONFIG#image/FLEET is absent or unusable; there is NO baked fallback,`);
-    lines.push(`${indent}so every turn fails closed with ImagePointerMissing (image-source.js:11-15)`);
+    lines.push(`${label('live')}NOTHING PUBLISHED — CONFIG#image/FLEET is absent or unusable; there is NO`);
+    lines.push(`${indent}baked fallback, so every turn fails closed with ImagePointerMissing`);
   }
   if (image.overrides.length) {
     lines.push(`${label('override')}${image.overrides.length} per-agent image override(s): `
@@ -482,7 +474,7 @@ function render(report) {
     lines.push(`${label('scope')}${coverage.agents} agent(s) from --agents (of ${report.scope.fleetAgents} in the routing GSI)`);
   }
 
-  if (release.generationId) {
+  if (release.tag) {
     const bits = [
       `${coverage.staged}/${coverage.agents} staged`,
       `${coverage.healthcheckOk} healthcheck=ok`,
@@ -498,7 +490,7 @@ function render(report) {
     lines.push(`${label('coverage')}${bits.join(', ')}`);
   } else {
     lines.push(`${label('coverage')}${report.liveBindingAgents}/${coverage.agents} agents hold at least one LIVE binding`);
-    lines.push(`${indent}(no active generation to measure against — this is a registry census, not coverage)`);
+    lines.push(`${indent}(nothing published to measure against — this is a registry census, not coverage)`);
   }
 
   // Deliberately NOT a failure (reference §2.2): missing bindings are `fleet reconcile`'s job.
@@ -522,7 +514,7 @@ function render(report) {
     lines.push(`${label('rollback')}${t.generationId} (${plural(t.live, 'live binding')}, ${health})`
       + (report.rollbackTargets.length > 1 ? `, +${report.rollbackTargets.length - 1} older` : ''));
   } else {
-    lines.push(`${label('rollback')}NONE — no other generation still holds a live binding`);
+    lines.push(`${label('rollback')}NONE — no other tag still holds a live binding`);
   }
 
   if (!report.drift.length) lines.push(`${label('drift')}none`);
@@ -583,9 +575,9 @@ async function status(ctx, args, out, deps = {}) {
 
   out.verbose(`reading ${table} in ${ctx.region} (name=${ctx.name})`);
 
-  const [releaseItem, generationItems, imageItems, routingRows] = await Promise.all([
-    attempt(errors, `GetItem CONFIG#release/ACTIVE on ${table}`, () => readReleasePointer(clients.doc, table), null),
-    attempt(errors, `Query CONFIG#generation on ${table}`, () => queryPartition(clients.doc, table, GENERATION_PK), []),
+  const [releaseItem, taintRecords, imageItems, routingRows] = await Promise.all([
+    attempt(errors, `GetItem CONFIG#image/FLEET on ${table}`, () => readReleasePointer(clients.doc, table), null),
+    attempt(errors, `Query CONFIG#image taints on ${table}`, () => listTaints(clients.doc, require('@aws-sdk/lib-dynamodb'), table), []),
     attempt(errors, `Query CONFIG#image on ${table}`, () => queryPartition(clients.doc, table, IMAGE_PK), []),
     // The agent enumeration is the routing GSI (`routing-build.js:68`) — reused, not reimplemented.
     attempt(errors, `Query routing GSI on ${table}`, () => collectFromDdb(clients.doc, table), []),
@@ -612,49 +604,39 @@ async function status(ctx, args, out, deps = {}) {
     if (rows) bindingsByAgent.set(agent, rows);
   });
 
-  const generationSpecs = new Map();
-  for (const it of generationItems) if (it.sk) generationSpecs.set(it.sk, it);
+  const taintByTag = new Map(taintRecords.map((t) => [t.tag, t]));
 
-  const activeGenerationId = (releaseItem && releaseItem.generationId) || null;
-  const activeSpec = activeGenerationId ? generationSpecs.get(activeGenerationId) : null;
-  const activeTaint = activeSpec ? taintOf(activeSpec) : null;
+  const liveTag = (releaseItem && releaseItem.tag) || null;
+  const activeTaint = liveTag ? taintByTag.get(liveTag) : null;
 
-  const { generations, coverage, healthcheckFailures } = summariseBindings(agents, bindingsByAgent, activeGenerationId);
+  const { tags, coverage, healthcheckFailures } = summariseBindings(agents, bindingsByAgent, liveTag);
   const image = summariseImagePointers(imageItems);
-  const targets = rollbackTargets(generations, generationSpecs, activeGenerationId);
+  const targets = rollbackTargets(tags, taintByTag, liveTag);
 
   const tainted = [];
-  for (const [generationId, spec] of generationSpecs) {
-    const t = taintOf(spec);
-    if (!t) continue;
-    const g = generations.get(generationId);
-    tainted.push({ generationId, reason: t.reason, at: t.at, by: t.by, failedAgents: g ? g.failed : 0 });
+  for (const [tag, t] of taintByTag) {
+    const g = tags.get(tag);
+    tainted.push({ tag, reason: t.reason, at: t.taintedAt, by: t.taintedBy, failedAgents: g ? g.failed : 0 });
   }
 
   // ── drift ────────────────────────────────────────────────────────────────
   // Registry-side only, and it says so. status cannot compare against AWS without ListAgentRuntimes;
   // `archie fleet drift` (spec-baseline's derived-vs-running comparison) is the command that can.
-  // What IS knowable here is whether the pointers, the generation catalogue and the bindings agree
+  // What IS knowable here is whether the pointers, the tag catalogue and the bindings agree
   // with each other — which is where the migration's real faults live.
   const driftFindings = [];
   if (!releaseItem) {
     driftFindings.push({
-      kind: 'release-pointer-absent',
-      detail: 'CONFIG#release/ACTIVE does not exist, so no generation is published. Under the release '
-        + 'model there is no baked fallback: nothing is authoritative about what the fleet should run.',
-    });
-  } else if (!activeSpec) {
-    driftFindings.push({
-      kind: 'release-generation-unknown',
-      detail: `the pointer names ${activeGenerationId}, but there is no CONFIG#generation item for it — `
-        + 'the generation is not self-describing, so it cannot be verified, diffed or rolled back to.',
+      kind: 'image-pointer-absent',
+      detail: 'CONFIG#image/FLEET does not exist, so nothing is published. There is no baked fallback: '
+        + 'every turn fails closed rather than guessing an image.',
     });
   }
   if (activeTaint) {
     driftFindings.push({
-      kind: 'active-generation-tainted',
-      detail: `${activeGenerationId} is TAINTED (${activeTaint.reason || 'no reason recorded'}) and is live. `
-        + 'Taint is permanent (§5.2): cut a new generation, do not retry this one.',
+      kind: 'live-tag-tainted',
+      detail: `${liveTag} is TAINTED (${activeTaint.reason || 'no reason recorded'}) and is live. `
+        + 'Taint is permanent (§5.2): fix the image and build again, do not retry this one.',
     });
   }
   if (!image.fleet) {
@@ -667,19 +649,19 @@ async function status(ctx, args, out, deps = {}) {
   if (coverage.cleared.length) {
     driftFindings.push({
       kind: 'binding-arn-cleared',
-      detail: `${plural(coverage.cleared.length, 'binding')} on the active generation had their arn cleared `
+      detail: `${plural(coverage.cleared.length, 'binding')} on the live tag had their arn cleared `
         + `by a failed invoke: ${fmtNames(coverage.cleared)}`,
     });
   }
   if (coverage.healthcheckFailed && !activeTaint) {
-    // An invariant violation, not a statistic. A failed healthcheck TAINTS the generation (plan §7,
-    // §5.2) and a tainted generation may never be pointed at — so a live generation carrying failed
+    // An invariant violation, not a statistic. A failed healthcheck TAINTS the tag (plan §7,
+    // §5.2) and a tainted tag may never be pointed at — so a live generation carrying failed
     // bindings and no taint means either the taint write was lost or the pointer was moved onto it
     // anyway. Both are worth exit 7; neither is visible from the coverage line alone.
     driftFindings.push({
       kind: 'active-healthcheck-failed-untainted',
       detail: `${plural(coverage.healthcheckFailed, 'agent')} failed healthcheck on the LIVE generation `
-        + `${activeGenerationId}, which is not tainted: ${fmtNames(healthcheckFailures.map((f) => f.agent))}`,
+        + `${liveTag}, which is not tainted: ${fmtNames(healthcheckFailures.map((f) => f.agent))}`,
     });
   }
 
@@ -699,12 +681,10 @@ async function status(ctx, args, out, deps = {}) {
     name: ctx.name,
     release: {
       present: Boolean(releaseItem),
-      generationId: activeGenerationId,
-      mode: (releaseItem && releaseItem.mode) || null,
+      tag: liveTag,
       publishedAt: (releaseItem && releaseItem.publishedAt) || null,
       publishedBy: (releaseItem && releaseItem.publishedBy) || null,
-      generationKnown: Boolean(activeSpec),
-      declaredImage: (activeSpec && (activeSpec.image || null)) || null,
+      imageDigest: (releaseItem && releaseItem.imageDigest) || null,
       tainted: Boolean(activeTaint),
     },
     image,

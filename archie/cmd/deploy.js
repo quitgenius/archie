@@ -5,7 +5,7 @@
 //   preflight  →  fleet deploy (the agent half)  →  gateway deploy (the ECS half)
 //
 // THE ORDER IS A CONSTRAINT, NOT A PREFERENCE. Agents first, then the gateway: a new gateway may
-// reference a generation that must already be stageable, whereas agents never depend on a new
+// reference a tag that must already be stageable, whereas agents never depend on a new
 // gateway (plan §5, §2.27 "Refuses to: reorder the halves"). Reversing it would put a dispatcher in
 // front of a fleet that cannot serve what it asks for, during the one window where nothing can reach
 // Slack anyway.
@@ -52,7 +52,7 @@ function publish(ctx, out, result, render) {
  * `archie deploy [--hotfix] [--keep n] [--skip-preflight] [--pure] [--agent-tag t] [--gateway-tag t]`
  *
  * EXIT: the failing sub-step's code, unchanged (§2.27). A `4` from the agent half means the
- * generation is tainted, the pointer never moved AND THE GATEWAY WAS NEVER TOUCHED — no rollout, no
+ * tag is tainted, the pointer never moved AND THE GATEWAY WAS NEVER TOUCHED — no rollout, no
  * outage, nothing to undo.
  */
 async function deploy(ctx, args, out, deps = {}) {
@@ -75,7 +75,7 @@ async function deploy(ctx, args, out, deps = {}) {
   // ── --pure, for BOTH images, before anything is built ──────────────────────────────────────────
   //
   // §2.27 states `--pure` as "a refusal, exit 5, BEFORE anything is built, listing the modified
-  // files". Each half honours it on its own (cmd/generation.js:679-684, cmd/gateway.js:252-256), but
+  // files". Each half honours it on its own (cmd/tag.js:679-684, cmd/gateway.js:252-256), but
   // composed that is not good enough: the gateway's check would run AFTER every agent in the fleet had already
   // rolled, and a release that refuses halfway is not the reproducible release `--pure` promises.
   // Both are asserted here, up front, even for a half that may later be skipped — the skip DECISION
@@ -103,7 +103,7 @@ async function deploy(ctx, args, out, deps = {}) {
   }
 
   // ── 2. the agent half ──────────────────────────────────────────────────────────────────────────
-  out.progress('agents      starting the agent half — build, generation, stage, healthcheck gate, release, gc');
+  out.progress('agents      starting the agent half — build, stage, healthcheck gate, publish, gc');
   try {
     const fleet = await runStep(steps.fleetDeploy, ctx, {
       positionals: [],
@@ -209,7 +209,7 @@ function render(r) {
   if (r.preflight) lines.push(`preflight   checks 1-3 pass (account ${r.preflight.account})`);
   else lines.push('preflight   SKIPPED');
   if (r.fleet) {
-    lines.push(`agents      ${r.fleet.generationId || '—'} (${r.fleet.mode})`
+    lines.push(`agents      ${r.fleet.imageTag || '—'} (${r.fleet.mode})`
       + `${r.fleet.stage && r.fleet.stage.coverage !== undefined ? `  staged ${r.fleet.stage.coverage}/${r.fleet.stage.agents}` : ''}`);
   }
   if (r.gatewaySkipped) {

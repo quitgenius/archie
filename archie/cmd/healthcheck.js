@@ -1,8 +1,8 @@
 'use strict';
 
-// `archie generation healthcheck` — W2-A, and the plan's one required-and-unbuilt item (§7).
+// `archie fleet healthcheck` — W2-A, and the plan's one required-and-unbuilt item (§7).
 //
-// This is the gate. `release set` refuses to move the pointer to a generation whose healthcheck has
+// This is the gate. `image publish` refuses to move the pointer to a tag whose healthcheck has
 // not passed, in every mode including --hotfix and rollback, and there is no force flag. So this
 // file decides whether anything ships. Everything below exists because a weaker version of it would
 // pass a broken image.
@@ -58,8 +58,8 @@ const RETRY_GAP_MS = 8000;
  * The >= 33 rule is AgentCore's, and violating it fails as ParamValidation rather than as anything
  * that mentions length.
  */
-function prewarmSessionId(agent, generationId) {
-  const base = `prewarm-${agent}-${generationId}`.replace(/[^A-Za-z0-9_-]/g, '-');
+function prewarmSessionId(agent, tag) {
+  const base = `prewarm-${agent}-${tag}`.replace(/[^A-Za-z0-9_-]/g, '-');
   return base.length >= 33 ? base.slice(0, 100) : base + '0'.repeat(33 - base.length);
 }
 
@@ -81,16 +81,16 @@ function isTerminal(err) {
  * Run ONE real turn against ONE agent's runtime, retried until the budget is exhausted.
  *
  * Resolves `{ ok: true, attempts, ms }` on a pass. THROWS on failure — `cmd/stage.js` treats any
- * throw without `notImplemented` as a failure that taints the generation, which is the contract
+ * throw without `notImplemented` as a failure that taints the tag, which is the contract
  * that makes this a gate rather than a report.
  */
 async function runHealthcheck({
-  agent, generationId, runtimeArn, sessionId, budgetSeconds, ctx, out, deps = {},
+  agent, tag, runtimeArn, sessionId, budgetSeconds, ctx, out, deps = {},
 } = {}) {
   if (!runtimeArn) throw new CliError(`healthcheck: no runtime ARN for ${agent}`, { code: EXIT.FAILED });
 
   const budget = Number(budgetSeconds) > 0 ? Number(budgetSeconds) : DEFAULT_BUDGET_SECONDS;
-  const session = sessionId || prewarmSessionId(agent, generationId);
+  const session = sessionId || prewarmSessionId(agent, tag);
   const prompt = deps.prompt || DEFAULT_PROMPT;
   const sleep = deps.sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
   const now = deps.now || Date.now;
@@ -140,7 +140,7 @@ async function runHealthcheck({
 
   const ms = now() - started;
   throw new CliError(
-    `healthcheck FAILED for ${agent} on ${generationId} after ${attempts} attempt(s) over ${Math.round(ms / 1000)}s`,
+    `healthcheck FAILED for ${agent} on ${tag} after ${attempts} attempt(s) over ${Math.round(ms / 1000)}s`,
     {
       code: EXIT.TAINTED,
       cause: lastErr,
@@ -166,7 +166,7 @@ function defaultInvoke(ctx, deps = {}) {
   // `Agent: "unknown"`, which is worse: 208 of them per release, attributed to nothing.
   //
   // Release-scoped signals belong to `archie emit-release-metrics`, under its own dimension, with
-  // agent and generation as EMF properties (plan §7).
+  // agent and tag as EMF properties (plan §7).
   const { NOOP_METRICS } = deps.metricsModule
     || require(path.join(__dirname, '..', '..', 'slack-dispatcher', 'dispatcher-metrics.js'));
   const client = createAgentCoreClient({
@@ -192,7 +192,7 @@ function defaultInvoke(ctx, deps = {}) {
     // Plan §7 is explicit that these synthetic turns must not land on the normal dimension: ~208 of
     // them per release would skew the very turn-latency panels used to judge the release, and each
     // one is a deliberate cold first-invoke, so it would drag exactly the metric that matters. The
-    // release-scoped metrics belong to `archie emit-release-metrics`, with agent and generation as
+    // release-scoped metrics belong to `archie emit-release-metrics`, with agent and tag as
     // EMF *properties* rather than dimensions.
     //
     // `trigger` is kept: it costs nothing and it is what distinguishes these turns in the logs.
@@ -220,67 +220,68 @@ function parseBudget(value, out) {
 }
 
 async function healthcheck(ctx, args, out, deps = {}) {
-  const generation = require('./generation');
+  const { scanBindings, tagOf } = require('../lib/bindings');
   const stage = require('./stage');
 
-  const generationId = args.values.generation || args.positionals[0];
+  // `--tag` is still read for the two-word alias (`archie fleet healthcheck`), where the
+  // value an old runbook passes is a tag now.
+  const tag = args.values.tag || args.values.generation || args.positionals[0];
   const agent = args.values.agent;
-  if (!generationId) throw usage('--generation <id> is required');
+  if (!tag) throw usage('--tag <tag> is required');
   if (!agent) throw usage('--agent <id> is required');
 
   const budgetSeconds = parseBudget(args.values.budget, out);
-  // Default ON. Off only for investigating an already-tainted generation — see the refusal below.
+  // Default ON. Off only for investigating an already-tainted tag — see the refusal below.
   const taintOnFailure = args.values['no-taint-on-failure'] ? false : true;
 
-  // The `{ doc() }` accessor shape cmd/generation.js's readers take (`readGeneration(aws, ctx, id)`,
-  // `scanBindings(aws, ctx)`) — reused from cmd/stage.js rather than re-spelled, so there is one
-  // place where --profile is threaded to the clients the dispatcher's client builds for itself.
+  // The `{ doc() }` accessor shape the shared readers take — reused from cmd/stage.js rather than
+  // re-spelled, so there is one place where --profile is threaded to the clients the dispatcher's
+  // client builds for itself.
   const aws = deps.aws || stage.clientsFor(ctx, deps);
 
-  const item = await generation.readGeneration(aws, ctx, generationId);
-  if (!item) throw usage(`generation ${generationId} does not exist`);
-
-  const rows = await generation.scanBindings(aws, ctx);
-  const binding = rows.find((r) => r.agent === agent
-    && (r.generationId === generationId || String(r.sk || '').endsWith(generationId)));
+  // NO EXISTENCE CHECK ON THE TAG ITSELF. There is no item to read any more, and the binding IS the
+  // stronger check: a live binding for this tag means a runtime was provisioned on this image and is
+  // there to invoke. A tag with no binding cannot be healthchecked whether or not it exists in ECR.
+  const rows = await scanBindings(aws, ctx);
+  const binding = rows.find((r) => r.agent === agent && tagOf(r) === tag);
   if (!binding || !binding.arn) {
-    throw new CliError(`${agent} has no live binding for ${generationId}`, {
+    throw new CliError(`${agent} has no live binding for ${tag}`, {
       code: EXIT.REFUSED,
-      detail: 'Run `archie generation stage` first — there is nothing to invoke.',
+      detail: 'Run `archie fleet stage` first — there is nothing to invoke.',
     });
   }
 
-  out.progress(`healthcheck  ${agent} on ${generationId}  budget ${budgetSeconds}s`);
+  out.progress(`healthcheck  ${agent} on ${tag}  budget ${budgetSeconds}s`);
   if (ctx.dryRun) {
     out.progress('[dry-run] would invoke the runtime once on an isolated prewarm session');
-    return { agent, generationId, dryRun: true, sessionId: prewarmSessionId(agent, generationId) };
+    return { agent, tag, dryRun: true, sessionId: prewarmSessionId(agent, tag) };
   }
 
   try {
     const res = await runHealthcheck({
-      agent, generationId, runtimeArn: binding.arn, budgetSeconds, ctx, out, deps,
+      agent, tag: tag, runtimeArn: binding.arn, budgetSeconds, ctx, out, deps,
     });
     out.progress(`ok           ${agent} served in ${res.ms}ms after ${res.attempts} attempt(s)`);
-    return { agent, generationId, ...res };
+    return { agent, tag, ...res };
   } catch (e) {
     if (taintOnFailure) {
-      await stage.taintGeneration(aws, ctx, generationId, {
+      await stage.taintGeneration(aws, ctx, tag, {
         reason: `healthcheck failed for ${agent}: ${String(e.message).slice(0, 200)}`,
         by: process.env.USER || 'archie',
         at: new Date().toISOString(),
       });
-      out.warn(`generation ${generationId} is now TAINTED and can never be released. `
-        + 'Fix the image and cut a new generation — there is no untaint.');
+      out.warn(`${tag} is now TAINTED and can never be published. `
+        + 'Fix the image and build again — the fixed image is a new tag, and there is no untaint.');
     } else {
-      out.warn('--no-taint-on-failure: the generation was NOT tainted. Use this only when '
-        + 'investigating a generation that is already tainted.');
+      out.warn('--no-taint-on-failure: the tag was NOT tainted. Use this only when '
+        + 'investigating a tag that is already tainted.');
     }
     throw e instanceof CliError ? e : tainted(String(e.message), { cause: e });
   }
 }
 
 module.exports = {
-  'generation healthcheck': healthcheck,
+  'fleet healthcheck': healthcheck,
   healthcheck,
   runHealthcheck,
   prewarmSessionId,

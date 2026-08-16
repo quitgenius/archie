@@ -87,7 +87,7 @@ function parse(argv, { commandOptions = {} } = {}) {
   // RE-RESOLVE from the STRICT positionals. Pass 1 knows only the global options, so a
   // command-specific flag's VALUE is parsed as a positional there — `generation stage --concurrency 9`
   // yields loose positionals ['generation','stage','9']. Handing that to the command means `9`
-  // arrives as its id argument, which for `release set` or `generation taint` is a flag value
+  // arrives as its id argument, which for `image publish` or `image taint` is a flag value
   // masquerading as a generation. Only the strict pass, which knows the command's own options, has
   // the real positionals; pass 1 exists solely to discover WHICH command that is.
   const resolved = resolve(strict.positionals) || found;
@@ -150,7 +150,7 @@ async function main(argv = process.argv.slice(2), deps = {}) {
     //
     // `createAgentCoreClient` resolves what it is not given as `process.env.X || <constant>`, and on
     // a laptop none of those variables are set — so before this, every field archie did not override
-    // resolved to a PRE-ARCHIE constant. `generation create` recorded the OpenClaw stack's security
+    // resolved to a PRE-ARCHIE constant. `fleet build` recorded the OpenClaw stack's security
     // group, dispatcher URL and secret names into a generation and reported success; `generation
     // stage` failed closed on a deleted filesystem. Applied here, once, rather than in each of the
     // nine client constructions, because the failure mode of one call site forgetting is a silently

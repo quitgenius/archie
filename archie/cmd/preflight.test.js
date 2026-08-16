@@ -252,7 +252,7 @@ test('check 4: the pointer read is ConsistentRead', async () => {
 test('check 4: on an empty account the failure says the state is CORRECT, not broken', async () => {
   const { code, stdout, stderr } = await run({ checks: '4' }, { async getItem() { return null; } }, { verbose: [true] });
   assert.equal(code, EXIT.PREFLIGHT);
-  assert.match(stdout, /has no usable CONFIG#release\/ACTIVE or CONFIG#image\/FLEET/);
+  assert.match(stdout, /has no usable CONFIG#image\/FLEET/);
   assert.match(stderr, /CORRECT on a genuinely empty account/);
 });
 

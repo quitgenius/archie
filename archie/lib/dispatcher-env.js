@@ -16,7 +16,7 @@
 //   dispatcherBaseUrl https://dispatcher.sandra-test.…         (the OpenClaw dispatcher)
 //
 // The first sandbox rehearsal caught it, and the failure that surfaced — `FileSystemNotFound` — was
-// the LEAST bad symptom, because it failed closed. The dangerous one was silent: `generation create`
+// the LEAST bad symptom, because it failed closed. The dangerous one was silent: `fleet build`
 // recorded all of the above into the generation's `runtimeEnv`, computed `specDigest` over it, and
 // stored it. Every runtime staged from that generation would have read ANOTHER STACK'S SECRETS and
 // called the wrong dispatcher, with nothing in the output to say so.

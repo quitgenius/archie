@@ -11,41 +11,57 @@
 // tidiness, it is the safety property: the composed path must never be able to end up with a WEAKER
 // check than the hand-run sequence an operator would type. Two consequences, both load-bearing:
 //
-//   1. THE RELEASE GATE IS `releaseRefusal` FROM cmd/release.js, IMPORTED DIRECTLY AND NOT
-//      INJECTABLE. It is a pure function of (generation item, binding rows, current pointer) exactly
-//      so that the composed flow can ask it the same question `release set` asks (`cmd/release.js`
-//      :242-256). A second gate written here would be a second opinion about whether an
-//      unhealthchecked generation may go live, and the first time the two disagreed the composed
-//      command would be the one that shipped it. There is no force flag anywhere in this path, and
-//      `--hotfix` is not passed to the gate at all — it narrows COVERAGE, never VERIFICATION (§2.19).
+//   1. THE GATE IS `publishRefusal` FROM cmd/image.js, IMPORTED DIRECTLY AND NOT INJECTABLE. It is a
+//      pure function of (tag, ECR lookup, taint record, binding stats) exactly so that the composed
+//      flow can ask it the same question `image publish` asks. A second gate written here would be a
+//      second opinion about whether an unhealthchecked tag may go live, and the first time the two
+//      disagreed the composed command would be the one that shipped it. There is no force flag
+//      anywhere in this path, and `--hotfix` is not passed to the gate at all — it narrows COVERAGE,
+//      never VERIFICATION (§2.19).
 //
-//   2. THE POINTER IS NEVER MOVED ON AN INCOMPLETE STAGE. `generation stage` records stragglers as
+//   2. THE POINTER IS NEVER MOVED ON AN INCOMPLETE STAGE. `fleet stage` records stragglers as
 //      per-unit failures WITHOUT throwing (`cmd/stage.js:958-962`) — the entry point turns a non-zero
 //      failure count into exit 6. Composed, nobody is watching that count, so this file counts them
-//      itself and stops BEFORE `release set`. Exit 6 out of `fleet deploy` therefore means exactly
+//      itself and stops BEFORE `image publish`. Exit 6 out of `fleet deploy` therefore means exactly
 //      what §2.19 says it means: staging incomplete, pointer not moved.
 //
 // WHY SUB-STEPS RUN WITH `json: true`. Each composed command answers either a structured object
-// (--json) or a paragraph of text, and this file needs the object — the generation id comes out of
-// `generation create`'s answer, and there is no way to read one out of a rendered paragraph. Their
+// (--json) or a paragraph of text, and this file needs the object — the image TAG comes out of
+// `fleet build`'s answer, and there is no way to read one out of a rendered paragraph. Their
 // PROGRESS output is unaffected: progress, warnings and per-agent lines all go to stderr in both
 // modes (`lib/output.js:9-13`), so the operator still watches the run happen. Only the sub-answer is
 // captured, and this command renders its own.
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { spawn } = require('node:child_process');
+const { spawn, execFileSync } = require('node:child_process');
 
 const {
-  CliError, EXIT, usage, refused, partial, drift: driftExit,
+  CliError, EXIT, usage, refused, partial, drift, drift: driftExit,
 } = require('../lib/exit');
-const { digestFor } = require('../lib/digest');
-const generationCmd = require('./generation');
+const {
+  digestFor, tagFor, assertPure, dirtyWarning, ROOT: DIGEST_ROOT,
+} = require('../lib/digest');
+const imageCmd = require('./image');
 const stageCmd = require('./stage');
-const releaseCmd = require('./release');
 const runtimeCmd = require('./runtime');
 
-const { readBody, readGeneration, scanBindings } = generationCmd;
+const { scanBindings, bindingStats, byTag } = require('../lib/bindings');
+const { readFleetPointer, readTaint } = require('../lib/image-pointer');
+const {
+  clientsFor, resolveAccount, imageUriFor, dispatcherClientFor, derivedSpecFor, registryHostFor,
+} = require('../lib/spec');
+const { describeImage, assertArm64 } = require('../lib/ecr');
+const { diffObserved } = require('../../slack-dispatcher/spec-diff');
+const { adoptedRootFor } = require('../lib/efs-root');
+const { runtimeIdOf } = require('../../slack-dispatcher/runtime-registry');
+
+// AgentCore microVMs are arm64. Not overridable — §2.6, Makefile:59-68.
+const PLATFORM = 'linux/arm64';
+const MAKE_TARGET = 'build-agentcore-pi';
+
+/** The answer, shaped for the reader: an object under --json, a block otherwise. */
+const answer = (out, ctx, obj, text) => out.answer(ctx.json ? obj : text);
 
 // docker/ — the same root lib/digest.js resolves, and where slack-dispatcher/ lives.
 const ROOT = path.resolve(__dirname, '..', '..');
@@ -58,15 +74,14 @@ const SPEC_BASELINE = path.join(ROOT, 'slack-dispatcher', 'spec-baseline.mjs');
  *
  * `releaseRefusal` is deliberately ABSENT from this table. A gate that could be swapped out is a gate
  * with a bypass, and "there is no force flag" has to be true of the code, not only of the flags
- * (§5.1). It is called directly, from the one implementation `release set` uses.
+ * (§5.1). It is called directly, from the one implementation `image publish` uses.
  */
 function stepsFor(deps = {}) {
   const s = deps.steps || {};
   return {
-    build: s.build || generationCmd.build,
-    create: s.create || generationCmd.create,
-    stage: s.stage || stageCmd['generation stage'],
-    releaseSet: s.releaseSet || releaseCmd.releaseSet,
+    build: s.build || build,
+    stage: s.stage || stageCmd['fleet stage'],
+    publish: s.publish || imageCmd.publish,
     gc: s.gc || runtimeCmd.gcRuntimes,
   };
 }
@@ -134,7 +149,7 @@ function emit(ctx, out, result, render) {
   return undefined;
 }
 
-/** Everything after the last `:` of an image URI — the tag `generation create` recorded. */
+/** Everything after the last `:` of an image URI — the tag `fleet build` recorded. */
 const tagOf = (uri) => (typeof uri === 'string' && uri.includes(':') ? uri.slice(uri.lastIndexOf(':') + 1) : uri || null);
 
 const namesOf = (failures) => [...new Set(failures.map((f) => f.agent).filter(Boolean))];
@@ -144,16 +159,16 @@ const namesOf = (failures) => [...new Set(failures.map((f) => f.agent).filter(Bo
 /**
  * `archie fleet deploy` — §2.19.
  *
- * `generation build` → `generation create` → `generation stage` → THE GATE → `release set` →
+ * `fleet build` → `fleet build` → `fleet stage` → THE GATE → `image publish` →
  * `runtime gc --keep`.
  *
  * ZERO DOWNTIME, and it is structural rather than careful: the new runtimes are created ALONGSIDE
- * the live ones under different names, staged and healthchecked while the old generation still
+ * the live ones under different names, staged and healthchecked while the old tag still
  * serves every turn, and the cutover is one pointer write (§2.19, §3.1). Nothing in this file stops
  * a single turn. The ~94-second outage belongs to the gateway, which this command does not touch —
  * `archie deploy` (cmd/deploy.js) is where the two halves meet.
  *
- * EXITS: 0 released · 4 a healthcheck failed → generation tainted, POINTER NOT MOVED · 6 staging
+ * EXITS: 0 released · 4 a healthcheck failed → tag tainted, POINTER NOT MOVED · 6 staging
  * incomplete, POINTER NOT MOVED · 5 the flip was refused · 1/8 as the failing sub-step.
  */
 async function fleetDeploy(ctx, args, out, deps = {}) {
@@ -170,7 +185,6 @@ async function fleetDeploy(ctx, args, out, deps = {}) {
   }
 
   const plan = {
-    generationId: null,
     image: null,
     imageTag: null,
     mode: hotfix ? 'hotfix' : 'staged',
@@ -184,34 +198,27 @@ async function fleetDeploy(ctx, args, out, deps = {}) {
     dryRun: Boolean(ctx.dryRun),
   };
 
-  // ── 1. the image ───────────────────────────────────────────────────────────────────────────────
-  //
-  // RESUME FIRST. `--generation <id>` naming an existing generation means "carry on with THAT
-  // release" — the documented response to exit 6 and to a run that was interrupted after `create`
-  // (§3.1 step 4, "re-run is the designed response"). Rebuilding and re-creating there would either
-  // be a no-op or, if the tree has moved since, refuse with a spec collision on a generation that is
-  // already half-staged. The image is the one the generation RECORDED; nothing re-derives it.
   // ── 0. retention, BEFORE anything is created ───────────────────────────────────────────────────
   //
   // GC RUNS FIRST, NOT LAST, and the reason is recovery rather than tidiness.
   //
   // Reaping after a release destroys rollback targets in the exact window where they are most likely
-  // to be wanted — the minutes after shipping. And recovering a reaped generation is not a re-run: a
+  // to be wanted — the minutes after shipping. And recovering a reaped runtime is not a re-run: a
   // re-stage issues CreateAgentRuntime under the same derived name, hits ConflictException because
   // AgentCore holds a deleted runtime's name for 3.5-10+ minutes, and falls into waitForRuntimeDeleted
-  // (400 x 3s). Per agent, at a provisioning bound of 4-5, recovering a reaped generation across the
+  // (400 x 3s). Per agent, at a provisioning bound of 4-5, recovering a reaped fleet across the
   // fleet is measured in HOURS, not minutes.
   //
-  // Running it before inverts that: the reap happens from a known-good state, against the generation
+  // Running it before inverts that: the reap happens from a known-good state, against the tag
   // that is currently live, so the two most recent rollback targets are retained by construction and
   // nothing just-released is ever destroyed. It also front-loads quota reclamation for the 208-runtime
   // staging pass that follows, and leaves a FAILED deploy with a freshly-cleaned quota rather than a
   // dirty one.
   //
-  // ARITHMETIC THIS CHANGES: the new generation arrives AFTER the reap, so `--keep N` rests at N+1
+  // ARITHMETIC THIS CHANGES: the new runtimes arrive AFTER the reap, so `--keep N` rests at N+1
   // rollback targets. That is why the default is `--keep 1` (cmd/runtime.js): it yields the live
-  // generation plus two to roll back to — exactly what `--keep 2` yielded when the reap came last —
-  // at a LOWER peak, 3 generations (624 runtimes) rather than 4 (832), so the resting headroom is
+  // live tag plus two to roll back to — exactly what `--keep 2` yielded when the reap came last —
+  // at a LOWER peak, 3 tags' worth (624 runtimes) rather than 4 (832), so the resting headroom is
   // 376 rather than 168.
   //
   // A reap failure must NEVER block the deploy: failing to reclaim quota is not a reason to refuse to
@@ -237,34 +244,21 @@ async function fleetDeploy(ctx, args, out, deps = {}) {
     out.progress('step 0/5  gc          skipped (dry run)');
   }
 
-  const named = values.generation || null;
-  const existing = named ? await readGeneration(aws, ctx, named) : null;
-
-  if (existing) {
-    const body = readBody(existing) || {};
-    const recordedTag = body.imageTag || tagOf(body.image);
-    if (values.tag && recordedTag && values.tag !== recordedTag) {
-      throw refused(`generation ${named} was cut from image ${recordedTag}, but --tag says ${values.tag}`, {
-        detail: 'a generation is never rewritten (cmd/generation.js:757-771). Drop --tag to resume this '
-          + 'generation, or drop --generation to cut a new one from the tree.',
-      });
-    }
-    plan.generationId = named;
-    plan.image = body.image || null;
-    plan.imageTag = recordedTag || null;
-    out.progress(`step 1/5  resume      generation ${named} already exists (${plan.imageTag || 'no image tag'}) — not rebuilding`);
-    out.progress('step 2/5  create      skipped — the generation is already written');
-  } else if (values['skip-build']) {
-    // The SAME derivation `generation build` would have used (lib/digest.js), so a `--skip-build`
+  // NO RESUME FLAG. `--tag <id>` used to mean "carry on with THAT tag"; there is no
+  // tag to carry on with, and nothing is lost — the tag is a content digest of the build's
+  // own inputs, so re-running with an unchanged tree derives the SAME tag, finds it in ECR, skips
+  // the build, and stages additively over what is already staged. Resuming is what running it again
+  // does. `--tag` still pins an explicit one, for CI and for rebuilding a historical image.
+  if (values['skip-build']) {
+    // The SAME derivation `fleet build` would have used (lib/digest.js), so a `--skip-build`
     // run cannot name a different tag than the build it is skipping.
     plan.imageTag = values.tag || (deps.digestFor || digestFor)('agent').tag;
     out.progress(`step 1/5  build       skipped (--skip-build) — using tag ${plan.imageTag}`);
   } else {
     const built = await runStep(steps.build, ctx, {
       positionals: [],
-      // --push always: an image nothing published is an image no generation can name, and `create`
-      // refuses a tag absent from ECR (cmd/generation.js:806-810) — which would fail this run one
-      // step later with a much worse message.
+      // --push always: staging refuses a tag absent from ECR, which would fail this run one step
+      // later with a much worse message.
       values: { tag: values.tag, push: true, pure: values.pure },
     }, out, deps);
     plan.build = built.result || null;
@@ -276,29 +270,8 @@ async function fleetDeploy(ctx, args, out, deps = {}) {
   if (!plan.imageTag) {
     throw new CliError('could not determine the agent image tag for this deploy', {
       code: EXIT.FAILED,
-      detail: '`generation build` reported no tag — re-run `archie generation build --push` on its own.',
+      detail: '`fleet build` reported no tag — re-run `archie fleet build --push` on its own.',
     });
-  }
-
-  // ── 2. the generation ──────────────────────────────────────────────────────────────────────────
-  if (!existing) {
-    const created = await runStep(steps.create, ctx, {
-      positionals: [],
-      values: { image: plan.imageTag, id: named || undefined },
-    }, out, deps);
-    const body = created.result || {};
-    plan.generationId = body.generationId || named || null;
-    plan.image = body.image || plan.image;
-    if (!plan.generationId) {
-      throw new CliError('`generation create` reported no generation id', {
-        code: EXIT.FAILED,
-        detail: 'nothing has been staged and nothing is live — re-run `archie generation create --image '
-          + `${plan.imageTag}\` on its own to see what it says.`,
-      });
-    }
-    plan.create = body;
-    out.progress(`step 2/5  generation  ${plan.generationId}`
-      + `${body.unchanged ? '  (already existed with this exact spec)' : ''}`);
   }
 
   // ── 3. staging ─────────────────────────────────────────────────────────────────────────────────
@@ -316,9 +289,9 @@ async function fleetDeploy(ctx, args, out, deps = {}) {
   const staged = await runStep(steps.stage, ctx, {
     positionals: [],
     values: {
-      generation: plan.generationId,
+      tag: plan.imageTag,
       // Concurrency is passed through UNPARSED. The bound is EFS `CreateAccessPoint`, not AgentCore,
-      // and `generation stage` owns both the clamp and the warning that says what over-running costs
+      // and `fleet stage` owns both the clamp and the warning that says what over-running costs
       // (§5.3, cmd/stage.js:247-262). Re-deriving it here is how the two would drift.
       concurrency: values.concurrency,
       agents: hotfix ? plan.canary : undefined,
@@ -326,7 +299,7 @@ async function fleetDeploy(ctx, args, out, deps = {}) {
   }, out, deps);
   plan.stage = staged.result || null;
 
-  // A dry run has written nothing, so there is no generation to gate and no pointer to move. Saying
+  // A dry run has written nothing, so there is nothing to gate and no pointer to move. Saying
   // so beats evaluating a gate that would refuse for the one reason that is not a problem.
   if (ctx.dryRun) {
     out.progress('step 4/5  gate        not evaluated — a dry run wrote no generation and staged no agent');
@@ -337,10 +310,10 @@ async function fleetDeploy(ctx, args, out, deps = {}) {
   // THE STRAGGLER RAIL. Composed, nothing else is watching `out.failure()`.
   if (staged.failures.length) {
     publish(ctx, out, plan, renderDeploy);
-    throw partial(`staging ${plan.generationId} left ${staged.failures.length} failure(s) — the pointer was NOT moved`, {
+    throw partial(`staging ${plan.imageTag} left ${staged.failures.length} failure(s) — the pointer was NOT moved`, {
       detail: `${namesOf(staged.failures).slice(0, 20).join(', ') || 'see failures[]'}. Re-running is the `
         + 'designed response: staging is additive and skips agents that are already staged and healthy '
-        + `(§3.1 step 4). \`archie fleet deploy --generation ${plan.generationId}\` resumes this one.`,
+        + `(§3.1 step 4). \`archie fleet deploy --tag ${plan.imageTag}\` resumes this one.`,
     });
   }
   // Coverage, from staging's OWN counts. Not a second health opinion — the health gate is below and
@@ -350,47 +323,48 @@ async function fleetDeploy(ctx, args, out, deps = {}) {
   if (!hotfix && plan.stage && plan.stage.agents && plan.stage.coverage < plan.stage.agents) {
     publish(ctx, out, plan, renderDeploy);
     throw partial(`only ${plan.stage.coverage} of ${plan.stage.agents} agent(s) are staged onto `
-      + `${plan.generationId} — the pointer was NOT moved`, {
+      + `${plan.imageTag} — the pointer was NOT moved`, {
       detail: 'Flipping now would leave the unstaged agents cold-starting on their next message. Re-run '
-        + `\`archie fleet deploy --generation ${plan.generationId}\`; it skips what is already done.`,
+        + `\`archie fleet deploy --tag ${plan.imageTag}\`; it skips what is already done.`,
     });
   }
 
   // ── 4. the gate ────────────────────────────────────────────────────────────────────────────────
   //
-  // The same function `release set` runs, on the same three reads, before the flip is attempted.
+  // The same function `image publish` runs, on the same three reads, before the flip is attempted.
   // Running it here as well is not belt-and-braces: it turns "refused" into a stop that names the
   // reason before the release command's own output, and it means this file cannot be given a gate of
   // its own by a later edit — there is nowhere to put one.
-  const [item, bindings, pointerItem] = await Promise.all([
-    readGeneration(aws, ctx, plan.generationId),
+  const account = await resolveAccount(ctx, aws);
+  const [found, taint, bindings] = await Promise.all([
+    describeImage(aws, { account, repo: ctx.resources.agentRepo, tag: plan.imageTag }),
+    readTaint(aws.doc(), require('@aws-sdk/lib-dynamodb'), ctx.resources.configTable, plan.imageTag),
     scanBindings(aws, ctx),
-    releaseCmd.readPointerItem(aws, ctx),
   ]);
-  const rows = bindings.filter((b) => b.generationId === plan.generationId);
-  const refusal = releaseCmd.releaseRefusal({
-    generationId: plan.generationId,
-    item,
-    rows,
-    release: readBody(pointerItem),
-    table: ctx.resources.configTable,
+  const rows = byTag(bindings).get(plan.imageTag) || [];
+  const refusal = imageCmd.publishRefusal({
+    tag: plan.imageTag,
+    found,
+    taint,
+    stats: bindingStats(rows),
+    imageUri: imageUriFor(ctx, account, plan.imageTag),
   });
   if (refusal) {
-    out.progress(`step 4/5  gate        REFUSED — nothing was published, ${plan.generationId} is not live`);
+    out.progress(`step 3/4  gate        REFUSED — nothing was published, ${plan.imageTag} is not live`);
     publish(ctx, out, plan, renderDeploy);
     throw refusal;
   }
   out.progress(`step 4/5  gate        passed — ${rows.length} binding(s), every healthcheck ok`);
 
   // ── 5. the flip ────────────────────────────────────────────────────────────────────────────────
-  const released = await runStep(steps.releaseSet, ctx, {
-    positionals: [plan.generationId],
+  const released = await runStep(steps.publish, ctx, {
+    positionals: [plan.imageTag],
     // `--hotfix` here is ATTRIBUTION (§2.13): it records `mode: 'hotfix'` on the pointer so the burst
     // of cold starts from the ~207 unstaged agents reads as intentional. It relaxes nothing.
     values: { hotfix },
   }, out, deps);
   plan.release = released.result || null;
-  out.progress(`step 5/5  release     ${plan.generationId} is live (mode ${plan.mode})`);
+  out.progress(`step 4/4  publish     ${plan.imageTag} is live`);
 
 
   return emit(ctx, out, plan, renderDeploy);
@@ -418,7 +392,7 @@ async function resolveCanary(ctx, values, aws, deps, out) {
 
 function renderDeploy(r) {
   const lines = [];
-  lines.push(`generation  ${r.generationId || '—'}  (${r.mode})`);
+  lines.push(`tag         ${r.imageTag || '—'}${r.mode === 'hotfix' ? '  (hotfix)' : ''}`);
   lines.push(`image       ${r.image || r.imageTag || '—'}`);
   if (r.canary) lines.push(`canary      ${r.canary}  — the other agents cold-start on first contact (§3.2)`);
   if (r.stage) {
@@ -426,7 +400,7 @@ function renderDeploy(r) {
       ? `staged      would stage ${(r.stage.wouldStage || []).length}, skipping ${r.stage.skipped || 0} already staged`
       : `staged      ${r.stage.coverage}/${r.stage.agents}  health ok ${r.stage.healthOk} · failed ${r.stage.healthFailed}`);
   }
-  lines.push(r.release ? `released    ${r.generationId} is live${r.release.unchanged ? ' (already was)' : ''}`
+  lines.push(r.release ? `published   ${r.imageTag} is live${r.release.unchanged ? ' (already was)' : ''}`
     : 'released    nothing (dry run)');
   if (r.gc) lines.push(`gc          reaped ${(r.gc.reaped || []).length}, kept ${(r.gc.kept || []).length}`);
   lines.push('downtime    none — new runtimes were built alongside the live ones and the cutover was one '
@@ -652,24 +626,24 @@ async function fleetDrift(ctx, args, out, deps = {}) {
   }
 
   if (values.fix && drifted.length) {
-    // FIXING A ROLL IS STAGING. `generation stage` re-provisions those agents onto the active
-    // generation, and it is also why `--fix` CANNOT apply an efsRoot change even if the gate above
+    // FIXING A ROLL IS STAGING. `fleet stage` re-provisions those agents onto the active
+    // tag, and it is also why `--fix` CANNOT apply an efsRoot change even if the gate above
     // were removed: staging never passes `efsRoot` to the saga — the client resolves the legacy root
     // from the agent's own META (`cmd/stage.js:611-614`), so a rekeyed agent keeps its directory.
-    const active = readBody(await releaseCmd.readPointerItem(aws, ctx));
-    if (!active || !active.generationId) {
-      throw new CliError('--fix needs an active release pointer and there is none', {
+    const active = await readFleetPointer(aws.doc(), require('@aws-sdk/lib-dynamodb'), ctx.resources.configTable);
+    if (!active || !active.tag) {
+      throw new CliError('--fix needs an active image pointer and there is none', {
         code: EXIT.FAILED,
         detail: 'With no pointer every turn already fails ImagePointerMissing (image-source.js:11-15). '
           + 'Publish a generation first: `archie fleet deploy`.',
       });
     }
-    out.progress(`fixing      staging ${drifted.length} agent(s) onto the active generation ${active.generationId}`);
+    out.progress(`fixing      staging ${drifted.length} agent(s) onto the live tag ${active.tag}`);
     const staged = await runStep(stepsFor(deps).stage, ctx, {
       positionals: [],
-      values: { generation: active.generationId, agents: drifted.join(',') },
+      values: { tag: active.tag, agents: drifted.join(',') },
     }, out, deps);
-    result.fixed = { generationId: active.generationId, agents: drifted, stage: staged.result || null };
+    result.fixed = { tag: active.tag, agents: drifted, stage: staged.result || null };
     if (staged.failures.length) {
       publish(ctx, out, result, renderDrift);
       throw partial(`--fix staged ${drifted.length} agent(s) and ${staged.failures.length} failed`, {
@@ -705,9 +679,356 @@ function renderDrift(r) {
   if (r.legacyAdopts.length) lines.push(`legacy EFS  ${r.legacyAdopts.length}  (§8.10 rekey, proven from META — not drift)`);
   lines.push(`EFS ROOT    ${r.dataLoss.length}  ${r.dataLoss.length ? '<- BLOCKS: agents would boot on an empty workspace' : ''}`);
   for (const d of r.dataLoss.slice(0, 20)) lines.push(`            ${d.agent}: ${d.before} -> ${d.now}`);
-  if (r.fixed) lines.push(`fixed       staged ${r.fixed.agents.length} agent(s) onto ${r.fixed.generationId}`);
+  if (r.fixed) lines.push(`fixed       staged ${r.fixed.agents.length} agent(s) onto ${r.fixed.tag}`);
   return lines.join('\n');
 }
+
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+// BUILD AND VERIFY — moved here from cmd/tag.js when the tag noun was removed.
+//
+// They were never about tags. `build` produces an arm64 image and a content-addressed tag;
+// `verify` asserts that what is RUNNING matches what this deployment derives. Both are fleet-level
+// operations that only ever borrowed the noun.
+//
+// One change of substance in the move, in `verify`: it used to compare observed state against the
+// spec a tag had STORED, and it now compares against the spec this deployment DERIVES. The
+// old form could only tell you whether a runtime matched what someone once wrote down; this one
+// tells you whether it matches what the fleet would provision today, which is the question an
+// operator is actually asking when they run it.
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+
+// ── subprocess ───────────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Run a command, or hand back what a test injected.
+ *
+ * Build output goes to STDERR (fd 2), never stdout: stdout carries the answer and only the answer
+ * (output.js:5-8), and `archie tag build --json | jq` must survive a docker build.
+ */
+function runnerFor(deps = {}) {
+  if (deps.run) return deps.run;
+  return (cmd, argv, { cwd = ROOT, input = null, capture = false } = {}) => {
+    try {
+      return execFileSync(cmd, argv, {
+        cwd,
+        encoding: 'utf8',
+        input: input === null ? undefined : input,
+        stdio: input !== null ? ['pipe', 'pipe', 'pipe'] : (capture ? ['ignore', 'pipe', 'pipe'] : ['ignore', 2, 2]),
+        maxBuffer: 64 * 1024 * 1024,
+      });
+    } catch (e) {
+      // execFileSync's message line 1 is always the useless one; the captured stderr is the only thing
+      // that separates "wrong region" from "unpublished image" (agent-image.js:52-56). exit.js keeps
+      // the cause, output.error prints it.
+      throw new CliError(`${cmd} ${argv[0] || ''} failed`.trim(), { code: EXIT.FAILED, cause: e });
+    }
+  };
+}
+
+// ── the Makefile's three constraints ─────────────────────────────────────────────────────────────
+
+/** The recipe lines of a make target, with line continuations joined. */
+function makeRecipe(text, target) {
+  const lines = String(text).split('\n');
+  const start = lines.findIndex((l) => l.startsWith(`${target}:`));
+  if (start < 0) return null;
+  const recipe = [];
+  for (let i = start + 1; i < lines.length; i += 1) {
+    const l = lines[i];
+    if (l.startsWith('\t')) { recipe.push(l.slice(1)); continue; }
+    if (l.trim() === '' || l.startsWith('#')) continue;
+    break;
+  }
+  return recipe.join('\n').replace(/\s*\\\n\s*/g, ' ');
+}
+
+/**
+ * Assert the build we are about to shell out to still applies all three constraints, and report the
+ * local image name it produces.
+ *
+ * WHY CHECK RATHER THAN TRUST. §2.6 says the command "applies and does not let you override" three
+ * things, and shelling out to `make` delegates them. If the target ever loses `--build-context
+ * lintroot=.`, the build does not silently skip the lint gate — it fails on the first
+ * `COPY --from=lintroot` (Makefile:267-270) — but if it lost `--platform=linux/arm64` it would build
+ * a perfectly good amd64 image that no microVM can run, and if it stopped honouring
+ * `$(AGENTCORE_PI_TAG)` our tag override would be silently ignored and we would push, and record,
+ * a tag naming content it does not contain. Refusing here costs one file read.
+ */
+function assertMakeConstraints(text) {
+  const recipe = makeRecipe(text, MAKE_TARGET);
+  if (!recipe) {
+    throw refused(`Makefile has no \`${MAKE_TARGET}\` target`,
+      { detail: 'the agent image build lives there (Makefile:271-276) — archie will not invent a docker command for it' });
+  }
+  const required = [
+    [`--platform=${PLATFORM}`, 'AgentCore microVMs are arm64 (Makefile:59-68)'],
+    ['--build-context lintroot=.', 'the lint gate\'s first `COPY --from=lintroot` fails without it (Makefile:267-270)'],
+    ['-f ./clawdbot/agentcore-pi/Dockerfile', 'the Dockerfile must be named explicitly, since the context is its parent'],
+    ['./clawdbot', 'the build context is ./clawdbot, NOT agentcore-pi/ — the Dockerfile COPYs sibling plugin-sdk/ and connector-session-plugin/'],
+    ['$(AGENTCORE_PI_TAG)', 'archie passes the tag as a make override; a hard-coded tag would silently ignore it'],
+  ];
+  for (const [needle, why] of required) {
+    if (!recipe.includes(needle)) {
+      throw refused(`Makefile \`${MAKE_TARGET}\` no longer passes \`${needle}\``, { detail: why });
+    }
+  }
+  const local = recipe.match(/-t\s+(\S+):\$\(AGENTCORE_PI_TAG\)/);
+  if (!local) throw refused(`cannot tell what local image \`${MAKE_TARGET}\` produces`, { detail: 'expected `-t <name>:$(AGENTCORE_PI_TAG)`' });
+  return { recipe, localImage: local[1] };
+}
+
+// ── tag items ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Canonical form + digest of a fleet spec.
+ *
+ * `canonicalize` is the dispatcher's own (agentcore-client.js:183-192) and is NOT reimplemented here:
+ * it sorts object keys and sorts arrays of primitives, because the fields hashed are SETS, and "an
+ * unsorted hash would change whenever AWS returned the same values in a different order, minting a
+ * new runtime on a turn where nothing actually changed (a provision per message, plus an access-point
+ * and role leak)" (:180-183).
+ *
+ * The digest is sha1 of the canonical JSON, as plan §3 specifies, truncated to 16 hex — the same
+ * construction `imageFingerprint` uses (:197-200) at twice the width. Wider on purpose: that
+ * fingerprint distinguishes the handful of specs ONE agent runs, this one is a fleet-wide, permanent
+ * identifier that also serves as the default tag.
+ */
+
+
+// ── tag build ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Build (and optionally push) the arm64 Pi runtime image — §2.6.
+ *
+ * NO DEPLOYMENT EFFECT. The fleet's image is chosen by a tag, so a push alone changes nothing
+ * (Makefile:64-67). That is what makes the derived tag safe: same content, same tag, tag already in
+ * ECR, skip the build and the push.
+ */
+async function build(ctx, args, out, deps = {}) {
+  const values = (args && args.values) || {};
+  const aws = clientsFor(ctx, deps);
+  const run = runnerFor(deps);
+  const root = deps.root || ROOT;
+
+  if (values.platform && values.platform !== PLATFORM) {
+    throw refused(`--platform ${values.platform}: the agent image is ${PLATFORM} and that is not overridable`,
+      { detail: 'AgentCore microVMs are arm64; an amd64 agent image cannot run at all (Makefile:59-68)' });
+  }
+  if (values.tag === 'latest') {
+    throw refused('refusing to build the agent image as `latest`',
+      { detail: 'the runtime image is chosen by a generation, and a floating tag would imply otherwise (Makefile:280-282)' });
+  }
+
+  // `--pure` is not a `fleet build` flag — it belongs to the composed `archie deploy` (§2.27),
+  // which calls straight into this function. Honouring it here rather than there keeps one wording
+  // and one refusal for both entry points.
+  if (values.pure) assertPure('agent', { root });
+  else {
+    const warning = dirtyWarning('agent', { root });
+    if (warning) out.warn(warning);
+  }
+
+  // The tag: pinned, or derived from the image's own declared inputs (lib/digest.js).
+  const pinned = Boolean(values.tag);
+  const digest = pinned ? null : digestFor('agent', { root });
+  const tag = values.tag || tagFor(digest.digest);
+  if (!pinned) out.verbose(`agent digest ${digest.digest} over ${digest.fileCount} declared inputs`);
+
+  const account = await resolveAccount(ctx, aws);
+  const uri = imageUriFor(ctx, account, tag);
+  const repo = ctx.resources.agentRepo;
+
+  const found = await describeImage(aws, { account, repo, tag });
+  if (found) {
+    // The repo is IMMUTABLE (modules/archie/ecr.tf:57-61) precisely so "a rollback would return what
+    // it claimed to". A DERIVED tag that is already present is proof the content is already there —
+    // skip. A PINNED tag is a name someone chose, and the local tree may be anything at all, so
+    // pushing over it is refused rather than skipped: the push would fail at the registry, and if it
+    // ever did not, every tag naming that tag would start lying.
+    if (pinned && values.push) {
+      throw refused(`${repo}:${tag} already exists in ECR and the repository is immutable`,
+        { detail: 'a rollback target must return what it claimed to — cut a new tag, or drop --tag and let the digest name it' });
+    }
+    out.progress(`${uri} already in ECR (${found.digest || 'no digest'}) — skipping build and push`);
+    answer(out, ctx, { image: uri, tag, built: false, pushed: false, skipped: true, ecr: found }, `${uri}\n  already in ECR — nothing to build`);
+    return undefined;
+  }
+
+  const { localImage } = assertMakeConstraints(fs.readFileSync(path.join(root, 'Makefile'), 'utf8'));
+  const makeArgs = ['-C', root, MAKE_TARGET, `AGENTCORE_PI_TAG=${tag}`];
+
+  if (ctx.dryRun) {
+    out.progress(`would run: make ${makeArgs.join(' ')}`);
+    if (values.push) out.progress(`would push: ${uri}`);
+    answer(out, ctx, { image: uri, tag, built: false, pushed: false, dryRun: true }, `${uri}\n  [dry-run] not built`);
+    return undefined;
+  }
+
+  out.progress(`building ${localImage}:${tag} (${PLATFORM}, context ./clawdbot, lintroot=.)`);
+  run('make', makeArgs, { cwd: root });
+
+  let pushed = false;
+  if (values.push) {
+    // The push does NOT go through `make push-agentcore-pi`: that target's registry, account and
+    // profile are sandbox literals (Makefile:71-73,136), and every resource name the CLI touches must
+    // come from `--name`/`--region`/the caller's account instead (context.js:12-16). The build stays
+    // in the Makefile because the build is where the three constraints live.
+    const host = registryHostFor(account, ctx.region);
+    const { GetAuthorizationTokenCommand } = require('@aws-sdk/client-ecr');
+    const auth = await aws.ecr().send(new GetAuthorizationTokenCommand({}));
+    const token = auth && auth.authorizationData && auth.authorizationData[0] && auth.authorizationData[0].authorizationToken;
+    if (!token) throw new CliError('ECR GetAuthorizationToken returned no token', { code: EXIT.FAILED });
+    const decoded = Buffer.from(token, 'base64').toString('utf8');
+    run('docker', ['login', '--username', 'AWS', '--password-stdin', host], { input: decoded.slice(decoded.indexOf(':') + 1) });
+    run('docker', ['tag', `${localImage}:${tag}`, uri]);
+    out.progress(`pushing ${uri}`);
+    run('docker', ['push', uri]);
+    pushed = true;
+  }
+
+  answer(out, ctx, { image: uri, tag, built: true, pushed, skipped: false }, [
+    uri,
+    `  built     ${localImage}:${tag} (${PLATFORM})`,
+    pushed ? '  pushed    yes' : '  pushed    no (--push to publish)',
+    `  next      archie generation create --image ${tag}`,
+  ].join('\n'));
+  return undefined;
+}
+
+// ── tag create ────────────────────────────────────────────────────────────────────────────
+
+
+
+// ── tag verify ────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Assert every bound runtime IS what this deployment derives — §2.10. Read-only. Exit 7 on mismatch.
+ *
+ * DERIVED vs OBSERVED, not declared vs observed. It used to diff against the spec a tag had
+ * STORED, which could only ever tell you whether a runtime matched what someone once wrote down.
+ * Deriving from the deployment answers the question an operator is actually asking — "is this fleet
+ * running what it would provision today?" — and it cannot go stale, because there is nothing stored
+ * to go stale.
+ *
+ * The bug it
+ * catches is real: the image was once dropped on the way to `CreateAgentRuntime`, so a runtime named
+ * for one tag ran another — "a roll that looks completely successful in list-agent-runtimes
+ * and changes nothing. Only get-agent-runtime's containerUri showed it" (agentcore-client.js:421-425).
+ *
+ * The read-back and the diff are both the dispatcher's own (`observedSpecOf` :476 / `specFromGet`
+ * :487, `diffObserved` spec-diff.js:26,39), so the two sides are shaped by the same code that shapes
+ * them at provision time — `efsAccessPoint` dropped from both sides (or every roll shows a phantom
+ * change) and, when the access point can no longer be read, `efsRoot` dropped from BOTH sides,
+ * because "absent is unknown, not 'changed to undefined'" (spec-diff.js:17-24).
+ */
+async function verify(ctx, args, out, deps = {}) {
+  const values = (args && args.values) || {};
+  const aws = clientsFor(ctx, deps);
+
+  const published = await readFleetPointer(aws.doc(), require('@aws-sdk/lib-dynamodb'), ctx.resources.configTable);
+  const tag = values.tag || values.generation || (published && published.tag);
+  if (!tag) throw usage('--tag <tag> is required (nothing is published to default to)');
+
+  const bindings = (await scanBindings(aws, ctx))
+    .filter((b) => b.tag === tag)
+    .filter((b) => !values.agent || b.agent === values.agent)
+    .sort((a, b) => (a.agent < b.agent ? -1 : 1));
+
+  if (!bindings.length) {
+    throw new CliError(`${tag} has no bindings${values.agent ? ` for ${values.agent}` : ''}`,
+      { code: EXIT.FAILED, detail: 'nothing to verify — stage it first' });
+  }
+
+  const account = await resolveAccount(ctx, aws);
+  const client = dispatcherClientFor(ctx, account, deps);
+  const imageUri = imageUriFor(ctx, account, tag);
+
+  const results = [];
+  const mismatched = [];
+  const unreadable = [];
+  for (const b of bindings) {
+    const runtimeId = runtimeIdOf(b);
+    if (!b.arn || !runtimeId) {
+      // A reaped row is history, not a mismatch: it makes no claim about a live runtime
+      // (runtime-registry.js:30-37). Reporting it as drift would make every post-gc verify fail.
+      results.push({ agent: b.agent, runtimeName: b.runtimeName, skipped: 'reaped' });
+      out.verbose(`${b.agent}: reaped — nothing running to verify`);
+      continue;
+    }
+    const declared = derivedSpecFor(client, b.agent, imageUri);
+    let observed;
+    try {
+      observed = await client.observedSpecOf(runtimeId);
+    } catch (e) {
+      unreadable.push({ agent: b.agent, error: String((e && e.message) || e) });
+      results.push({ agent: b.agent, runtimeName: b.runtimeName, error: String((e && e.message) || e) });
+      out.warn(`${b.agent}: GetAgentRuntime failed — ${(e && e.message) || e}`);
+      continue;
+    }
+    // TWO SENTINELS, and getting either wrong inverts the result:
+    //   'initial'              — `diffObserved` was handed nothing to compare. Never a match.
+    //   'fingerprint-algorithm' — every field agreed. specDiff returns this rather than an empty
+    //                             array because its usual caller only diffs when the runtime NAME
+    //                             already changed, so "no field differs" means the hash algorithm
+    //                             moved (spec-diff.js:52-56). Verify's callers are the opposite case:
+    //                             here it is precisely what a clean verify looks like.
+    let changes = diffObserved(observed, declared).filter((c) => c !== 'fingerprint-algorithm');
+
+    // §8.10 LEGACY ADOPT — without this, verify exits 7 for the WHOLE FLEET.
+    //
+    // `derivedSpecFor` always derives `efsRootDir(agent, prefix)`, but a rekeyed agent legitimately
+    // ADOPTS its old directory rather than moving data, so its observed root can never equal the
+    // derived one. cmd/stage.js proved that at staging time and recorded `legacyEfsRoot` on the
+    // binding; cmd/fleet.js applies the same rule to `fleet drift`. This is the third caller, and it
+    // was the one missing it — the rule now lives in lib/efs-root.js so the three cannot disagree.
+    //
+    // Only an efsRoot-ONLY difference is eligible. If anything else also differs, the runtime is
+    // genuinely wrong and an adopted root does not excuse it.
+    let adopted = null;
+    if (changes.length === 1 && changes[0] === 'efsRoot') {
+      adopted = await adoptedRootFor(aws, ctx, b.agent, b, [observed && observed.efsRoot, declared.efsRoot]);
+      if (adopted) {
+        changes = [];
+        out.verbose(`${b.agent}: efsRoot differs but ${adopted} is this agent's adopted legacy root — not drift`);
+      }
+    }
+
+    const ok = changes.length === 0;
+    results.push({
+      agent: b.agent, runtimeName: b.runtimeName, ok, changes,
+      observedImage: observed && observed.image,
+      ...(adopted ? { legacyEfsRoot: adopted } : {}),
+    });
+    if (ok) out.verbose(`${b.agent}: ok`);
+    else {
+      mismatched.push({ agent: b.agent, changes });
+      out.progress(`${b.agent}: MISMATCH ${changes.join(', ')}`);
+    }
+  }
+
+  const checked = results.filter((r) => r.ok !== undefined).length;
+  answer(out, ctx,
+    { tag, checked, mismatched: mismatched.length, unreadable: unreadable.length, results },
+    [
+      `tag ${tag}  ${checked - mismatched.length}/${checked} runtimes match the spec this deployment derives`,
+      ...mismatched.map((m) => `  MISMATCH  ${m.agent}  ${m.changes.join(', ')}`),
+      ...unreadable.map((u) => `  UNREADABLE ${u.agent}  ${u.error}`),
+    ].join('\n'));
+
+  // NOT out.failure(): a recorded per-unit failure exits 6 (PARTIAL, "re-run me"), and a runtime
+  // running the wrong image is not a straggler — §2.10 fixes drift at 7 and a read failure at 1.
+  if (mismatched.length) {
+    throw drift(`${mismatched.length} runtime(s) do not match ${tag}`,
+      { detail: mismatched.map((m) => `${m.agent}: ${m.changes.join(', ')}`).join(' · ') });
+  }
+  if (unreadable.length) {
+    throw new CliError(`could not read ${unreadable.length} runtime(s)`,
+      { code: EXIT.FAILED, detail: unreadable.map((u) => u.agent).join(', ') });
+  }
+  return undefined;
+}
+
 
 module.exports = {
   // THE FULL COMMAND KEYS, never bare verbs. `registry.load()` resolves `mod[key] || mod[verb]`, and

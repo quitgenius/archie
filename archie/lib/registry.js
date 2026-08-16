@@ -27,7 +27,7 @@ const COMMANDS = {
   preflight: { options: { checks:{type:'string'}, skip:{type:'string'} }, top: true, module: 'preflight', task: 'W1-A', needsAws: true,
     summary: 'verify the target account has the infrastructure; never creates anything' },
   status: { options: { agents:{type:'string'}, brief:{type:'boolean'} }, top: true, module: 'status', task: 'W1-F', needsAws: true,
-    summary: 'active generation, staged coverage, healthcheck failures, taint, drift' },
+    summary: 'live tag, staged coverage, healthcheck failures, taint, drift' },
   version: { top: true, module: null, needsAws: false, summary: 'print the CLI version' },
 
   // ── gateway (ECS) ────────────────────────────────────────────────────────
@@ -36,40 +36,37 @@ const COMMANDS = {
   'gateway status': { options: { check:{type:'boolean'} }, module: 'gateway', task: 'W1-B', needsAws: true, summary: 'which task definition and image is actually running' },
   'gateway compose': { options: {}, module: 'gateway', task: 'W3-D', needsAws: true, summary: 'compose the task definition from SSM + discovery and diff it against the running one' },
 
-  // ── generation ───────────────────────────────────────────────────────────
-  'generation build': { options: { tag:{type:'string'}, push:{type:'boolean'}, platform:{type:'string'}, pure:{type:'boolean'} }, module: 'generation', task: 'W1-C', needsAws: true, summary: 'build/push the arm64 Pi runtime image' },
-  'generation create': { options: { image:{type:'string'}, id:{type:'string'}, set:{type:'string',multiple:true}, from:{type:'string'} }, module: 'generation', task: 'W1-C', needsAws: true, summary: 'write CONFIG#generation; nothing goes live' },
-  'generation list': { options: { limit:{type:'string'} }, module: 'generation', task: 'W1-C', needsAws: true, summary: 'generations, coverage, health, which is live, which are rollback targets' },
-  'generation show': { options: {}, module: 'generation', task: 'W1-C', needsAws: true, positional: 'generationId', summary: 'one generation: declared spec and per-agent bindings' },
-  'generation stage': { options: { generation:{type:'string'}, agents:{type:'string'}, concurrency:{type:'string'}, 'healthcheck-budget':{type:'string'} }, module: 'stage', task: 'W1-D', needsAws: true, summary: 'provision + healthcheck + bind every agent onto a generation' },
-  'generation healthcheck': { options: { generation:{type:'string'}, agent:{type:'string'}, budget:{type:'string'}, prompt:{type:'string'}, 'taint-on-failure':{type:'boolean'}, 'no-taint-on-failure':{type:'boolean'} }, module: 'healthcheck', task: 'W2-A', needsAws: true, summary: 'one real invoke against one agent; taints the generation on failure' },
-  'generation verify': { options: { generation:{type:'string'}, agent:{type:'string'} }, module: 'generation', task: 'W1-C', needsAws: true, summary: 'assert observed runtime config matches the declared spec' },
-  'generation taint': { options: { reason:{type:'string'} }, module: 'release', task: 'W2-B', needsAws: true, positional: 'generationId', summary: 'mark a generation permanently unpointable' },
-
-  // ── release pointer ──────────────────────────────────────────────────────
-  'release set': { options: { hotfix:{type:'boolean'} }, module: 'release', task: 'W2-B', needsAws: true, positional: 'generationId', summary: 'move the live pointer (the only command that moves traffic)' },
-  'release publish-image': { options: { agent:{type:'string'}, clear:{type:'boolean'} }, module: 'release', task: 'W3-C', needsAws: true, positional: 'tag', summary: 'write CONFIG#image — what the dispatcher provisions on TODAY' },
-  'release show': { options: {}, module: 'release', task: 'W2-B', needsAws: true, summary: 'the active generation and how it was published' },
-  'release history': { options: { limit:{type:'string'} }, module: 'release', task: 'W2-B', needsAws: true, summary: 'previous pointer values' },
+  // ── image (THE pointer) ──────────────────────────────────────────────────
+  // The image tag is the release identity. There is no generation id and no second pointer: one
+  // item, `CONFIG#image / FLEET`, decides what the fleet runs, and the dispatcher reads that item on
+  // the next turn. See lib/image-pointer.js for why the generation model was removed.
+  'image publish': { options: {}, module: 'image', task: 'W2-B', needsAws: true, positional: 'tag', summary: 'move the fleet to a tag (THE only command that moves traffic)' },
+  'image taint': { options: { reason:{type:'string'} }, module: 'image', task: 'W2-B', needsAws: true, positional: 'tag', summary: 'mark a tag permanently unpublishable; no untaint, no force' },
+  'image show': { options: {}, module: 'image', task: 'W2-B', needsAws: true, positional: 'tag', summary: 'one tag: state, health, and every agent bound to it (defaults to live)' },
+  'image list': { options: { limit:{type:'string'} }, module: 'image', task: 'W2-B', needsAws: true, summary: 'tags with bindings: coverage, health, which is live, which are rollback targets' },
 
   // ── runtimes and access points ───────────────────────────────────────────
-  'runtime list': { options: { agent:{type:'string'}, generation:{type:'string'}, missing:{type:'boolean'}, failed:{type:'boolean'} }, module: 'runtime', task: 'W1-E', needsAws: true, summary: 'per-agent bindings for a generation' },
-  'runtime delete': { options: { agent:{type:'string'}, generation:{type:'string'}, 'wait-timeout':{type:'string'}, 'no-wait':{type:'boolean'}, 'force-active':{type:'boolean'} }, module: 'runtime', task: 'W1-E', needsAws: true, dryRunDefault: true, summary: 'delete one runtime and wait for the name to release' },
+  'runtime list': { options: { agent:{type:'string'}, tag:{type:'string'}, missing:{type:'boolean'}, failed:{type:'boolean'} }, module: 'runtime', task: 'W1-E', needsAws: true, summary: 'per-agent bindings for a tag' },
+  'runtime delete': { options: { agent:{type:'string'}, tag:{type:'string'}, 'wait-timeout':{type:'string'}, 'no-wait':{type:'boolean'}, 'force-active':{type:'boolean'} }, module: 'runtime', task: 'W1-E', needsAws: true, dryRunDefault: true, summary: 'delete one runtime and wait for the name to release' },
   'runtime gc': { options: { keep:{type:'string'}, 'reconcile-aws':{type:'boolean'}, agents:{type:'string'} }, module: 'runtime', task: 'W1-E', needsAws: true, dryRunDefault: true, summary: 'retention-based reaping; --keep N means N rollback targets' },
   'access-point gc': { options: { tag:{type:'string'} }, module: 'runtime', task: 'W1-E', needsAws: true, dryRunDefault: true, summary: 'reap tagged EFS access points with no live runtime' },
 
-  // ── fleet ────────────────────────────────────────────────────────────────
-  'fleet deploy': { options: { tag:{type:'string', 'skip-gc':{type:'boolean'}}, generation:{type:'string'}, hotfix:{type:'boolean'}, canary:{type:'string'}, concurrency:{type:'string'}, keep:{type:'string'}, 'skip-build':{type:'boolean'}, pure:{type:'boolean'} }, module: 'fleet', task: 'W2-C', needsAws: true, summary: 'the agent half of a release, end to end (zero downtime)' },
+  // ── fleet (the agent half) ───────────────────────────────────────────────
+  'fleet build': { options: { tag:{type:'string'}, push:{type:'boolean'}, platform:{type:'string'}, pure:{type:'boolean'} }, module: 'fleet', task: 'W1-C', needsAws: true, summary: 'build/push the arm64 Pi runtime image (no deployment effect)' },
+  'fleet stage': { options: { tag:{type:'string'}, agents:{type:'string'}, concurrency:{type:'string'}, 'healthcheck-budget':{type:'string'} }, module: 'stage', task: 'W1-D', needsAws: true, summary: 'provision + healthcheck + bind every agent onto a tag' },
+  'fleet healthcheck': { options: { tag:{type:'string'}, agent:{type:'string'}, budget:{type:'string'}, prompt:{type:'string'}, 'taint-on-failure':{type:'boolean'}, 'no-taint-on-failure':{type:'boolean'} }, module: 'healthcheck', task: 'W2-A', needsAws: true, summary: 'one real invoke against one agent; taints the TAG on failure' },
+  'fleet verify': { options: { tag:{type:'string'}, agent:{type:'string'} }, module: 'fleet', task: 'W1-C', needsAws: true, summary: 'assert observed runtime config matches the spec this deployment derives' },
+  'fleet deploy': { options: { tag:{type:'string', 'skip-gc':{type:'boolean'}}, hotfix:{type:'boolean'}, canary:{type:'string'}, concurrency:{type:'string'}, keep:{type:'string'}, 'skip-build':{type:'boolean'}, pure:{type:'boolean'} }, module: 'fleet', task: 'W2-C', needsAws: true, summary: 'the agent half of a release, end to end (zero downtime)' },
   'fleet drift': { options: { fix:{type:'boolean'}, compare:{type:'string'} }, module: 'fleet', task: 'W2-C', needsAws: true, summary: 'derived spec vs what is running; an efsRoot change BLOCKS' },
   'fleet reconcile': { options: { daemon:{type:'boolean'}, concurrency:{type:'string'}, interval:{type:'string'} }, module: 'fleet', task: null, phase: 2, needsAws: true, summary: 'drain the provisioning queue and sweep for missing bindings' },
 
   // ── per-agent primitives ─────────────────────────────────────────────────
-  'agent ensure-role': { options: { generation:{type:'string'} }, module: 'agent', task: 'W1-H', needsAws: true, positional: 'agent', summary: 'get-or-create the derived per-agent exec role' },
+  'agent ensure-role': { options: { tag:{type:'string'} }, module: 'agent', task: 'W1-H', needsAws: true, positional: 'agent', summary: 'get-or-create the derived per-agent exec role' },
   'agent ensure-access-point': { options: { 'efs-root':{type:'string'} }, module: 'agent', task: 'W1-H', needsAws: true, positional: 'agent', summary: 'get-or-create the agent EFS access point' },
   'agent ensure-connector': { options: {}, module: 'agent', task: 'W1-H', needsAws: true, positional: 'agent', summary: 'give the agent its own Connector project and key' },
   'agent seed-workspace': { options: {}, module: 'agent', task: 'W1-H', needsAws: true, positional: 'agent', summary: 'pre-write the agent workspace SEED' },
-  'agent ensure-runtime': { options: { generation:{type:'string'} }, module: 'agent', task: 'W1-H', needsAws: true, positional: 'agent', summary: 'the full provisioning saga for one agent' },
-  'agent migrate': { options: { agents:{type:'string'}, generation:{type:'string'}, 'skip-config':{type:'boolean'}, 'skip-runtimes':{type:'boolean'}, 'skip-cron':{type:'boolean'} }, module: 'agent', task: 'W1-H', needsAws: true, summary: 'config hydrate, ensure runtimes, fold in per-agent cron' },
+  'agent ensure-runtime': { options: { tag:{type:'string'} }, module: 'agent', task: 'W1-H', needsAws: true, positional: 'agent', summary: 'the full provisioning saga for one agent' },
+  'agent migrate': { options: { agents:{type:'string'}, tag:{type:'string'}, 'skip-config':{type:'boolean'}, 'skip-runtimes':{type:'boolean'}, 'skip-cron':{type:'boolean'} }, module: 'agent', task: 'W1-H', needsAws: true, summary: 'config hydrate, ensure runtimes, fold in per-agent cron' },
   'agent rekey': { options: { 'to-scope':{type:'boolean'} }, module: 'agent', task: 'W1-H', needsAws: true, dryRunDefault: true, positional: 'agent', summary: 'move an agent identity to a scope key, carrying GRANT#' },
   'agent teardown': { options: { 'name-re':{type:'string'}, 'skip-re':{type:'string'} }, module: 'agent', task: 'W1-H', needsAws: true, dryRunDefault: true, summary: 'delete runtimes, access points and table items (guarded)' },
   'agent create': { options: {}, module: 'agent', task: null, phase: 2, needsAws: true, positional: 'agent', summary: 'mint an agent identity and enqueue provisioning' },
@@ -95,20 +92,23 @@ const COMMANDS = {
 // Every command here builds `createAgentCoreClient`, which resolves what it is not given as
 // `process.env.X || <constant>`. The deployed dispatcher sets those variables from its task
 // definition; a laptop sets none of them, so before this list existed each of these commands
-// silently fell back to the PRE-ARCHIE OpenClaw constants — `generation create` recorded that
-// stack's security group, dispatcher URL and secret names into a generation and reported success.
+// silently fell back to the PRE-ARCHIE OpenClaw constants — staging recorded that stack's security
+// group, dispatcher URL and secret names into the derived spec and reported success. It matters more
+// now than it did then: the name is DERIVED on both sides rather than stored on one, so a wrong
+// environment here does not write a wrong record, it produces a different name from the one the
+// dispatcher will derive and the two halves stop meeting.
 // `bin/archie.js` reads the deployed task definition and applies it before dispatch.
 //
 // Declared as a SET here rather than a field on each entry so the list is readable as a list — the
 // question "which commands provision?" is one an operator asks, and fifteen scattered booleans do
 // not answer it. `registry.test.js` holds it to the modules that actually construct a client.
 //
-// Deliberately absent: `generation healthcheck`. Its client only ever calls `invokeStreaming` against
+// Deliberately absent: `fleet healthcheck`. Its client only ever calls `invokeStreaming` against
 // an ARN it is given — no EFS, no security group, no secret names — so requiring a deployed
 // dispatcher to run one would be a dependency it does not have.
 const FLEET_ENV_COMMANDS = [
   'deploy',
-  'generation create', 'generation verify', 'generation stage',
+  'fleet verify', 'fleet stage',
   'fleet deploy', 'fleet drift', 'fleet reconcile',
   'agent ensure-role', 'agent ensure-access-point', 'agent ensure-connector',
   'agent seed-workspace', 'agent ensure-runtime', 'agent migrate', 'agent rekey',
@@ -124,12 +124,34 @@ for (const key of FLEET_ENV_COMMANDS) {
 const ALIASES = {
   'create-gateway-image': 'gateway build',
   'deploy-gateway': 'gateway deploy',
-  'create-agent-image': 'generation build',
+  'create-agent-image': 'fleet build',
   'deploy-agents': 'fleet deploy',
-  'set-active-runtime': 'release set',
-  'set-new-runtime': 'release set',
-  'get-available-runtimes': 'generation list',
-  taint: 'generation taint',
+  'set-active-runtime': 'image publish',
+  'set-new-runtime': 'image publish',
+  'get-available-runtimes': 'image list',
+  taint: 'image taint',
+};
+
+// TWO-WORD ALIASES — the `generation`/`release` nouns, removed when the image tag became the release
+// identity. Kept because a runbook that fails at 2am with "unknown command" is the worst possible
+// moment to discover a rename, and because the arguments still line up: every one of these took a
+// generation id where its replacement takes a tag, and `--generation` is accepted as `--tag`.
+//
+// `generation create` is deliberately ABSENT rather than aliased. There is nothing for it to do — a
+// build produces a tag and there is no record to cut — so mapping it to something that silently
+// succeeded would be worse than saying it is gone.
+const NOUN_ALIASES = {
+  'generation build': 'fleet build',
+  'generation stage': 'fleet stage',
+  'generation healthcheck': 'fleet healthcheck',
+  'generation verify': 'fleet verify',
+  'generation list': 'image list',
+  'generation show': 'image show',
+  'generation taint': 'image taint',
+  'release set': 'image publish',
+  'release publish-image': 'image publish',
+  'release show': 'image show',
+  'release history': 'image list',
 };
 
 /**
@@ -150,6 +172,10 @@ function resolve(positionals) {
 
   const two = second ? `${first} ${second}` : null;
   if (two && COMMANDS[two]) return { key: two, command: COMMANDS[two], args: positionals.slice(2) };
+  if (two && NOUN_ALIASES[two]) {
+    const key = NOUN_ALIASES[two];
+    return { key, command: COMMANDS[key], args: positionals.slice(2), viaAlias: two };
+  }
   if (COMMANDS[first] && COMMANDS[first].top) return { key: first, command: COMMANDS[first], args: positionals.slice(1) };
   return null;
 }
@@ -206,5 +232,5 @@ function load(key, command, { require: req = require } = {}) {
 }
 
 module.exports = {
-  COMMANDS, ALIASES, FLEET_ENV_COMMANDS, resolve, load,
+  COMMANDS, ALIASES, NOUN_ALIASES, FLEET_ENV_COMMANDS, resolve, load,
 };
