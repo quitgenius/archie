@@ -365,7 +365,7 @@ test('grants dry-run previews the diff and writes nothing', async () => {
 
 // ── cron ─────────────────────────────────────────────────────────────────────────────────────
 
-function cronDeps({ jobs = [], bodies = [{ jobId: 'j1', enabled: true }, { jobId: 'j2', enabled: false }], needsReview = [{ jobId: 'j2' }] } = {}) {
+function cronDeps({ routing = { dm_users: ['UE9Q979XW'] }, jobs = [], bodies = [{ jobId: 'j1', enabled: true }, { jobId: 'j2', enabled: false }], needsReview = [{ jobId: 'j2' }] } = {}) {
   const posted = [];
   const api = {
     add: async (b) => { posted.push(b); },
@@ -377,6 +377,10 @@ function cronDeps({ jobs = [], bodies = [{ jobId: 'j1', enabled: true }, { jobId
       env: { MOUNT_PATH: '/mnt/agents', MANAGER_API_URL: 'http://dispatcher:9090', DISPATCHER_SHARED_SECRET: 's' },
       managerApi: api,
       now: () => 1_700_000_000_000,
+      // §8.10: the owner of the jobs is derived from the agent's ROUTING, not its name. Without this
+      // the CLI would reach DynamoDB for real — and the point of the lookup is that it must not be
+      // skippable, so there is no fallback for it to take instead.
+      agentRouting: async () => routing,
       modules: {
         cronHydrator: () => ({
           readAgentCron: () => ({ jobs: bodies.map((b) => ({ id: b.jobId })), state: {}, entities: {} }),
@@ -518,7 +522,10 @@ test('cron hydrate without a local mount runs an EPHEMERAL task, and drops it af
     'the RUNNING gateway image, so the hydrator speaks the same manager API');
   assert.equal(registered.taskRoleArn, undefined, 'no task role: it makes no AWS API calls');
   assert.equal(registered.containerDefinitions[0].mountPoints[0].readOnly, true);
-  assert.match(out.text(), /WIPES archie's cron store/);
+  // The line names BOTH identities on purpose: the store it wipes (the §8.10 scope owner) and the
+  // EFS directory it reads (the legacy OpenClaw name). Conflating them is the bug this fixes.
+  assert.match(out.text(), /WIPES dm-ue9q979xw's cron store, then seeds from agent-75lieo's EFS/);
+  assert.match(out.text(), /owner\s+dm-ue9q979xw\s+\(§8\.10 scope id, from agent-75lieo routing\)/);
 });
 
 test('cron hydrate deregisters the ephemeral definition even when the task FAILS', async () => {

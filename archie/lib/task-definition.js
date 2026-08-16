@@ -374,7 +374,7 @@ function composeTaskDefinition({ resources, region, facts, ssm, image, tags }) {
  * agent's subtree, so it is the task where that matters most.
  */
 function composeCronHydratorTaskDefinition({
-  resources, region, facts, image, agentId, parentAccessPointId, mountPath = '/mnt/agents',
+  resources, region, facts, image, agentId, ownerAgentId, parentAccessPointId, mountPath = '/mnt/agents',
 }) {
   requireFacts(facts, ['executionRoleArn', 'efsFileSystemId', 'dispatcherSharedSecretArn']);
   if (!image) throw new CliError('composeCronHydratorTaskDefinition needs an image');
@@ -420,6 +420,10 @@ function composeCronHydratorTaskDefinition({
       workingDirectory: '/app',
       environment: [
         { name: 'HYDRATE_AGENT', value: agentId },
+        // The §8.10 identity the jobs are STORED under. HYDRATE_AGENT stays the legacy name because
+        // it names the EFS directory; without this the two are conflated and jobs land under an
+        // identity no Slack event routes to.
+        { name: 'HYDRATE_OWNER_AGENT', value: ownerAgentId || agentId },
         { name: 'MOUNT_PATH', value: mountPath },
         { name: 'MANAGER_API_URL', value: dispatcherBaseUrl(resources.name) },
         { name: 'AWS_REGION', value: region },

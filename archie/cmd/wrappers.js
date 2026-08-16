@@ -666,15 +666,77 @@ async function cronList(ctx, args, out, deps) {
 async function cronHydrate(ctx, args, out, deps) {
   const agentId = oneAgent(args);
   const mountDir = deps.env.MOUNT_PATH;
+  const ownerAgentId = await resolveCronOwner(ctx, args, out, deps, agentId);
 
-  out.progress(`${agentId}: WIPES archie's cron store for this agent, then seeds from EFS`);
+  out.progress(`${agentId}: WIPES ${ownerAgentId}'s cron store, then seeds from ${agentId}'s EFS directory`);
   return mountDir
-    ? cronHydrateInProcess(ctx, args, out, deps, { agentId, mountDir })
-    : cronHydrateViaTask(ctx, args, out, deps, { agentId });
+    ? cronHydrateInProcess(ctx, args, out, deps, { agentId, ownerAgentId, mountDir })
+    : cronHydrateViaTask(ctx, args, out, deps, { agentId, ownerAgentId });
+}
+
+/**
+ * Which archie identity OWNS the jobs — §8.10 identity=scope.
+ *
+ * The legacy OpenClaw name is a PATH on EFS, not an identity here. Storing jobs under it produces an
+ * agent no Slack event resolves to: the jobs run, but the owner's App Home is empty and the agent has
+ * no config, runtime or grants. That happened live on 2026-08-16 — three jobs under
+ * `agent-xx9aff` while every message went to `dm-ux0mz5ckp2r`.
+ *
+ * Resolution order, and there is deliberately NO fallback to the legacy name:
+ *   --as <id>   an explicit override, for when config has not been hydrated yet
+ *   AGENT#<legacy>/META routing → scopeIdForRouting() — the SAME rule the dispatcher mints with
+ *   otherwise   REFUSE. Guessing is what created the split identity in the first place.
+ */
+async function resolveCronOwner(ctx, args, out, deps, agentId) {
+  const explicit = args.values.as;
+  if (explicit) {
+    out.progress(`owner       ${explicit}  (--as, not derived from routing)`);
+    return explicit;
+  }
+
+  const { scopeIdForRouting } = deps.modules.agentScope
+    ? deps.modules.agentScope()
+    : require('../../slack-dispatcher/agent-scope');
+
+  const meta = await readAgentRouting(ctx, deps, agentId);
+  if (!meta) {
+    throw refused(`no routing config for ${agentId} — cannot tell which identity owns its cron jobs`, {
+      detail: `AGENT#${agentId}/META is absent from ${ctx.resources.configTable}. Run \`archie config `
+        + 'hydrate\` first, or pass --as <scope-id> if you know it. Refusing to store the jobs under the '
+        + 'legacy name: that creates an agent no Slack event routes to, whose App Home is empty and '
+        + 'whose jobs run under an identity with no config, runtime or grants.',
+    });
+  }
+  const scopeId = scopeIdForRouting(meta);
+  if (!scopeId) {
+    throw refused(`${agentId} has neither dm_users nor channels — no scope identity to own its jobs`, {
+      detail: 'An agent that routes nothing cannot be scope-keyed. Pass --as <scope-id> if this agent '
+        + 'should nonetheless own jobs.',
+    });
+  }
+  out.progress(`owner       ${scopeId}  (§8.10 scope id, from ${agentId} routing)`);
+  return scopeId;
+}
+
+/** The agent's routing META — the same item the dispatcher's routing GSI is built from. */
+async function readAgentRouting(ctx, deps, agentId) {
+  if (deps.agentRouting) return deps.agentRouting(agentId);
+  const { makeClient } = require('../lib/aws');
+  const { DynamoDBDocumentClient, GetCommand } = require('@aws-sdk/lib-dynamodb');
+  const doc = deps.doc || DynamoDBDocumentClient.from(makeClient(ctx, '@aws-sdk/client-dynamodb', 'DynamoDBClient'));
+  const r = await doc.send(new GetCommand({
+    TableName: ctx.resources.configTable, Key: { pk: `AGENT#${agentId}`, sk: 'META' },
+  }));
+  if (!r.Item) return null;
+  try {
+    return typeof r.Item.data === 'string' ? JSON.parse(r.Item.data) : (r.Item.data || null);
+  } catch {
+    return null;
+  }
 }
 
 /** The agents tree is mounted here (inside the hydrator task, or a test). Seed directly. */
-async function cronHydrateInProcess(ctx, args, out, deps, { agentId, mountDir }) {
+async function cronHydrateInProcess(ctx, args, out, deps, { agentId, ownerAgentId, mountDir }) {
   const api = await managerApi(ctx, out, deps);
   const hydrator = deps.modules.cronHydrator();
 
@@ -683,7 +745,7 @@ async function cronHydrateInProcess(ctx, args, out, deps, { agentId, mountDir })
   // quietly resurrect all of them at once, in a single burst, into people's DMs"
   // (cron-hydrator.js:388-390). A count is the difference between a decision and a surprise.
   const parsed = hydrator.readAgentCron(mountDir, agentId, deps.fs);
-  const plan = hydrator.buildBodies(agentId, parsed, deps.now());
+  const plan = hydrator.buildBodies(ownerAgentId, parsed, deps.now());
   const wouldPost = plan.bodies.length;
   const wouldEnable = plan.bodies.filter((b) => b.enabled !== false).length;
   const preview = {
@@ -705,11 +767,11 @@ async function cronHydrateInProcess(ctx, args, out, deps, { agentId, mountDir })
   // first and still matters; what it no longer does is block.
   if (ctx.dryRun) {
     out.progress('dry-run: nothing purged, nothing posted — the store is untouched');
-    return { dryRun: true, agent: agentId, mode: 'in-process', ...preview };
+    return { dryRun: true, agent: agentId, owner: ownerAgentId, mode: 'in-process', ...preview };
   }
 
   const summary = await hydrator.hydrateAgent({
-    agentId, mountDir, api, fs: deps.fs, now: deps.now,
+    agentId, ownerAgentId, mountDir, api, fs: deps.fs, now: deps.now,
     log: {
       info: (o, m) => out.verbose(`${m} ${JSON.stringify(o)}`),
       warn: (o, m) => out.warn(`${m} ${JSON.stringify(o)}`),
@@ -718,11 +780,11 @@ async function cronHydrateInProcess(ctx, args, out, deps, { agentId, mountDir })
   });
   // Surface each failed job rather than one exit code — `failures[]` names them (lib/output.js).
   for (const e of summary.errors || []) out.failure({ agent: agentId, step: `cron-seed ${e.jobId}`, error: new Error(e.err) });
-  return { agent: agentId, mode: 'in-process', ...preview, purged: summary.purged, posted: summary.posted, errors: summary.errors };
+  return { agent: agentId, owner: ownerAgentId, mode: 'in-process', ...preview, purged: summary.purged, posted: summary.posted, errors: summary.errors };
 }
 
 /** The normal path: register an ephemeral task around the fleet-wide-read mount, run it, drop it. */
-async function cronHydrateViaTask(ctx, args, out, deps, { agentId }) {
+async function cronHydrateViaTask(ctx, args, out, deps, { agentId, ownerAgentId }) {
   const { discoverFacts, readGatewayConfig } = require('../lib/deployment-facts');
   const { composeCronHydratorTaskDefinition } = require('../lib/task-definition');
   const { runEphemeralTask } = require('../lib/run-task');
@@ -746,6 +808,7 @@ async function cronHydrateViaTask(ctx, args, out, deps, { agentId }) {
     facts,
     image: deployed.image,
     agentId,
+    ownerAgentId,
     parentAccessPointId: config.values.CRON_HYDRATOR_ACCESS_POINT_ID,
   });
 
@@ -753,7 +816,7 @@ async function cronHydrateViaTask(ctx, args, out, deps, { agentId }) {
     out.progress(`would register ${taskDefinition.family}, RunTask it against ${ctx.resources.cluster}, `
       + 'and deregister it');
     out.progress('dry-run: nothing purged, nothing posted — the store is untouched');
-    return { dryRun: true, agent: agentId, mode: 'task', taskDefinition };
+    return { dryRun: true, agent: agentId, owner: ownerAgentId, mode: 'task', taskDefinition };
   }
 
   const result = await runEphemeralTask({
@@ -774,7 +837,7 @@ async function cronHydrateViaTask(ctx, args, out, deps, { agentId }) {
   // The task's own output IS the report — the preview, every per-job decision, and the counts are all
   // logged in there by the same code the in-process path prints from.
   for (const line of result.logLines) out.progress(`            ${line}`);
-  return { agent: agentId, mode: 'task', ...result };
+  return { agent: agentId, owner: ownerAgentId, mode: 'task', ...result };
 }
 
 /** The image the dispatcher is actually running. */
