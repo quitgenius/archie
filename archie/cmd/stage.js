@@ -169,22 +169,29 @@ async function resolveAccount(ctx, aws) {
 }
 
 /**
- * The dispatcher's AgentCore client, configured FROM THE STORED GENERATION — not from `process.env`.
+ * The dispatcher's AgentCore client, configured from THE DEPLOYED TASK DEFINITION.
  *
- * That is the whole point of a tag: `runtimeSpecFor` runs off the dispatcher's environment
- * (`agentcore-client.js:904-915`), so a client built from today's environment would provision
- * whatever the currently-deployed task definition happens to say and then "verify" it against the
- * tag. Every fleet field the tag declares is pushed in as an override, and the
- * per-agent environment is passed per call (`envs`) rather than letting `runtimeEnv()` recompute it.
+ * This used to say "FROM THE STORED GENERATION — not from process.env", and pushed the generation's
+ * recorded fleet fields in as overrides so staging honoured the tag's environment rather than
+ * today's. Generations are gone: a tag is now a content digest of the IMAGE, and records nothing
+ * about the fleet it runs on. So the environment is the only source, and `bin/archie.js` makes it
+ * the deployed dispatcher's rather than the laptop's before any handler runs (FLEET_ENV_COMMANDS →
+ * lib/dispatcher-env.js). The per-agent environment is still passed per call (`envs`) rather than
+ * letting `runtimeEnv()` recompute it.
  */
-function dispatcherClientFor(ctx, account, spec, deps = {}) {
+function dispatcherClientFor(ctx, account, deps = {}) {
   const overrides = {
     region: ctx.region,
     account,
     agentConfigTable: ctx.resources.configTable,
-    efsRootPrefix: spec.efsRootPrefix,
-    efsMountPath: spec.efsMountPath,
-    securityGroupId: spec.securityGroupId,
+    // NO efsRootPrefix / efsMountPath / securityGroupId. Under generations these were pushed in from
+    // the generation's RECORDED fleet fields, so staging honoured the tag's environment rather than
+    // today's. There is no such record now — the tag is a content digest of the image alone — so the
+    // only source is the deployed task definition, which `bin/archie.js` applies before this runs
+    // (FLEET_ENV_COMMANDS, lib/dispatcher-env.js). The call site kept passing an empty spec, so all
+    // three arrived as `undefined` and BLANKED the values that env had resolved: every provision
+    // failed with "securityGroups: Value '[]'" and a null mountPath. mergeConfig now ignores
+    // undefined overrides too, so neither half of that can recur on its own.
     // DERIVED, never inherited. The client's own default is the pre-archie `agentcore-base`
     // (agentcore-client.js:69), which does not exist in an archie account — so omitting this made
     // every provision fail closed with NoSuchEntityException while `archie preflight` check 7,
@@ -872,7 +879,7 @@ async function stage(ctx, args, out, deps = {}) {
   //    There is no stored spec to configure it from any more, and that is the point: the name this
   //    derives has to be the name the dispatcher will derive, which means deriving from the same
   //    place rather than from a record of what someone once declared.
-  const client = deps.client || dispatcherClientFor(ctx, account, {}, deps);
+  const client = deps.client || dispatcherClientFor(ctx, account, deps);
   const runtimeNameFor = runtimeNameFn(deps);
   const digestOf = (declared) => specDigestFor(declared, deps).specDigest;
 
