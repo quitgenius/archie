@@ -319,11 +319,12 @@ async function gate({ name, script, argv = [], env = {}, cwd, requires = [], onF
 }
 
 /**
- * The 1-agent=1-source routing invariant, in process.
+ * The routing ambiguity gate, in process.
  *
- * routing-normalize.mjs is a library with no CLI, so this is the only way to run its gate. Both the
- * normalization and the assertion come from that module — a second copy of DM_ONLY_OVERRIDE here
- * would be a second definition of which agents are legitimately DM-only.
+ * routing-normalize.mjs is a library with no CLI, so this is the only way to run it. The assertion
+ * comes from that module rather than being restated here, so there is one definition of what counts
+ * as ambiguous. It refuses >1 channel or >1 DM — an agent with one of each is DECIDED (the DM wins,
+ * per scopeIdFor / scopeIdForRouting) and passes.
  */
 async function routingSingleSourceGate(out, deps) {
   const dir = path.join(CONFIG_RESOLVER, 'items', 'routing');
@@ -331,14 +332,14 @@ async function routingSingleSourceGate(out, deps) {
     out.warn('routing-single-source: UNRUNNABLE — config-resolver/items/routing is absent (run extract.mjs first)');
     return { name: 'routing-single-source', ok: false, unrunnable: true, reason: 'items/routing absent' };
   }
-  const { normalizeRouting, assertSingleSource } = await deps.modules.routingNormalize();
+  const { assertSingleSource } = await deps.modules.routingNormalize();
   const violations = [];
   let checked = 0;
   for (const f of deps.fs.readdirSync(dir).filter((n) => n.endsWith('.json'))) {
     const id = f.slice(0, -5);
     const cfg = JSON.parse(deps.fs.readFileSync(path.join(dir, f), 'utf-8'));
     try {
-      assertSingleSource(id, normalizeRouting(id, cfg.routing || cfg));
+      assertSingleSource(id, cfg.routing || cfg);
       checked += 1;
     } catch (e) {
       violations.push({ agent: id, error: e.message });
