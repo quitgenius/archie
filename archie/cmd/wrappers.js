@@ -822,7 +822,7 @@ async function cronHydrateInProcess(ctx, args, out, deps, { agentId, ownerAgentI
   // quietly resurrect all of them at once, in a single burst, into people's DMs"
   // (cron-hydrator.js:388-390). A count is the difference between a decision and a surprise.
   const parsed = hydrator.readAgentCron(mountDir, agentId, deps.fs);
-  const plan = hydrator.buildBodies(ownerAgentId, parsed, deps.now());
+  const plan = hydrator.buildBodies({ owner: ownerAgentId, legacy: agentId }, parsed, deps.now());
   const wouldPost = plan.bodies.length;
   const wouldEnable = plan.bodies.filter((b) => b.enabled !== false).length;
   const preview = {
