@@ -927,7 +927,13 @@ async function migrate(ctx, args, out, deps) {
     result.phases.config = { skipped: true };
   } else {
     out.progress('config: hydrating DynamoDB from the sandra config repo');
-    result.phases.config = await wrappers['config hydrate'](ctx, { positionals: [], values: {} }, out, deps.wrapperDeps);
+    // Threaded through, so `agent migrate --agents X` hydrates X and not the whole fleet. Without
+    // this the config phase rewrote EVERY agent's CONFIG and GRANT while the runtime and cron phases
+    // below were scoped to one — a blast radius nobody asked for from a scoped command. Same
+    // comma-separated string both sides, so it is a pass-through and not a translation.
+    result.phases.config = await wrappers['config hydrate'](
+      ctx, { positionals: [], values: { agents: args.values.agents } }, out, deps.wrapperDeps,
+    );
   }
 
   const agents = await agentRoster(ctx, clients, args, out);

@@ -224,8 +224,17 @@ async function configHydrate(ctx, args, out, deps) {
   const sandraDir = args.values['sandra-dir'] || deps.env.SANDRA_DIR || null;
   const ref = args.values.ref || deps.env.SANDRA_REF || 'main';
   const table = ctx.resources.configTable;
+  // Comma-separated CONFIG-REPO names. Forwarded verbatim: the names are validated against the repo
+  // by migrate-to-ddb, which is the only thing that has the repo in front of it. Resolving them here
+  // would mean a second opinion about which agents exist.
+  const agents = String(args.values.agents || '').split(',').map((a) => a.trim()).filter(Boolean);
 
   for (const line of HYDRATE_CONSEQUENCES) out.progress(line);
+  if (agents.length) {
+    out.progress(`SCOPED to ${agents.length} agent(s): ${agents.join(', ')} — this writes ONLY these `
+      + 'agents plus the fleet-wide skill library. It does NOT make them the only agents in the '
+      + 'table: hydrate never deletes, so every other agent already there is left exactly as it is.');
+  }
   const source = await resolveSandraSource({ sandraDir, ref }, out, deps);
   out.progress(`source: ${describeSource(source)} → ${table}`);
 
@@ -235,7 +244,7 @@ async function configHydrate(ctx, args, out, deps) {
 
   if (ctx.dryRun) {
     out.progress(`would run: node ${SCRIPTS.hydrate}`);
-    return { dryRun: true, table, source, consequences: HYDRATE_CONSEQUENCES };
+    return { dryRun: true, table, source, consequences: HYDRATE_CONSEQUENCES, ...(agents.length ? { agents } : {}) };
   }
 
   const { stdout } = await run({
@@ -247,9 +256,10 @@ async function configHydrate(ctx, args, out, deps) {
       AGENT_CONFIG_TABLE: table,
       SANDRA_REF: ref,
       ...(sandraDir ? { SANDRA_DIR: sandraDir } : {}),
+      ...(agents.length ? { HYDRATE_AGENTS: agents.join(',') } : {}),
     },
   }, out, deps);
-  return { table, source, log: tail(stdout, 2) };
+  return { table, source, ...(agents.length ? { agents } : {}), log: tail(stdout, 2) };
 }
 
 async function configHydrateConversations(ctx, args, out, deps) {

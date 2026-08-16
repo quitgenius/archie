@@ -72,7 +72,7 @@ const COMMANDS = {
   'agent create': { options: {}, module: 'agent', task: null, phase: 2, needsAws: true, positional: 'agent', summary: 'mint an agent identity and enqueue provisioning' },
 
   // ── config, grants, cron, observability ──────────────────────────────────
-  'config hydrate': { options: { ref:{type:'string'}, 'sandra-dir':{type:'string'} }, module: 'wrappers', task: 'W1-G', needsAws: true, dryRunDefault: true, summary: 'git config repo -> DynamoDB' },
+  'config hydrate': { options: { ref:{type:'string'}, 'sandra-dir':{type:'string'}, agents:{type:'string'} }, module: 'wrappers', task: 'W1-G', needsAws: true, dryRunDefault: true, summary: 'git config repo -> DynamoDB (--agents to scope it)' },
   'config hydrate-conversations': { options: { file:{type:'string'}, s3:{type:'string'} }, module: 'wrappers', task: 'W1-G', needsAws: true, dryRunDefault: true, summary: 'conversations snapshot -> DynamoDB' },
   'config validate': { options: {}, module: 'wrappers', task: 'W1-G', needsAws: false, summary: 'requires-closure, routing single-source, round-trip gates' },
   'config parity': { options: {}, module: 'wrappers', task: 'W1-G', needsAws: true, summary: 'config vs deployed parity checks' },
