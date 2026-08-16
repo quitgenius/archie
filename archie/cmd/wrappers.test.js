@@ -748,3 +748,50 @@ test('every declared wrappers command resolves, and no verb-keyed export can sha
     assert.equal(wrappers[verb], undefined, `exporting "${verb}" would shadow another noun's command`);
   }
 });
+
+// ── the §8.10 rename link: resolving the owner when only the SCOPE-keyed item exists ────────────
+//
+// `cron hydrate` takes the LEGACY name (it is an EFS directory) and has to find the archie identity
+// that owns the jobs. It read `AGENT#<legacy>/META`, which worked while hydration wrote legacy items
+// and `rekey` moved them afterwards. Since eb14aeefa hydration writes ONLY the scope id, so that key
+// exists for no agent and every invocation needed `--as` — which is precisely the guess this command
+// refuses to make. `META.efsRoot` is the link, and the same one legacyAgentIdFor and Connector
+// adoption use.
+test('cron hydrate resolves the owner via META.efsRoot when no legacy item exists', async () => {
+  const base = cronDeps();
+  const out = makeOut();
+  const deps = {
+    ...base.deps,
+    agentRouting: async () => null,                       // no AGENT#agent-xx9aff/META
+    agentByEfsRoot: async (n) => (n === 'agent-xx9aff' ? 'dm-ux0mz5ckp2r' : null),
+  };
+  const r = await wrappers['cron hydrate'](makeCtx({ dryRun: true }), args(['agent-xx9aff']), out, deps);
+  assert.equal(r.owner, 'dm-ux0mz5ckp2r');
+});
+
+// Still refuses rather than falling back to the legacy name — the split identity that caused is the
+// whole reason the lookup is not skippable.
+test('cron hydrate REFUSES when neither the routing item nor an adopting agent exists', async () => {
+  const base = cronDeps();
+  const deps = { ...base.deps, agentRouting: async () => null, agentByEfsRoot: async () => null };
+  await rejects(
+    wrappers['cron hydrate'](makeCtx(), args(['agent-swnm7k']), makeOut(), deps),
+    EXIT.REFUSED, /cannot tell which identity owns/,
+  );
+});
+
+// --as still wins, and must not consult either lookup.
+test('cron hydrate --as overrides both lookups', async () => {
+  const base = cronDeps();
+  let looked = false;
+  const deps = {
+    ...base.deps,
+    agentRouting: async () => { looked = true; return null; },
+    agentByEfsRoot: async () => { looked = true; return null; },
+  };
+  const a = args(['agent-xx9aff']);
+  a.values.as = 'dm-explicit';
+  const r = await wrappers['cron hydrate'](makeCtx({ dryRun: true }), a, makeOut(), deps);
+  assert.equal(r.owner, 'dm-explicit');
+  assert.equal(looked, false, '--as must short-circuit the lookups entirely');
+});

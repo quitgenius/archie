@@ -694,9 +694,17 @@ async function cronHydrate(ctx, args, out, deps) {
  * `agent-xx9aff` while every message went to `dm-ux0mz5ckp2r`.
  *
  * Resolution order, and there is deliberately NO fallback to the legacy name:
- *   --as <id>   an explicit override, for when config has not been hydrated yet
- *   AGENT#<legacy>/META routing → scopeIdForRouting() — the SAME rule the dispatcher mints with
- *   otherwise   REFUSE. Guessing is what created the split identity in the first place.
+ *   --as <id>       an explicit override, for when config has not been hydrated yet
+ *   AGENT#<id>/META routing → scopeIdForRouting() — the SAME rule the dispatcher mints with.
+ *                   Hits when the caller passed a scope id, or a legacy item still exists.
+ *   META.efsRoot    the §8.10 rename link: find the scope-keyed agent that ADOPTED this legacy
+ *                   directory. Since `eb14aeefa` hydration writes ONLY the scope id — no legacy
+ *                   items, no separate rekey — so `AGENT#<legacy>/META` no longer exists for any
+ *                   agent and the step above can never hit for a legacy name. Without this every
+ *                   invocation needed `--as`, which is exactly the guess this command refuses to
+ *                   make. `efsRoot` is the same field the dispatcher's `legacyAgentIdFor` and the
+ *                   Connector adopt path resolve through, so there is one link, not three.
+ *   otherwise       REFUSE. Guessing is what created the split identity in the first place.
  */
 async function resolveCronOwner(ctx, args, out, deps, agentId) {
   const explicit = args.values.as;
@@ -711,11 +719,19 @@ async function resolveCronOwner(ctx, args, out, deps, agentId) {
 
   const meta = await readAgentRouting(ctx, deps, agentId);
   if (!meta) {
+    // The §8.10 rename link, before refusing: this name is a legacy EFS directory, and the agent
+    // that adopted it records it as `META.efsRoot`.
+    const adopted = await findAgentByEfsRoot(ctx, deps, agentId);
+    if (adopted) {
+      out.progress(`owner       ${adopted}  (§8.10 scope id, adopted efsRoot=${agentId})`);
+      return adopted;
+    }
     throw refused(`no routing config for ${agentId} — cannot tell which identity owns its cron jobs`, {
-      detail: `AGENT#${agentId}/META is absent from ${ctx.resources.configTable}. Run \`archie config `
-        + 'hydrate\` first, or pass --as <scope-id> if you know it. Refusing to store the jobs under the '
-        + 'legacy name: that creates an agent no Slack event routes to, whose App Home is empty and '
-        + 'whose jobs run under an identity with no config, runtime or grants.',
+      detail: `Neither AGENT#${agentId}/META nor any agent with META.efsRoot=${agentId} is in `
+        + `${ctx.resources.configTable}. Run \`archie config hydrate --agents ${agentId}\` first, or pass `
+        + '--as <scope-id> if you know it. Refusing to store the jobs under the legacy name: that '
+        + 'creates an agent no Slack event routes to, whose App Home is empty and whose jobs run '
+        + 'under an identity with no config, runtime or grants.',
     });
   }
   const scopeId = scopeIdForRouting(meta);
@@ -744,6 +760,56 @@ async function readAgentRouting(ctx, deps, agentId) {
   } catch {
     return null;
   }
+}
+
+/**
+ * The scope-keyed agent that ADOPTED a legacy EFS directory, or null.
+ *
+ * §8.10 renamed every migrated agent, and `META.efsRoot` is what carries the old name across — the
+ * same field `fleet drift` uses to tell a legitimate legacy adopt from data loss, and the same one
+ * the dispatcher's `legacyAgentIdFor` reads to decide an agent is not new. Resolving through it
+ * here means the legacy→scope link has ONE definition rather than one per command.
+ *
+ * Routed agents only, via the routing GSI: an agent with no routing has no scope identity to own
+ * jobs, which is the case the caller below refuses anyway. That also bounds this to the fleet size
+ * rather than a full table scan.
+ */
+async function findAgentByEfsRoot(ctx, deps, legacyName) {
+  if (deps.agentByEfsRoot) return deps.agentByEfsRoot(legacyName);
+  const { makeClient } = require('../lib/aws');
+  const { DynamoDBDocumentClient, QueryCommand, BatchGetCommand } = require('@aws-sdk/lib-dynamodb');
+  const doc = deps.doc || DynamoDBDocumentClient.from(makeClient(ctx, '@aws-sdk/client-dynamodb', 'DynamoDBClient'));
+  const table = ctx.resources.configTable;
+
+  const ids = [];
+  let ExclusiveStartKey;
+  do {
+    const r = await doc.send(new QueryCommand({
+      TableName: table,
+      IndexName: 'routing',
+      KeyConditionExpression: 'gsi1pk = :p',
+      ExpressionAttributeValues: { ':p': 'ROUTING' },
+      ExclusiveStartKey,
+    }));
+    for (const it of r.Items || []) if (it.gsi1sk) ids.push(it.gsi1sk);
+    ExclusiveStartKey = r.LastEvaluatedKey;
+  } while (ExclusiveStartKey);
+
+  for (let i = 0; i < ids.length; i += 100) { // BatchGetItem caps at 100 keys
+    const Keys = ids.slice(i, i + 100).map((id) => ({ pk: `AGENT#${id}`, sk: 'META' }));
+    const r = await doc.send(new BatchGetCommand({ RequestItems: { [table]: { Keys } } }));
+    for (const it of (r.Responses || {})[table] || []) {
+      let meta;
+      try { meta = typeof it.data === 'string' ? JSON.parse(it.data) : it.data; } catch { continue; }
+      const root = String((meta && meta.efsRoot) || '');
+      // efsRoot is the bare legacy name today; it was a full path before eb14aeefa, so match the
+      // last segment either way rather than assuming which era wrote the item.
+      if (root && root.split('/').filter(Boolean).pop() === legacyName) {
+        return String(it.pk).replace(/^AGENT#/, '');
+      }
+    }
+  }
+  return null;
 }
 
 /** The agents tree is mounted here (inside the hydrator task, or a test). Seed directly. */
