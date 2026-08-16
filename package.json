@@ -2,13 +2,14 @@
   "name": "archie-docker-lint",
   "version": "1.0.0",
   "private": true,
-  "description": "Lint-only root for the archie/AgentCore docker tree. Holds the single ESLint 9 flat config (eslint.config.mjs) and the toolchain the per-package `npm run lint` scripts shell out to. Deliberately has NO runtime dependencies — nothing in here is copied into any image.",
+  "description": "Lint-only root for the archie/AgentCore docker tree. Holds the single ESLint 9 flat config (eslint.config.mjs) and the toolchain the per-package `npm run lint` scripts shell out to. Deliberately has NO runtime dependencies \u2014 nothing in here is copied into any image.",
   "scripts": {
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "test": "node --test eslint.config.test.mjs",
     "swallowed-errors": "eslint . -f json | node -e \"let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const r=JSON.parse(s),t={};let n=0;for(const f of r)for(const m of f.messages){if(m.ruleId!=='local/no-statementless-catch')continue;n++;const p=f.filePath.replace(process.cwd()+'/','').split('/');const k=p[0]==='clawdbot'?p.slice(0,2).join('/'):p[0];t[k]=(t[k]||0)+1}for(const k of Object.keys(t).sort())console.log(String(t[k]).padStart(5),k);console.log(String(n).padStart(5),'TOTAL')})\"",
-    "typecheck": "tsc --noEmit -p tsconfig.json"
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "check": "bash scripts/check.sh"
   },
   "devDependencies": {
     "@types/node": "^26.2.0",
