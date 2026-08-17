@@ -2,8 +2,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { applyToolFilter } from './tool-filter.mjs';
 import { makeCapabilityResolver, makeAllowCheck } from './capabilities.mjs';
-import { toolCapabilities } from '../tool-registry.mjs';
-const TC = toolCapabilities();
+import { CUSTOM_TOOLS } from '../tool-declarations.mjs';
+const TC = CUSTOM_TOOLS;
 
 const NOOP_LOG = { info() {}, warn() {} };
 

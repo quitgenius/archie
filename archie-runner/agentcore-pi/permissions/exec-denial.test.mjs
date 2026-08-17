@@ -3,8 +3,8 @@ import assert from 'node:assert/strict';
 import { applyToolFilter } from './tool-filter.mjs';
 import { createPermissionsExtension } from './permissions-extension.mjs';
 import { makeCapabilityResolver, makeAllowCheck, makeDecider } from './capabilities.mjs';
-import { toolCapabilities } from '../tool-registry.mjs';
-const TC = toolCapabilities();
+import { CUSTOM_TOOLS } from '../tool-declarations.mjs';
+const TC = CUSTOM_TOOLS;
 
 // Proves the end-to-end guarantee: an agent WITHOUT a `runtime` grant cannot exec.
 // Both enforcement layers are exercised against the SAME tool surface:

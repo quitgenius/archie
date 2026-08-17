@@ -5,48 +5,22 @@
 // providers already return their own ToolDefinition[]; the registry only NAMES them, declares their
 // capability surface + `mandatory` flag, and makes the CLOSURE INVARIANT checkable.
 //
-// It is DERIVED from the tools themselves (§8.6 single source): the synthetic providers come
-// straight from each custom tool's declared `capability` (tool-registry.toolCapabilities). Only the
-// Pi built-ins need a static list (Pi owns those objects — we can't decorate them), and the plugins
-// are declared by capability surface because their tools are dynamic (prefix/toolkit-resolved).
-
-import { toolCapabilities } from '../tool-registry.mjs';
+// It is DERIVED from the tool DECLARATIONS (§8.6 single source): the synthetic providers come
+// straight from each custom tool's declared `capability`. Only the Pi built-ins need a static list
+// (Pi owns those objects — we can't decorate them), and the plugins are declared by capability
+// surface because their tools are dynamic (prefix/toolkit-resolved).
+//
+// IT READS tool-declarations.mjs, NOT tool-registry.mjs, AND THAT IS LOAD-BEARING. tool-registry
+// imports every build*Tools factory, each of which does `const T = piAi.Type` at module scope, and
+// pi-runtime.mjs top-level-awaits the Pi packages — so importing it dragged the entire Pi harness in
+// behind a manifest. With declarations as data this module has no heavy dependency at all, which is
+// what lets the dispatcher use it instead of mirroring these facts by hand.
+import { CORE_TOOLS, CUSTOM_TOOLS, PLUGIN_PROVIDERS, PROVIDER_NAMES } from '../tool-declarations.mjs';
 import { isBaseline } from './capabilities.mjs';
 
-// The canonical provider-name set. Kept in lockstep with config-resolver/providers.mjs's
-// PROVIDER_NAMES by provider-registry.test.mjs (which imports BOTH) — NOT imported from there,
-// because this module loads at agent BOOT and the config-resolver tree sits at a different relative
-// depth in the built image than in the repo (permissions/ is flattened to /app/permissions/); a
-// cross-tree import here would resolve in tests but module-not-found in the container → boot crash.
-// NB `otel.fleet` is a synthetic provider like any other: this registry derives ONE provider per
-// capability from the tools' declarations, and the otel_fleet_* tools declare `otel.fleet` (the
-// fleet-wide + ad-hoc tier, grant-gated) while the otel_my_* tools declare baseline `otel`. Hence a
-// dotted provider name — the first one; it is the capability, not a new plugin.
-export const PROVIDER_NAMES = new Set([
-  'core',
-  'memory', 'cron', 'otel', 'otel.fleet', 'datadog', 'cloudwatch-logs', 'aws-person79b333-secrets', 'airflow', 'aws-readonly', 'sandbox-probe',
-  'connector', 'demo-cache', 'mcp-auth', 'hindsight',
-]);
-
-// Pi owns the built-in tool objects, so a static tool→capability list is unavoidable here — the ONE
-// place §8.6's "declare on the tool" can't reach. These are the `core` provider's tools (the same
-// set the runtime resolver hard-codes in capabilities.mjs; kept in lockstep by the closure test).
-export const CORE_TOOLS = {
-  read: 'fs.read', grep: 'fs.read', find: 'fs.read', ls: 'fs.read', glob: 'fs.read', tree: 'fs.read', list: 'fs.read',
-  write: 'fs.write', edit: 'fs.write', apply_patch: 'fs.write',
-  bash: 'runtime', exec: 'runtime', process: 'runtime', sessions_spawn: 'runtime',
-};
-
-// Plugin providers — declared by capability SURFACE (their tools are dynamic, so there's no static
-// name list). `mcp-auth` also owns the per-agent MCP server prefixes (demo_warehouse/demo_query_app/…) resolved at
-// runtime. `hindsight` is a HOOKS plugin (§8.7) — no tool object at all — carried here purely for
-// provenance + closure completeness.
-const PLUGIN_PROVIDERS = {
-  connector: { capabilities: ['connector', 'connector.exec', 'health'], kind: 'plugin' },
-  'demo-cache': { capabilities: ['demo_cache'], kind: 'plugin' },
-  'mcp-auth': { capabilities: ['demo_warehouse'], kind: 'plugin' }, // + per-agent extraMcpServers prefixes at runtime
-  hindsight: { capabilities: ['hindsight.read', 'hindsight.write'], kind: 'plugin-hooks' },
-};
+// Re-exported from the declarations, where it now lives as the SINGLE copy — see the note there for
+// why there used to be two and a lockstep test holding them together.
+export { PROVIDER_NAMES };
 
 /**
  * Build the provider manifest. Providers: { name → { name, kind, capabilities:Set, tools:Set,
@@ -54,7 +28,7 @@ const PLUGIN_PROVIDERS = {
  * baseline synthetic providers (memory/cron/otel) — they exist for auditability/closure, not
  * lifecycle. Everything else is optional (grant-gated, install/uninstall via a skill/plugin).
  */
-export function buildProviderRegistry(cwd = '/tmp') {
+export function buildProviderRegistry() {
   const providers = {};
   const ensure = (name, kind, mandatory) =>
     (providers[name] ||= { name, kind, capabilities: new Set(), tools: new Set(), mandatory });
@@ -65,7 +39,7 @@ export function buildProviderRegistry(cwd = '/tmp') {
 
   // synthetic adapter-native — ONE provider per capability, DERIVED from the tools' own declarations
   // (§8.6). Baseline caps (memory/cron/otel) are mandatory infra; the rest are optional grant-gated.
-  for (const [tool, cap] of Object.entries(toolCapabilities(cwd))) {
+  for (const [tool, cap] of Object.entries(CUSTOM_TOOLS)) {
     const p = ensure(cap, 'synthetic', isBaseline(cap));
     p.tools.add(tool); p.capabilities.add(cap);
   }

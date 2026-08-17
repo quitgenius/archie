@@ -112,7 +112,8 @@ COPY agentcore-pi/pi-runtime.mjs agentcore-pi/pi-adapter.mjs agentcore-pi/config
      agentcore-pi/trace-context.mjs agentcore-pi/otel-tool.mjs agentcore-pi/datadog-tool.mjs \
      agentcore-pi/aws-assume.mjs agentcore-pi/cloudwatch-logs-tool.mjs agentcore-pi/aws-person79b333-secrets-tool.mjs \
      agentcore-pi/airflow-tool.mjs agentcore-pi/aws-readonly-tool.mjs \
-     agentcore-pi/sandbox-probe-tool.mjs agentcore-pi/observability-iam.cjs agentcore-pi/tool-registry.mjs ./
+     agentcore-pi/sandbox-probe-tool.mjs agentcore-pi/observability-iam.cjs agentcore-pi/tool-registry.mjs \
+     agentcore-pi/tool-declarations.mjs ./
 # The OTEL self-observability tools (otel-tool.mjs) load the query/metric corpus from the shared
 # single source of truth — agentcore-observability/insight-queries.js (the same file the dashboard
 # builder + BDD suite use). Copy it in next to the adapter so the tools and the dashboard can't drift.

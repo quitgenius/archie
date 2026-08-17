@@ -1,9 +1,20 @@
-// §8.6 capability-on-tool: the fleet-wide {toolName → capability} map, derived from the tools
-// themselves (each tool declares `capability`). This is the single source that replaces the old
-// hand-written capabilityOf switch. The adapter builds its PER-SESSION resolver from the tools it
-// actually built for that agent (see pi-adapter); this registry enumerates ALL custom tools with a
-// permissive allow-set (grant-gating decides RUNTIME availability, not the capability DECLARATION),
-// and is used by tests + as a static reference.
+// §8.6 capability-on-tool: the factories that BUILD our adapter-native tools.
+//
+// The {toolName → capability} map lives in tool-declarations.mjs (data, zero imports) rather than
+// being derived by CONSTRUCTING every tool to read two fields off the objects. What that changed:
+//
+//   · Nothing that only wants the MAP loads the Pi harness. Every tool module does
+//     `const T = piAi.Type` at module scope, and pi-runtime.mjs top-level-awaits the Pi packages, so
+//     the old `toolCapabilities()` pulled in the whole agent runtime — which is why the dispatcher
+//     could not use it, and why config-resolver/providers.mjs existed as a hand-written mirror until
+//     this change let the real modules ship (that file is now deleted).
+//   · The hand-maintained `ALL_CAPS` allow-set is gone. It existed solely to force construction, and
+//     had to list allow-set TOKENS and capability names side by side because the factories gate on
+//     the former. tool-declarations.permissiveAllowSet() derives both from the declarations.
+//
+// allCustomTools() stays, and is now TEST-ONLY: constructing the real tools is how we prove the
+// declarations match reality (tool-registry.test.mjs asserts both directions). Runtime tool building
+// happens per session in pi-adapter with that agent's real allow-set, never through here.
 
 import { buildMemoryTools } from './memory-tool.mjs';
 import { buildCronTools } from './cron-tool.mjs';
@@ -14,34 +25,33 @@ import { buildPerson79b333SecretsTools } from './aws-person79b333-secrets-tool.m
 import { buildAirflowTools } from './airflow-tool.mjs';
 import { buildAwsReadonlyTools } from './aws-readonly-tool.mjs';
 import { createSandboxProbeTool } from './sandbox-probe-tool.mjs';
+import { CUSTOM_TOOLS, permissiveAllowSet } from './tool-declarations.mjs';
 
-// Permissive allow-set so every build*Tools yields its tools. NB build gates check the raw
-// allow-set TOKENS (e.g. buildMemoryTools → 'memory_search'/'memory_get'), which are NOT always the
-// capability the tool declares ('memory') — so include both flavors.
-const ALL_CAPS = new Set([
-  'memory', 'memory_search', 'memory_get', 'cron', 'otel', 'datadog', 'cloudwatch-logs',
-  'aws-person79b333-secrets', 'airflow', 'aws-readonly', 'sandbox-probe', 'fs.read', 'fs.write', 'runtime',
-]);
-
-// Every custom tool, built once with a permissive allow-set (+ the probe directly, bypassing its
-// env flag) so the map is complete regardless of grants/flags.
+/**
+ * Every custom tool, actually built — with a permissive allow-set (+ the probe directly, bypassing
+ * its env flag) so the set is complete regardless of grants or flags.
+ *
+ * FOR TESTS. Importing this module imports the whole tool tree and therefore Pi; if you only need
+ * names or capabilities, import tool-declarations.mjs directly.
+ */
 export function allCustomTools(cwd = '/tmp') {
+  const allow = permissiveAllowSet();
   return [
-    ...buildMemoryTools(ALL_CAPS, cwd),
-    ...buildCronTools(ALL_CAPS),
+    ...buildMemoryTools(allow, cwd),
+    ...buildCronTools(allow),
     ...buildOtelTools(),
-    ...buildDatadogTools(ALL_CAPS),
-    ...buildCloudwatchLogsTools(ALL_CAPS),
-    ...buildPerson79b333SecretsTools(ALL_CAPS),
-    ...buildAirflowTools(ALL_CAPS),
-    ...buildAwsReadonlyTools(ALL_CAPS),
+    ...buildDatadogTools(allow),
+    ...buildCloudwatchLogsTools(allow),
+    ...buildPerson79b333SecretsTools(allow),
+    ...buildAirflowTools(allow),
+    ...buildAwsReadonlyTools(allow),
     createSandboxProbeTool(),
   ];
 }
 
-// {toolName → capability} from the tools' own declarations.
-export function toolCapabilities(cwd = '/tmp') {
-  return Object.fromEntries(
-    allCustomTools(cwd).filter((t) => t && t.name && t.capability).map((t) => [t.name, t.capability]),
-  );
-}
+// NO toolCapabilities() ANY MORE. It used to derive {name → capability} by constructing every tool;
+// once the declarations became data it was a one-line passthrough to CUSTOM_TOOLS, and every caller
+// was a test. They import tool-declarations.mjs directly now — which also means the permission tests
+// no longer load the Pi harness to read a constant. The runtime never used it: pi-adapter builds its
+// own toolCaps from the tools it actually built for that session (pi-adapter.mjs:1051), because a
+// session's surface depends on that agent's allow-set, not on the full declared set.

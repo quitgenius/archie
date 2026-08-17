@@ -1,8 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { makeCapabilityResolver, makeDecider, makeAllowCheck, policyFor, isBaseline, CAPABILITY_DEFAULTS } from './capabilities.mjs';
-import { toolCapabilities } from '../tool-registry.mjs';
-const TC = toolCapabilities();
+import { CUSTOM_TOOLS } from '../tool-declarations.mjs';
+const TC = CUSTOM_TOOLS;
 
 test('makeAllowCheck: silent baseline/grant check (no telemetry) — for the tool filter', () => {
   const allow = makeAllowCheck({ grants: new Set(['demo_query_app']) });

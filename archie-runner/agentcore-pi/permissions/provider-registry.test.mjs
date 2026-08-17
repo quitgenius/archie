@@ -1,14 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  buildProviderRegistry, providerForCapability, checkClosure, assertClosure, unknownProviders, PROVIDER_NAMES, CORE_TOOLS,
+  buildProviderRegistry, providerForCapability, checkClosure, assertClosure, unknownProviders, PROVIDER_NAMES,
 } from './provider-registry.mjs';
 import { makeCapabilityResolver, isBaseline } from './capabilities.mjs';
-import { toolCapabilities, allCustomTools } from '../tool-registry.mjs';
-import { PROVIDER_NAMES as SHIPPED_PROVIDER_NAMES } from '../../config-resolver/providers.mjs';
+import { allCustomTools } from '../tool-registry.mjs';
+import { CUSTOM_TOOLS, CORE_TOOLS } from '../tool-declarations.mjs';
 
 const REG = buildProviderRegistry();
-const TC = toolCapabilities();
+const TC = CUSTOM_TOOLS;
 const capOf = makeCapabilityResolver({ mcpPrefixes: ['demo_query_app', 'demo_warehouse'], toolCaps: TC });
 
 test('registry has a core provider (mandatory) covering the Pi built-ins', () => {
@@ -78,7 +78,3 @@ test('registry provider names are all known to the shippable PROVIDER_NAMES list
   assert.deepEqual(unknownProviders(REG), []);
 });
 
-test('the boot-local PROVIDER_NAMES is in LOCKSTEP with the shippable config-resolver copy', () => {
-  // provider-registry keeps its own copy (no cross-tree import at boot); this guards the drift.
-  assert.deepEqual([...PROVIDER_NAMES].sort(), [...SHIPPED_PROVIDER_NAMES].sort());
-});
