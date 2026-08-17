@@ -35,6 +35,21 @@ async function loadCaps() {
   return _caps;
 }
 
+// Skill pins (see config-resolver/skill-pins.mjs). Exported as `loadSkillPins` because the App Home
+// install action in index.js needs it too, and the pin must read from ONE declaration — a pin enforced
+// at the button but not at hydration is theatre, and vice versa.
+let _pins = null;
+async function loadSkillPins() {
+  if (_pins) return _pins;
+  try {
+    _pins = await import('./config-resolver/skill-pins.mjs');
+  } catch (e) {
+    if (e.code !== 'ERR_MODULE_NOT_FOUND') throw e;
+    _pins = await import('../archie-runner/config-resolver/skill-pins.mjs');
+  }
+  return _pins;
+}
+
 let _schema = null;
 async function loadSchema() {
   if (_schema) return _schema;
@@ -406,4 +421,5 @@ module.exports = {
   assertGrantable,
   setDerivedRoleHook,
   toolCatalog,
+  loadSkillPins,
 };

@@ -1719,6 +1719,20 @@ bolt.action('marketplace_install', async ({ ack, body, client }) => {
   const child = log.child({ action: 'marketplace_install', user: userId, agent: agentId, skill: skillId });
   if (!agentId) { await client.chat.postMessage({ channel: userId, text: NO_AGENT_MSG }); return; }
 
+  // PINNED SKILLS come first, because a pin is stricter than a review flag and does not depend on the
+  // catalog carrying one. `skill-builder` is precisely that case: sandra does NOT mark it
+  // securityReviewRequired, so the check below would wave it through. See config-resolver/skill-pins.mjs.
+  //
+  // This is the WEAKER of the two enforcement points and is documented as such: 134 of the 135
+  // demo-crm installs never came through this button — they arrived via hydration, which is
+  // gated separately in extract.mjs. A pin here alone would stop nothing that has already happened.
+  const pins = await grants.loadSkillPins();
+  if (pins.isPinned(skillId) && !pins.pinAllows(skillId, agentId)) {
+    child.warn({ skill: skillId }, 'install refused: pinned skill, scope not on the allow-list');
+    await client.chat.postMessage({ channel: userId, text: `:pushpin: ${pins.pinRefusalText(skillId)}` });
+    return;
+  }
+
   // Skills flagged for security review were gated behind human PR approval in the old flow. There
   // is no DDB-native approval path yet, so don't silently auto-install — route to #sandra-management.
   const catalogSkill = marketplace.getCatalog().skills[skillId] || {};

@@ -139,6 +139,11 @@ const IMAGES = {
       { path: 'archie-runner/config-resolver/derive-exec-role.mjs' },
       { path: 'archie-runner/config-resolver/caps-from-config.mjs' },
       { path: 'archie-runner/config-resolver/schema.mjs' },
+      // The skill-pin allow-lists. Declared for a sharper reason than the rest: this file decides which
+      // scopes may hold a gated skill, so an edit that did NOT move the tag would leave the dispatcher
+      // enforcing the OLD allow-list while the repo showed the new one — a permissions change that
+      // silently did not ship. Populating an allow-list must roll the gateway.
+      { path: 'archie-runner/config-resolver/skill-pins.mjs' },
 
       // Dockerfile:76-84. The tool/capability declarations the Tools tab renders, imported from the
       // agent tree rather than mirrored. Declared here for the same reason as every file above: the

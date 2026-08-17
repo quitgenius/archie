@@ -71,7 +71,8 @@ COPY --chown=dispatcher:dispatcher archie-runner/config-seed/new-agent-skeleton/
 COPY --chown=dispatcher:dispatcher archie-runner/agentcore-pi/workspace-seed.mjs ./agentcore-pi/
 
 COPY --chown=dispatcher:dispatcher archie-runner/config-resolver/skill-iam-requirements.mjs archie-runner/config-resolver/derive-exec-role.mjs \
-     archie-runner/config-resolver/caps-from-config.mjs archie-runner/config-resolver/schema.mjs ./config-resolver/
+     archie-runner/config-resolver/caps-from-config.mjs archie-runner/config-resolver/schema.mjs \
+     archie-runner/config-resolver/skill-pins.mjs ./config-resolver/
 
 # The tool/capability model the App Home Tools tab renders — THE AGENT'S OWN DECLARATIONS, not a
 # generated copy of them. tool-declarations.mjs has zero imports and provider-registry.mjs reads it
