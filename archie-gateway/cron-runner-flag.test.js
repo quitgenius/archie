@@ -110,35 +110,36 @@ describe('reading a decided scope', () => {
   });
 });
 
-describe('the cache exists so a flip needs no restart', () => {
-  it('serves repeat reads without touching DynamoDB', async () => {
+describe('no cache: the row is read at FIRE TIME and used immediately', () => {
+  // THE PROPERTY THE FLAG EXISTS FOR. A cached value means a fire can be decided on a row that has
+  // since changed — i.e. a scope flipped to `agentcore` in Slack keeps firing here for the rest of
+  // the TTL, on both stacks. This started at a 30s TTL to spare DynamoDB; that trade was wrong and
+  // the tests now pin the absence of it.
+  it('reads on EVERY resolution — two questions, two reads', async () => {
     const doc = fakeDoc([item('dm-u1', { runner: 'agentcore' })]);
     const f = flags(doc);
     await f.get('dm-u1');
     await f.get('dm-u1');
-    expect(doc.seen.filter((s) => s.name === 'GetCommand')).toHaveLength(1);
+    expect(doc.seen.filter((s) => s.name === 'GetCommand')).toHaveLength(2);
   });
 
-  it('expires, so an edit made straight to the table is picked up', async () => {
-    const doc = fakeDoc([item('dm-u1', { runner: 'openclaw' })]);
-    let clock = 1000;
-    const f = flags(doc, { now: () => clock, ttlMs: 30_000 });
-    expect((await f.get('dm-u1')).runner).toBe('openclaw');
-    doc.store.set(keyOf('AGENT#dm-u1', 'CRON'), item('dm-u1', { runner: 'agentcore' }));
-    clock += 29_000;
-    expect((await f.get('dm-u1')).runner).toBe('openclaw'); // still inside the TTL
-    clock += 2_000;
-    expect((await f.get('dm-u1')).runner).toBe('agentcore');
-  });
-
-  // The App Home button has to take effect on the next tick. A write that left a stale cache entry
-  // behind would look like it had worked and would not have.
-  it('a write through this module drops the entry immediately', async () => {
+  it('a flip is honoured by the very next read, with no invalidation and no wait', async () => {
     const doc = fakeDoc([item('dm-u1', { runner: 'openclaw' })]);
     const f = flags(doc);
     expect(await f.isAgentCore('dm-u1')).toBe(false);
-    await f.set('dm-u1', 'agentcore', { by: 'U123' });
+    // somebody flips it in Slack — a DIFFERENT process, so nothing here is notified
+    doc.store.set(keyOf('AGENT#dm-u1', 'CRON'), item('dm-u1', { runner: 'agentcore' }));
     expect(await f.isAgentCore('dm-u1')).toBe(true);
+  });
+
+  it('reads every time when built the way index.js builds it', async () => {
+    const doc = fakeDoc([item('dm-u1', { runner: 'openclaw' })]);
+    // built the way index.js builds it: no ttlMs at all
+    const f = createCronRunnerFlags({ doc, table: TABLE });
+    await f.get('dm-u1');
+    await f.get('dm-u1');
+    await f.get('dm-u1');
+    expect(doc.seen.filter((s) => s.name === 'GetCommand')).toHaveLength(3);
   });
 });
 
@@ -187,3 +188,4 @@ describe('setDefault — hydration must not undo a cutover', () => {
     expect(update.input.ConditionExpression).toBe('attribute_not_exists(pk)');
   });
 });
+

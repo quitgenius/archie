@@ -72,24 +72,23 @@ function parseRunner(value) {
   return isValidRunner(value) ? value : null;
 }
 
-// How long a resolved value is trusted before it is re-read. The flip has to take effect without a
-// dispatcher restart (an App Home toggle that needs a deploy is not a toggle), and cron fires are
-// far too sparse for a per-fire read to cost anything — but a job firing every few seconds should
-// not hit DynamoDB every tick either. 30s is the compromise; a write through this module drops the
-// entry immediately, so the only case that waits out the TTL is an edit made straight to the table.
-const DEFAULT_TTL_MS = 30_000;
-
 /**
+ * NO CACHING, DELIBERATELY (2026-08-17). Every call reads DynamoDB.
+ *
+ * This module briefly carried a 30s TTL cache, added to spare the table reads nobody had complained
+ * about. It was removed because it traded away the only property the flag has: with a cache, a fire
+ * can be decided from a row that has since changed, so a scope flipped in Slack keeps firing here
+ * until the entry expires — firing on BOTH stacks, which is the outcome this whole mechanism exists
+ * to prevent. What a read costs is not the point; when it happens is.
+ *
  * @param deps.doc      DynamoDBDocumentClient (injected — keeps this module aws-sdk-free)
  * @param deps.table    agent-config table name
  * @param deps.now      () => epoch ms (injectable for tests)
- * @param deps.ttlMs    cache lifetime (default 30s; 0 disables caching)
  * @param deps.log      pino-shaped logger
  */
 function createCronRunnerFlags(deps = {}) {
   const { doc, table } = deps;
   const now = deps.now || Date.now;
-  const ttlMs = deps.ttlMs === undefined ? DEFAULT_TTL_MS : deps.ttlMs;
   const log = deps.log || { info() {}, warn() {}, error() {} };
 
   // No table configured is a REAL state, not a test artifact: a dispatcher can boot without
@@ -98,32 +97,6 @@ function createCronRunnerFlags(deps = {}) {
   const configured = !!(doc && table);
   if (!configured) {
     log.warn({}, 'cron runner flag: no agent-config table — every scope resolves to the default (openclaw)');
-  }
-
-  const cache = new Map(); // agentId -> { record, expiresAtMs }
-
-  function cached(agentId) {
-    const hit = cache.get(agentId);
-    if (!hit) return null;
-    if (ttlMs > 0 && hit.expiresAtMs > now()) return hit.record;
-    cache.delete(agentId);
-    return null;
-  }
-
-  function remember(agentId, record) {
-    if (ttlMs > 0) cache.set(agentId, { record, expiresAtMs: now() + ttlMs });
-    return record;
-  }
-
-  function invalidate(agentId) {
-    if (agentId === undefined) cache.clear();
-    else cache.delete(agentId);
-  }
-
-  /** The last resolved value without touching DynamoDB — for metrics/log enrichment only. */
-  function peek(agentId) {
-    const hit = cached(agentId);
-    return hit ? hit.runner : null;
   }
 
   function defaultRecord(agentId, source) {
@@ -152,31 +125,28 @@ function createCronRunnerFlags(deps = {}) {
    */
   async function get(agentId) {
     if (!agentId) return defaultRecord(agentId, 'default');
-    const hit = cached(agentId);
-    if (hit) return hit;
-    if (!configured) return remember(agentId, defaultRecord(agentId, 'default'));
+    if (!configured) return defaultRecord(agentId, 'default');
     let body;
     try {
       body = await readItem(agentId);
     } catch (err) {
-      // NOT cached: a table blip must not pin a scope to the fallback for the whole TTL, and the
-      // next fire should get a fresh answer.
+      // The next fire asks again — there is nothing holding this answer.
       log.error({ agent: agentId, err: String(err && err.message) }, 'cron runner flag: read failed — falling back to openclaw');
       return defaultRecord(agentId, 'unreadable');
     }
-    if (!body) return remember(agentId, defaultRecord(agentId, 'default'));
+    if (!body) return defaultRecord(agentId, 'default');
     const runner = parseRunner(body.runner);
     if (!runner) {
       log.warn({ agent: agentId, stored: body.runner }, 'cron runner flag: unrecognised runner — falling back to openclaw');
-      return remember(agentId, defaultRecord(agentId, 'invalid'));
+      return defaultRecord(agentId, 'invalid');
     }
-    return remember(agentId, {
+    return {
       agentId,
       runner,
       source: 'store',
       setAtMs: Number.isFinite(body.setAtMs) ? body.setAtMs : null,
       setBy: body.setBy || null,
-    });
+    };
   }
 
   /** The one question the fire gate asks. */
@@ -204,8 +174,8 @@ function createCronRunnerFlags(deps = {}) {
 
   /**
    * Set a scope's runner. This is the cutover action — it moves the schedule between stacks — so it
-   * is logged at info with WHO did it, and the cache entry is dropped so the very next fire honours
-   * it (no restart, no wait).
+   * is logged at info with WHO did it. The very next fire on either stack reads the row and honours
+   * it: no restart, no invalidation, nothing to wait for.
    */
   async function set(agentId, runner, opts = {}) {
     if (!agentId) throw new Error('cron: agentId required');
@@ -216,7 +186,6 @@ function createCronRunnerFlags(deps = {}) {
     if (!configured) throw new Error('CRON_RUNNER store is not configured on this dispatcher (no agent-config table)');
     const body = { runner: value, setAtMs: now(), setBy: opts.by || 'unknown' };
     await write(agentId, body);
-    invalidate(agentId);
     log.info({ agent: agentId, runner: value, setBy: body.setBy }, 'cron runner flag: SET — this scope\'s cron jobs now belong to this scheduler');
     return { agentId, runner: value, source: 'store', setAtMs: body.setAtMs, setBy: body.setBy, wrote: true };
   }
@@ -236,7 +205,6 @@ function createCronRunnerFlags(deps = {}) {
     const body = { runner: value, setAtMs: now(), setBy: opts.by || 'hydrate' };
     try {
       await write(agentId, body, { ifAbsent: true });
-      invalidate(agentId);
       log.info({ agent: agentId, runner: value }, 'cron runner flag: seeded the default');
       return { agentId, runner: value, wrote: true, existing: null };
     } catch (err) {
@@ -248,7 +216,7 @@ function createCronRunnerFlags(deps = {}) {
     }
   }
 
-  return { get, isAgentCore, set, setDefault, peek, invalidate, _configured: configured };
+  return { get, isAgentCore, set, setDefault, _configured: configured };
 }
 
 module.exports = {
