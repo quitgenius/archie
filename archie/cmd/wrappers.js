@@ -30,8 +30,8 @@ const { makeClient } = require('../lib/aws');
 
 // docker/ — this file lives at docker/archie/cmd/wrappers.js.
 const DOCKER_ROOT = path.resolve(__dirname, '..', '..');
-const CONFIG_RESOLVER = path.join(DOCKER_ROOT, 'clawdbot', 'config-resolver');
-const OBSERVABILITY = path.join(DOCKER_ROOT, 'clawdbot', 'agentcore-observability');
+const CONFIG_RESOLVER = path.join(DOCKER_ROOT, 'archie-runner', 'config-resolver');
+const OBSERVABILITY = path.join(DOCKER_ROOT, 'archie-runner', 'agentcore-observability');
 const DISPATCHER = path.join(DOCKER_ROOT, 'archie-gateway');
 
 const SCRIPTS = {

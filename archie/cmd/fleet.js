@@ -765,7 +765,7 @@ function assertMakeConstraints(text) {
     [`--platform=${PLATFORM}`, 'AgentCore microVMs are arm64 (Makefile:59-68)'],
     ['--build-context lintroot=.', 'the lint gate\'s first `COPY --from=lintroot` fails without it (Makefile:267-270)'],
     ['-f ./archie-runner/agentcore-pi/Dockerfile', 'the Dockerfile must be named explicitly, since the context is its parent'],
-    ['./clawdbot', 'the build context is ./clawdbot, NOT agentcore-pi/ — the Dockerfile COPYs sibling plugin-sdk/ and connector-session-plugin/'],
+    ['./archie-runner', 'the build context is ./archie-runner, NOT agentcore-pi/ — the Dockerfile COPYs sibling plugin-sdk/ and connector-session-plugin/'],
     ['$(AGENTCORE_PI_TAG)', 'archie passes the tag as a make override; a hard-coded tag would silently ignore it'],
   ];
   for (const [needle, why] of required) {

@@ -839,3 +839,27 @@ test('cron hydrate --as overrides both lookups', async () => {
   assert.equal(r.owner, 'dm-explicit');
   assert.equal(looked, false, '--as must short-circuit the lookups entirely');
 });
+
+// THE CLASS OF BUG THE 2026-08-17 TREE RENAME EXPOSED, and the reason it is worth a test.
+//
+// Every script this file shells into is addressed by a path ASSEMBLED FROM SEGMENTS
+// (`path.join(DOCKER_ROOT, 'archie-runner', 'config-resolver')`). When archie's trees were renamed
+// out of the OpenClaw paths, a regex sweep over module specifiers caught every `require('../x')` and
+// `import('../x')` and missed all three of these, because there is no `clawdbot/` substring in them
+// to match — only the word, sitting in an argument list.
+//
+// Nothing else can see it either: eslint resolves specifiers, not join() calls; the unit suites
+// never reach these paths (they mock `execFile`); and `npm run check` was green with all three
+// pointing at directories that no longer existed. It surfaced only when `archie deploy` refused on
+// an unrelated guard, which is luck, not coverage.
+//
+// So: assert the resolved paths EXIST. It is the cheapest possible statement of "these constants
+// name real directories", and it fails the moment a tree moves again.
+test('every script path this file shells into resolves to a file that exists', () => {
+  const { SCRIPTS } = wrappers._internals;
+  const missing = Object.entries(SCRIPTS).filter(([, p]) => !require('node:fs').existsSync(p));
+  assert.deepEqual(missing, [],
+    `these script paths do not exist:\n  ${missing.map(([k, p]) => `${k} -> ${p}`).join('\n  ')}\n`
+    + 'They are built with path.join() from directory-name segments, so a renamed tree leaves them '
+    + 'pointing at nothing and no linter or specifier sweep will notice.');
+});

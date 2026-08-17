@@ -53,7 +53,7 @@ async function phaseConfig() {
   if (skip('config')) { log('config: skipped'); return; }
   log(`config: hydrating DynamoDB from sandra${DRY ? ' [dry-run — skipping]' : ''}`);
   if (DRY) return;
-  execFileSync('node', [path.join(__dirname, '..', 'clawdbot', 'config-resolver', 'hydrate.mjs')],
+  execFileSync('node', [path.join(__dirname, '..', 'archie-runner', 'config-resolver', 'hydrate.mjs')],
     { stdio: 'inherit', env: { ...process.env, AGENT_CONFIG_TABLE: TABLE } });
   log('config: DynamoDB + config-seed hydrated');
 }
