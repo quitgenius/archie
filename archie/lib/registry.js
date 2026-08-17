@@ -80,7 +80,6 @@ const COMMANDS = {
   'grants apply': { options: {}, module: 'wrappers', task: 'W1-G', needsAws: true, positional: 'agent', summary: 'rewrite the role policy only, from GRANT#* as stored' },
   'cron hydrate': { options: { as:{type:'string'} }, module: 'wrappers', task: 'W1-G', needsAws: true, dryRunDefault: true, positional: 'agent', summary: 'fold an agent EFS cron store into the dispatcher store' },
   'cron list': { options: {}, module: 'wrappers', task: 'W1-G', needsAws: true, positional: 'agent', summary: 'list scheduled jobs via the manager API' },
-  'cron runner': { options: { set:{type:'string'} }, module: 'wrappers', task: 'W1-G', needsAws: true, dryRunDefault: true, positional: 'agent', summary: 'read (or --set) which scheduler fires a scope\'s jobs' },
   'cron arm': { options: {}, module: 'wrappers', task: 'W1-G', needsAws: true, summary: 'arm the cron scheduler' },
   'cron disarm': { options: {}, module: 'wrappers', task: 'W1-G', needsAws: true, summary: 'disarm the cron scheduler' },
   'dashboard deploy': { options: { dashboard:{type:'string'} }, module: 'wrappers', task: 'W1-G', needsAws: true, summary: 'PutDashboard for the fleet board' },

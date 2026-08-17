@@ -657,37 +657,6 @@ async function cronList(ctx, args, out, deps) {
 }
 
 /**
- * `archie cron runner <scope> [--set openclaw|agentcore]` — the CRON_RUNNER flag (§3a').
- *
- * TAKES THE SCOPE ID, not the legacy agent name, and that is not a detail: the flag is keyed by the
- * identity that OWNS the jobs in archie's store (`dm-<user>` / `ch-<channel>`), which is what
- * `cron hydrate` resolves and stores under. Passing `agent-xx9aff` here would read and write a
- * row nothing consults. `cron list` has the same contract.
- *
- * Goes through the manager API rather than DynamoDB directly for the reason every cron write does:
- * the dispatcher caches the resolved flag, and a write behind its back would be honoured only after
- * the cache expired — a flip that appears to have worked and has not.
- *
- * A read is free; a --set is a cutover, so it honours --dry-run like every other mutation here.
- */
-async function cronRunner(ctx, args, out, deps) {
-  const agentId = oneAgent(args);
-  const want = args.values.set;
-  const api = await managerApi(ctx, out, deps);
-  const current = await api.getRunner(agentId);
-  out.progress(`${agentId}: CRON_RUNNER=${current.runner} (${current.source}${current.setBy ? `, set by ${current.setBy}` : ''})`);
-  if (!want) return { agent: agentId, ...current };
-  if (want === current.runner) {
-    out.progress(`already ${want} — nothing to change`);
-    return { agent: agentId, ...current, changed: false };
-  }
-  out.progress(`${want === 'agentcore' ? 'archie will START' : 'archie will STOP'} firing ${agentId}'s jobs on its next tick`);
-  if (ctx.dryRun) return { dryRun: true, agent: agentId, from: current.runner, to: want };
-  const result = await api.setRunner(agentId, want, { by: `archie:${deps.env.USER || 'cli'}` });
-  return { agent: agentId, from: current.runner, ...result, changed: true };
-}
-
-/**
  * `archie cron hydrate <agent>` — GATEWAY-OWNERSHIP-PLAN.md §8/§E1.
  *
  * TWO MODES, and the split is not a convenience. The hydrator must read the PARENT access point
@@ -1226,7 +1195,6 @@ module.exports = {
 
   'cron hydrate': (ctx, args, out, deps) => cronHydrate(ctx, args, out, withDefaults(deps)),
   'cron list': (ctx, args, out, deps) => cronList(ctx, args, out, withDefaults(deps)),
-  'cron runner': (ctx, args, out, deps) => cronRunner(ctx, args, out, withDefaults(deps)),
   'cron arm': (ctx, args, out, deps) => cronArming(ctx, out, withDefaults(deps), { want: true }),
   'cron disarm': (ctx, args, out, deps) => cronArming(ctx, out, withDefaults(deps), { want: false }),
 
