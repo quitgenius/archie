@@ -296,8 +296,13 @@ export default [
       // The two OpenClaw trees restored from master. They are master's code, linted by
       // whatever master does (nothing, today) — adopting them is a separate, deliberate
       // change, exactly like the dirs above.
-      'slack-dispatcher/**',
-      'clawdbot/**',
+      // NOT LISTED HERE, deliberately: `slack-dispatcher/**` and `clawdbot/**`, the two OpenClaw trees
+      // restored from master. They need no ignore — every rule block below is scoped by `files` and
+      // none of them names those paths, and there is no universal block carrying rules, so eslint
+      // finds no configuration for them and skips them. An `ignores` entry would be worse than
+      // redundant: a globally ignored DIRECTORY is never traversed, so `!clawdbot/my-file.mjs` cannot
+      // un-ignore anything inside it — which is exactly what the CRON_RUNNER gate needs, since that
+      // file IS ours and IS linted (its own block below).
       'archie-runner/agentcore-skills/**',
       'archie-runner/config-seed/**',
       'archie-runner/hindsight-ingest/**',
@@ -372,6 +377,18 @@ export default [
       'archie-gateway/cron-runner-flag.js',
     ],
     rules: { 'n/no-missing-import': 'off' },
+  },
+
+  // ── clawdbot: ONLY the CRON_RUNNER gate this branch adds (ESM, node builtins) ──
+  {
+    files: ['clawdbot/cron-runner-gate.mjs', 'clawdbot/cron-runner-gate.test.mjs'],
+    languageOptions: {
+      ecmaVersion: 2023,
+      sourceType: 'module',
+      globals: { ...globals.node },
+    },
+    plugins: { n, local },
+    rules: bugRules,
   },
 
   // ── archie-runner/agentcore-pi, config-resolver, agentcore-provision: ESM ─
