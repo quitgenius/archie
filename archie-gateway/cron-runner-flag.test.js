@@ -189,3 +189,44 @@ describe('setDefault — hydration must not undo a cutover', () => {
   });
 });
 
+// §3a'' — the legacy-name alias. The OpenClaw gateway knows only its AGENT_NAME; the flag is keyed by
+// ScopeId. This row is the bridge, and it is written by hydration because that is the only place both
+// identities are in scope at once.
+describe('setAlias — the pointer the OpenClaw gate resolves through', () => {
+  it('writes { alias } at the LEGACY key, leaving the scope row alone', async () => {
+    const doc = fakeDoc([item('dm-u1', { runner: 'openclaw', setBy: 'hydrate' })]);
+    const r = await flags(doc).setAlias('agent-xx9aff', 'dm-u1', { by: 'hydrate:agent-xx9aff' });
+    expect(r).toMatchObject({ legacyName: 'agent-xx9aff', scopeId: 'dm-u1', wrote: true });
+    expect(bodyOf(doc, 'agent-xx9aff')).toEqual({
+      alias: 'dm-u1', setAtMs: 1000, setBy: 'hydrate:agent-xx9aff',
+    });
+    expect(bodyOf(doc, 'dm-u1')).toMatchObject({ runner: 'openclaw' });
+  });
+
+  // The row at that key would be the RUNNER row. An alias there is either clobbered by it or clobbers
+  // it — and the symptom would be a scope that silently reads `openclaw` forever.
+  it('REFUSES to alias a name to itself', async () => {
+    const doc = fakeDoc();
+    await expect(flags(doc).setAlias('dm-u1', 'dm-u1')).rejects.toThrow(/itself — that key holds the runner row/);
+    expect(doc.store.size).toBe(0);
+  });
+
+  it('is write-if-absent, and reports what was already there', async () => {
+    const doc = fakeDoc([item('agent-xx9aff', { alias: 'dm-somebody-else' })]);
+    const r = await flags(doc).setAlias('agent-xx9aff', 'dm-u1');
+    expect(r).toMatchObject({ wrote: false, existing: 'dm-somebody-else' });
+    // untouched — a re-hydration must not repoint a row somebody else owns
+    expect(bodyOf(doc, 'agent-xx9aff')).toEqual({ alias: 'dm-somebody-else' });
+  });
+
+  it('reports a RUNNER value found at the legacy key, not just an alias', async () => {
+    // An agent whose scope id IS its name was hydrated earlier, so this key holds a runner.
+    const doc = fakeDoc([item('agent-3t86ii', { runner: 'agentcore' })]);
+    const r = await flags(doc).setAlias('agent-3t86ii', 'dm-u1');
+    expect(r).toMatchObject({ wrote: false, existing: 'agentcore' });
+  });
+
+  it('requires both names', async () => {
+    await expect(flags(fakeDoc()).setAlias('', 'dm-u1')).rejects.toThrow(/legacyName and scopeId required/);
+  });
+});

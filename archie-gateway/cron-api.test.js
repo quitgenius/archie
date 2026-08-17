@@ -24,6 +24,7 @@ function fakeService(over = {}) {
     getRunner: vi.fn(async (agentId) => ({ agentId, runner: 'openclaw', source: 'default', setAtMs: null, setBy: null })),
     setRunner: vi.fn(async (agentId, runner, opts) => ({ agentId, runner, wrote: true, setBy: opts && opts.by })),
     setDefaultRunner: vi.fn(async (agentId, opts) => ({ agentId, runner: (opts && opts.runner) || 'openclaw', wrote: true })),
+    setRunnerAlias: vi.fn(async (legacyName, scopeId) => ({ legacyName, scopeId, wrote: true })),
     ...over,
   };
 }
@@ -297,6 +298,15 @@ describe('GET/PUT /cron/:agentId/runner', () => {
     await put('/cron/dm-u1/runner', { runner: 'openclaw', by: 'hydrate:x', ifAbsent: true });
     expect(service.setDefaultRunner).toHaveBeenCalledWith('dm-u1', { runner: 'openclaw', by: 'hydrate:x' });
     expect(service.setRunner).not.toHaveBeenCalled();
+  });
+
+  it("writes the legacy-name alias through the same route — it is the same ROW", async () => {
+    const res = await put('/cron/agent-xx9aff/runner', { alias: 'dm-u1', by: 'hydrate:agent-xx9aff' });
+    expect(res.status).toBe(200);
+    expect(service.setRunnerAlias).toHaveBeenCalledWith('agent-xx9aff', 'dm-u1', { by: 'hydrate:agent-xx9aff' });
+    // …and it must NOT be mistaken for a runner write
+    expect(service.setRunner).not.toHaveBeenCalled();
+    expect(service.setDefaultRunner).not.toHaveBeenCalled();
   });
 
   it('an unknown runner is a 400, not a 500', async () => {

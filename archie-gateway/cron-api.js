@@ -187,14 +187,19 @@ function createCronApi(deps) {
   // asked (`by`) and about which of the two writes it is doing:
   //   {runner}                  set it — a cutover decision, overwrites whatever is there.
   //   {runner, ifAbsent: true}  seed the default — used by hydration, never overwrites a decision.
+  //   {alias: <scopeId>}        write the legacy-name pointer the OpenClaw gate reads (§3a''), also
+  //                             write-if-absent. Same route because it is the same ROW — one key
+  //                             shape for the gate to look up, whichever name it holds.
   router.put('/:agentId/runner', async (req, res) => {
     const child = log.child ? log.child({ op: 'cron.runner.set' }) : log;
     const { agentId } = req.params;
     const body = req.body || {};
     try {
-      const result = body.ifAbsent
-        ? await service.setDefaultRunner(agentId, { runner: body.runner, by: body.by })
-        : await service.setRunner(agentId, body.runner, { by: body.by });
+      const result = body.alias
+        ? await service.setRunnerAlias(agentId, body.alias, { by: body.by })
+        : (body.ifAbsent
+          ? await service.setDefaultRunner(agentId, { runner: body.runner, by: body.by })
+          : await service.setRunner(agentId, body.runner, { by: body.by }));
       return res.json({ ok: true, ...result });
     } catch (err) {
       return fail(res, err, child);

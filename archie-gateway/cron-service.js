@@ -249,6 +249,16 @@ function createCronService(opts) {
     return runnerFlags.setDefault(agentId, options);
   }
 
+  /**
+   * The legacy-name → ScopeId pointer the OpenClaw gate resolves through (cron-runner-flag.setAlias).
+   * Written by hydration only; nothing in archie reads it, because archie is keyed by scope
+   * everywhere already.
+   */
+  function setRunnerAlias(legacyName, scopeId, options = {}) {
+    if (!runnerFlags) return Promise.reject(new Error('CRON_RUNNER store is not configured on this dispatcher'));
+    return runnerFlags.setAlias(legacyName, scopeId, options);
+  }
+
   return {
     start,
     stop,
@@ -259,6 +269,7 @@ function createCronService(opts) {
     getRunner,
     setRunner,
     setDefaultRunner,
+    setRunnerAlias,
     list: runner.list,
     runNow: runner.runNow,
     snapshotInventory,

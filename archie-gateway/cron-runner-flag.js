@@ -216,7 +216,55 @@ function createCronRunnerFlags(deps = {}) {
     }
   }
 
-  return { get, isAgentCore, set, setDefault, _configured: configured };
+  /**
+   * Write the LEGACY-NAME → ScopeId pointer the OpenClaw side resolves through.
+   *
+   * The OpenClaw gateway knows only `AGENT_NAME` — the config-repo name its EFS directory is called
+   * (`agent-xx9aff`) — and the flag is keyed by ScopeId (`dm-ux0mz5ckp2r`). Something has to
+   * bridge those, and it must not be a second copy of the §8.10 rule: re-deriving `scopeIdForRouting`
+   * over there fails silently AND in the unsafe direction, because a wrong scope id reads an ABSENT
+   * row, and absent means "keep firing".
+   *
+   * So the bridge is data, written by the only component holding both identities at once — cron
+   * hydration, which is handed the legacy name (the EFS path it reads) and the scope id (the identity
+   * it stores the jobs under). One extra row:
+   *
+   *     AGENT#<legacyName> / CRON  ->  { alias: "<scopeId>" }
+   *
+   * and the gateway does the one lookup it can express, following `alias` a single hop.
+   *
+   * REFUSES A SELF-ALIAS. When an agent's scope id IS its name (never rekeyed), the row at that key
+   * is the RUNNER row — writing an alias there would either be clobbered by, or clobber, the value
+   * the gate reads. Callers skip the alias entirely in that case; this throws if one forgets.
+   *
+   * WRITE-IF-ABSENT, like the default: re-hydrating must not overwrite a row somebody else owns.
+   */
+  async function setAlias(legacyName, scopeId, opts = {}) {
+    if (!legacyName || !scopeId) throw new Error('cron: legacyName and scopeId required');
+    if (legacyName === scopeId) {
+      throw new Error(`cron: refusing to alias "${legacyName}" to itself — that key holds the runner row`);
+    }
+    if (!configured) throw new Error('CRON_RUNNER store is not configured on this dispatcher (no agent-config table)');
+    const body = { alias: scopeId, setAtMs: now(), setBy: opts.by || 'hydrate' };
+    try {
+      await write(legacyName, body, { ifAbsent: true });
+      log.info({ legacyName, scopeId }, 'cron runner flag: wrote the legacy-name alias (read by the OpenClaw gate)');
+      return { legacyName, scopeId, wrote: true, existing: null };
+    } catch (err) {
+      if (!err || err.name !== 'ConditionalCheckFailedException') throw err;
+      // Something is already at this key. Report WHAT, because the two possibilities need different
+      // responses: the same alias again is a no-op, anything else is a collision worth looking at.
+      let existing = null;
+      try {
+        const body2 = await readItem(legacyName);
+        existing = (body2 && (body2.alias || body2.runner)) || null;
+      } catch { /* reported as unknown below */ }
+      log.info({ legacyName, scopeId, existing }, 'cron runner flag: alias already present — not overwritten');
+      return { legacyName, scopeId, wrote: false, existing };
+    }
+  }
+
+  return { get, isAgentCore, set, setDefault, setAlias, _configured: configured };
 }
 
 module.exports = {
