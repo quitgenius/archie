@@ -11,10 +11,10 @@ function fakePi() {
   return { pi: { on: (evt, fn) => (handlers[evt] = fn) }, handlers };
 }
 
-function wire({ grants = new Set(), mcpPrefixes = [], toolCaps = TC } = {}) {
+function wire({ grants = new Set(), mcpPrefixes = [] } = {}) {
   const turnCtx = { channel: 'C0TEST', agent: 'a', trigger: 'user' };
   const signals = [];
-  const capabilityOf = makeCapabilityResolver({ mcpPrefixes, toolCaps });
+  const capabilityOf = makeCapabilityResolver({ mcpPrefixes, toolCaps: TC });
   const decide = makeDecider({ grants, onSignal: (s) => signals.push(s) });
   const { pi, handlers } = fakePi();
   createPermissionsExtension({ capabilityOf, decide, turnCtx })(pi);
@@ -158,15 +158,8 @@ test('the connector RCE tools are baseline-allowed, and the slug still identifie
   }
 });
 
-// PATH COVERAGE, not a production configuration. Since `connector` is baseline-allow there is no
-// longer any connector call the capability layer denies, so the deny branch is reached here by
-// DECLARING a connector-named tool with a non-baseline capability (toolCaps is consulted first). The
-// property under test is that the slug field is populated independently of the decision — "a remote
-// bash was blocked" beats "something was blocked" if a pin-layer forbid ever creates such a case.
-test('a denied connector call still reports its slug', () => {
-  const { onToolCall, signals } = wire({ toolCaps: { ...TC, mcp_connector__SOME_FORBIDDEN: 'connector.forbidden' } });
-  const r = onToolCall({ toolName: 'mcp_connector__SOME_FORBIDDEN', input: { tool_slug: 'SOME_FORBIDDEN' } });
-  assert.equal(r.block, true);
-  assert.equal(signals.at(-1).decision, 'deny');
-  assert.equal(signals.at(-1).slugs, 'SOME_FORBIDDEN');
-});
+// NO deny-path slug test. `connector` is baseline-allow, so the capability layer denies no connector call
+// and the only way to reach that branch was a synthetic capability no production config produces.
+// Deleted rather than kept as path coverage (sandbox): a test whose fixture cannot occur in production
+// asserts something about the fixture, not about the system. If a pin-layer forbid ever makes a denied
+// connector call real, the test comes back with that configuration.
