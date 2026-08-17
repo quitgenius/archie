@@ -489,9 +489,9 @@ test('build --dry-run: prints the make command and the push, and runs nothing', 
 });
 
 test('build --push: the Makefile builds, and the push goes to the CLI\'s registry, not the Makefile\'s', async () => {
-  // The build stays in `make` because the three constraints live there; the PUSH deliberately does not
-  // (`make push-agentcore-pi`'s registry, account and profile are sandbox literals — Makefile:288-290),
-  // because every resource this CLI touches must come from --name/--region/the caller's account.
+  // The build stays in `make` because the three constraints live there; the PUSH does not, and
+  // `make push-agentcore-pi` has been deleted for it — it hard-coded registry, account and profile as
+  // sandbox literals, whereas every resource this CLI touches comes from --name/--region/the caller.
   const ran = [];
   const { result } = await runBuild(ctxFor(), { push: true }, {
     ecr: fakeEcr(false),

@@ -926,10 +926,11 @@ async function build(ctx, args, out, deps = {}) {
 
   let pushed = false;
   if (values.push) {
-    // The push does NOT go through `make push-agentcore-pi`: that target's registry, account and
-    // profile are sandbox literals (Makefile:71-73,136), and every resource name the CLI touches must
-    // come from `--name`/`--region`/the caller's account instead (context.js:12-16). The build stays
-    // in the Makefile because the build is where the three constraints live.
+    // The push is the CLI's, not the Makefile's. `make push-agentcore-pi` used to exist and is now
+    // DELETED: it hard-coded the registry, account and profile as sandbox literals, while every
+    // resource name this CLI touches must come from `--name`/`--region`/the caller's account
+    // (context.js:12-16) — so it could only ever push to one place. The BUILD stays in the Makefile,
+    // because that is where the three build constraints (arm64, context, lintroot) live.
     const host = registryHostFor(account, ctx.region);
     const { GetAuthorizationTokenCommand } = require('@aws-sdk/client-ecr');
     const auth = await aws.ecr().send(new GetAuthorizationTokenCommand({}));
