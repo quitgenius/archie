@@ -564,10 +564,13 @@ async function grantsReconcile(ctx, args, out, deps) {
   const agentInstalls = (marketplace.getInstalls().installs || {})[agentId] || {};
 
   // Preview from the SAME source of truth the write uses (capsWithSources), so a dry run cannot
-  // disagree with the apply.
+  // disagree with the apply. That includes `before.grant` as the `existing` argument: the write
+  // (marketplace._reconcileSkillGrant) preserves the stored grant's foreign sources — manual grants
+  // approved in App Home's Tools tab — so a preview computed without them would report a revocation
+  // that the apply will not perform.
   const { capsWithSources, grantedCaps } = await deps.modules.caps();
   const before = await readStoredGrant(clients, table, agentId, deps);
-  const next = capsWithSources(cfg, agentInstalls, marketplace.getCatalog(), agentId);
+  const next = capsWithSources(cfg, agentInstalls, marketplace.getCatalog(), agentId, before.grant);
   const nextCaps = grantedCaps(next);
   const added = nextCaps.filter((c) => !before.caps.includes(c));
   const removed = before.caps.filter((c) => !nextCaps.includes(c));
