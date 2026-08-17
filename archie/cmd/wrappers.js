@@ -37,7 +37,6 @@ const DISPATCHER = path.join(DOCKER_ROOT, 'archie-gateway');
 const SCRIPTS = {
   hydrate: path.join(CONFIG_RESOLVER, 'hydrate.mjs'),
   validateRequires: path.join(CONFIG_RESOLVER, 'validate-requires.mjs'),
-  parity: path.join(CONFIG_RESOLVER, 'parity.mjs'),
   routesParity: path.join(CONFIG_RESOLVER, 'routes-parity.mjs'),
   seedRoundtrip: path.join(CONFIG_RESOLVER, 'seed-roundtrip.mjs'),
   skillRoundtrip: path.join(CONFIG_RESOLVER, 'skill-roundtrip.mjs'),
@@ -385,17 +384,15 @@ async function configValidate(ctx, args, out, deps) {
       requires: [path.join(CONFIG_RESOLVER, 'items', 'skill-catalog.json')],
     }, out, deps),
     await routingSingleSourceGate(out, deps),
-    await gate({
-      name: 'resolver-parity',
-      script: SCRIPTS.parity,
-      cwd: CONFIG_RESOLVER,
-      requires: [path.join(CONFIG_RESOLVER, 'ground-truth', '_manifest.json'), path.join(CONFIG_RESOLVER, 'resolved')],
-      // `resolved/` is a BUILD ARTIFACT, and a checked-in stale copy fails this gate for a reason
-      // that has nothing to do with the config repo. Say which red this is — a red whose cause is
-      // "you did not regenerate the inputs" is otherwise indistinguishable from a real regression.
-      onFail: 'compares config-resolver/resolved/ against ground-truth/ — both are generated. '
-        + 'Re-run capture-ground-truth.mjs + extract.mjs + resolve.mjs before reading this as a regression.',
-    }, out, deps),
+    // NO `resolver-parity` GATE. It byte-compared config-resolver/resolved/ against ground-truth/, and
+    // both it and the harness behind it are deleted: `resolved/` was produced by resolve.mjs, which had
+    // been broken since the fleet base config became the BASE_MAIN constant (it still read
+    // items/base.json, removed with it), so this gate could not pass on any current checkout.
+    //
+    // What it was FOR — proving the item split is lossless — is now config-resolver's
+    // boot-config.test.mjs, which drives every agent in the fleet and compares the values pi-adapter actually
+    // consumes rather than a rendered file. That runs offline in `npm run check`; this one needed two
+    // generated directories nobody regenerates.
   ];
   return finishGates(gates, out);
 }
