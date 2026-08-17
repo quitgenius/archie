@@ -1,3 +1,5 @@
+import { toolSlugField } from './third-party-slug.mjs';
+
 // Pi extension: enforce tool-permission capabilities at the tool_call hook (the PEP choke point
 // for every callable tool — built-in, custom, connector, MCP). Hindsight is NOT a tool, so it is
 // gated separately at its own context/agent_end hooks via the `can()` helper below.
@@ -51,7 +53,14 @@ export function createPermissionsExtension({ capabilityOf, decide, turnCtx }) {
         }
       }
       const cap = capabilityOf(event.toolName);
-      const allowed = decide(cap, { tool: event.toolName, channel: turnCtx.channel, agent: turnCtx.agent, trigger: turnCtx.trigger });
+      // What the call is actually DOING, for telemetry: connector's six generic tools carry the real
+      // action as an argument, so `tool` alone cannot distinguish reading a calendar from sending an
+      // email. The slug only — never the arguments beside it, which hold recipients and bodies.
+      const slugs = toolSlugField(event.toolName, event.input || event.args);
+      const allowed = decide(cap, {
+        tool: event.toolName, channel: turnCtx.channel, agent: turnCtx.agent, trigger: turnCtx.trigger,
+        ...(slugs ? { slugs } : {}),
+      });
       if (!allowed) {
         // Blocking reason is fed back to the model as the tool result — legible + seeds a grant request.
         return { block: true, reason: `permission denied: capability "${cap}" is not granted in this channel` };

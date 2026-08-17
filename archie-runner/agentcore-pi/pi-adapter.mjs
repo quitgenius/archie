@@ -156,6 +156,11 @@ function onPermissionSignal(sig) {
         Metrics: denied ? [{ Name: 'ToolCall', Unit: 'Count' }, { Name: 'ToolDenied', Unit: 'Count' }] : [{ Name: 'ToolCall', Unit: 'Count' }] }] },
       Agent: AGENT_NAME, capability: sig.capability, decision: sig.decision,
       ...(sig.tool ? { tool: sig.tool } : {}), ...(sig.channel ? { channel: sig.channel } : {}), ...(sig.surface ? { surface: sig.surface } : {}),
+      // The connector action the call executes (GMAIL_SEND_EMAIL, SLACK_SEND_MESSAGE, …). A PROPERTY,
+      // never a Dimension: dimensions multiply the metric's cardinality by every slug in every
+      // toolkit, and `stats count() by slugs` in Logs Insights answers the same questions for free.
+      // Slug only — permissions/third-party-slug.mjs never reads the arguments beside it (PII).
+      ...(sig.slugs ? { slugs: sig.slugs } : {}),
       ToolCall: 1, ...(denied ? { ToolDenied: 1 } : {}),
       component: 'pi-adapter', msg: 'permission_decision',
     }));
@@ -1051,7 +1056,7 @@ async function getSession(key, seed = {}) {
   // audit gap; the throwing form assertClosure() is the BDD/test gate). Registry is memoized.
   try {
     const surfaced = [...tools, ...customTools].map((t) => t && t.name).filter(Boolean);
-    const { ok, holes, byProvider } = checkClosure(surfaced, { capabilityOf, registry: (PROVIDER_REGISTRY ||= buildProviderRegistry(CWD)) });
+    const { ok, holes, byProvider } = checkClosure(surfaced, { capabilityOf, registry: (PROVIDER_REGISTRY ||= buildProviderRegistry()) });
     if (!ok) console.error(JSON.stringify({ level: 'warn', component: 'pi-adapter', msg: 'closure invariant hole(s) — tool(s) with no provider', key, holes }));
     else console.log(JSON.stringify({ level: 'info', component: 'pi-adapter', msg: 'closure ok', key, providers: Object.keys(byProvider) }));
   } catch (e) {

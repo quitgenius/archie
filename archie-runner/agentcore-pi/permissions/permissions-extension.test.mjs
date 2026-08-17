@@ -2,8 +2,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createPermissionsExtension, makeCan } from './permissions-extension.mjs';
 import { makeCapabilityResolver, makeDecider } from './capabilities.mjs';
-import { toolCapabilities } from '../tool-registry.mjs';
-const TC = toolCapabilities();
+import { CUSTOM_TOOLS } from '../tool-declarations.mjs';
+const TC = CUSTOM_TOOLS;
 
 // Minimal fake Pi: capture the tool_call handler registered via pi.on.
 function fakePi() {
@@ -114,4 +114,40 @@ test('the capability check still applies on a cron turn', () => {
   const r = onToolCall({ toolName: 'demo_query_app__run_query' });
   assert.equal(r.block, true);
   assert.match(r.reason, /capability "demo_query_app" is not granted/);
+});
+
+// ── The connector slug reaches telemetry ─────────────────────────────────────────
+// Connector's six generic tools carry the real action as an argument, so `tool` alone cannot tell a
+// calendar read from an email send. The slug rides the decision signal to the EMF line; the
+// arguments beside it never do (permissions/third-party-slug.mjs).
+test('a connector multi-execute reports the slug it will run', () => {
+  const { onToolCall, signals } = wire();
+  const r = onToolCall({
+    toolName: 'mcp_connector__CONNECTOR_MULTI_EXECUTE_TOOL',
+    input: { tools: [{ tool_slug: 'GMAIL_SEND_EMAIL', arguments: { recipient_email: 'jane@example.com', subject: 'private' } }] },
+  });
+  assert.equal(r, undefined);                       // connector is baseline — allowed
+  assert.equal(signals.at(-1).capability, 'connector');
+  assert.equal(signals.at(-1).slugs, 'GMAIL_SEND_EMAIL');
+  // ...and nothing from the arguments came with it.
+  const s = JSON.stringify(signals.at(-1));
+  assert.equal(s.includes('jane@example.com'), false);
+  assert.equal(s.includes('private'), false);
+});
+
+test('a non-connector tool call carries no slugs field at all', () => {
+  const { onToolCall, signals } = wire({ grants: new Set(['runtime']) });
+  onToolCall({ toolName: 'bash', input: { command: 'echo hi' } });
+  assert.equal('slugs' in signals.at(-1), false);
+});
+
+// A DENIED call is the one you most want to identify: connector.exec is default-deny, and "something
+// was blocked" is far less useful than "a remote bash was blocked".
+test('a denied connector call still reports its slug', () => {
+  const { onToolCall, signals } = wire();
+  const r = onToolCall({ toolName: 'mcp_connector__CONNECTOR_REMOTE_BASH_TOOL', input: { tool_slug: 'CONNECTOR_REMOTE_BASH_TOOL' } });
+  assert.equal(r.block, true);
+  assert.equal(signals.at(-1).decision, 'deny');
+  assert.equal(signals.at(-1).capability, 'connector.exec');
+  assert.equal(signals.at(-1).slugs, 'CONNECTOR_REMOTE_BASH_TOOL');
 });
