@@ -37,6 +37,7 @@ const pino = require('pino');
 const { BedrockClient } = require('@aws-sdk/client-bedrock');
 const { BedrockRuntimeClient } = require('@aws-sdk/client-bedrock-runtime');
 const marketplace = require('./marketplace');
+const grants = require('./grants');
 const conversations = require('./conversations');
 const { recordMessage } = require('./metrics');
 const { StreamingManager } = require('./streaming');
@@ -87,6 +88,11 @@ const dispatcherMetrics = createDispatcherMetrics({ log });
 // (always on — no flag); same-tier → live PutRolePolicy, a
 // base↔dedicated crossing → runtime recreate.
 marketplace.setDerivedRoleHook((gc) => agentCore.applyDerivedRoleGrantChange(gc.agentId, gc, { logger: log }));
+// The same hook for the OTHER writer of GRANT#*: App Home's Tools tab. Both go through it because a
+// capability is two facts — the DynamoDB row the in-container PEP reads, and the derived role's
+// inline policy that grants the underlying AWS access. Writing one without the other produces a
+// capability the agent is permitted to use and cannot actually exercise.
+grants.setDerivedRoleHook((gc) => agentCore.applyDerivedRoleGrantChange(gc.agentId, gc, { logger: log }));
 
 // ---------- Config ----------
 
@@ -1195,6 +1201,9 @@ if (bolt) bolt.event('app_home_opened', async ({ event, client }) => {
       opts.jobs = await fetchAgentCronJobs(agentId);
       opts.cronRunner = await fetchCronRunner(agentId);
     }
+    if (activeTab === 'tools' && agentId) {
+      opts.tools = await fetchToolPermissions(agentId);
+    }
     const view = marketplace.buildHomeView(agentId, activeTab, opts);
     await client.views.publish({ user_id: userId, view });
     child.info('app home published');
@@ -1394,11 +1403,103 @@ if (bolt) bolt.action('marketplace_tab_jobs', async ({ ack, body, client }) => {
   }
 });
 
-// Which scheduler owns this scope's jobs (§3a'). Async because it may read DynamoDB; the flag
-// module caches, so the tab is not a per-render round trip.
+// Which scheduler owns this scope's jobs (§3a'). Async because it reads DynamoDB — deliberately
+// uncached (cron-runner-flag.js:75-84), so this IS a round trip per render.
 function fetchCronRunner(agentName) {
   return cronHome ? cronHome.getRunner(agentName) : Promise.resolve(null);
 }
+
+// ---------- Tools & permissions tab ----------
+
+// This agent's capability picture: the stored grant, plus the per-agent capabilities only its own
+// config knows about (each connector.extraMcpServers[].toolPrefix IS a capability, so a `demo_query_app` agent
+// has one no static catalogue can list).
+//
+// Returns null on ANY failure, which the builder renders as "could not read this agent's
+// permissions". That distinction is the whole point: an empty capability list and an unreadable one
+// look identical in the data and mean opposite things, and claiming an agent has no access when we
+// simply could not read it is the one wrong answer a permissions screen must not give.
+async function fetchToolPermissions(agentId) {
+  if (!AGENT_CONFIG_TABLE || !agentId) return null;
+  try {
+    const doc = configDoc();
+    const [{ grant }, extraCaps] = await Promise.all([
+      grants.readGrant(doc, AGENT_CONFIG_TABLE, agentId),
+      grants.extraCapsForAgent(doc, AGENT_CONFIG_TABLE, agentId, { log }),
+    ]);
+    return { ...(await grants.describeCapabilities(grant, extraCaps)), extraCaps };
+  } catch (err) {
+    log.error({ err: err.message, agent: agentId }, 'could not read tool permissions');
+    return null;
+  }
+}
+
+if (bolt) bolt.action('marketplace_tab_tools', async ({ ack, body, client }) => {
+  await ack();
+  const userId = body.user.id;
+  const agentId = homeAgentFor(userId, 'app_home');
+  userActiveTab.set(userId, 'tools');
+  const tools = await fetchToolPermissions(agentId);
+  try {
+    const view = marketplace.buildHomeView(agentId, 'tools', { teamId: slackTeamId, tools });
+    await client.views.publish({ user_id: userId, view });
+  } catch (err) {
+    log.error({ err: err.message }, 'failed to switch to tools tab');
+  }
+});
+
+async function refreshToolsTab(userId, client) {
+  const agentId = homeAgentFor(userId, 'app_home');
+  if (!agentId) return;
+  const tools = await fetchToolPermissions(agentId);
+  const view = marketplace.buildHomeView(agentId, 'tools', { teamId: slackTeamId, tools });
+  await client.views.publish({ user_id: userId, view });
+}
+
+// Approve / revoke a capability for the VIEWER'S OWN agent.
+//
+// homeAgentFor is the whole authorisation model here: it derives the scope from the Slack user id, so
+// there is no way to address anyone else's agent — which matters because IAM cannot express that
+// bound (dynamodb:LeadingKeys takes literal keys, and the scope is per-request). The capability
+// itself is untrusted input — Slack echoes the button value back — so grants.js validates it against
+// the catalogue rather than writing whatever arrives.
+//
+// The re-render is what confirms it: provenance appears on the row ("approved by @you"), the button
+// flips, and the tool moves from Available to Granted. No reaction, no separate confirmation message.
+async function handleGrantChange(kind, { ack, body, client }) {
+  await ack();
+  const userId = body.user.id;
+  const capability = body.actions[0].value;
+  const agentId = homeAgentFor(userId, 'app_home');
+  if (!agentId) return;
+  const child = log.child({ action: `tools_${kind}`, user: userId, agent: agentId, capability });
+  if (!AGENT_CONFIG_TABLE) { child.error('no AGENT_CONFIG_TABLE — cannot change grants'); return; }
+  try {
+    const fn = kind === 'approve' ? grants.grantCapability : grants.revokeCapability;
+    const extraCaps = await grants.extraCapsForAgent(configDoc(), AGENT_CONFIG_TABLE, agentId, { log });
+    const r = await fn(configDoc(), AGENT_CONFIG_TABLE, agentId, capability, userId, { extraCaps, log: child });
+    child.info({ caps: r.caps, role: r.role }, `capability ${kind}d`);
+    await refreshToolsTab(userId, client);
+    // Say it in words when the outcome is not what the click implied: a revoke that leaves the
+    // capability in force because a skill or the base config still grants it. The re-rendered row
+    // shows the provenance, but it still reads as "granted" and the person just pressed Revoke.
+    if (kind === 'revoke' && r.stillGranted) {
+      await client.chat.postMessage({
+        channel: userId,
+        text: `Withdrew your approval of \`${capability}\`, but *${agentId}* still has it — it is also granted by ${r.heldBy.map((s) => `\`${s}\``).join(', ')}. Remove that source to take the capability away.`,
+      });
+    }
+  } catch (err) {
+    child.error({ err: err.message }, `capability ${kind} failed`);
+    await client.chat.postMessage({
+      channel: userId,
+      text: `:x: Could not ${kind} \`${capability}\` for *${agentId}*: ${err.message}`,
+    });
+  }
+}
+
+if (bolt) bolt.action('tools_approve', (args) => handleGrantChange('approve', args));
+if (bolt) bolt.action('tools_revoke', (args) => handleGrantChange('revoke', args));
 
 // Helper to refresh the Jobs tab for a user
 async function refreshJobsTab(userId, client) {

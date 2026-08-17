@@ -375,6 +375,7 @@ export default [
       'archie-gateway/agentcore-client.js',
       'archie-gateway/marketplace.js',
       'archie-gateway/cron-runner-flag.js',
+      'archie-gateway/grants.js',
     ],
     rules: { 'n/no-missing-import': 'off' },
   },

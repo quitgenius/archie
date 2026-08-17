@@ -57,7 +57,7 @@ WORKDIR /app
 COPY --chown=dispatcher:dispatcher archie-gateway/package.json archie-gateway/package-lock.json* ./
 RUN npm install --omit=dev --no-fund --no-audit
 
-COPY --chown=dispatcher:dispatcher archie-gateway/index.js archie-gateway/marketplace.js archie-gateway/derived-role.js archie-gateway/streaming.js archie-gateway/conversations.js archie-gateway/metrics.js archie-gateway/file-ref.js archie-gateway/agentcore-client.js archie-gateway/agentcore-provisioning.js archie-gateway/dispatcher-metrics.js archie-gateway/tracing.js archie-gateway/routing-build.js archie-gateway/backpressure.js archie-gateway/connector-credential.js archie-gateway/session-tracker.js archie-gateway/image-source.js archie-gateway/turn-queue.js archie-gateway/spec-diff.js archie-gateway/cron-home.js archie-gateway/agent-scope.js archie-gateway/semaphore.js archie-gateway/sdk-http.js archie-gateway/runtime-registry.js archie-gateway/session-tracker.js \
+COPY --chown=dispatcher:dispatcher archie-gateway/index.js archie-gateway/marketplace.js archie-gateway/derived-role.js archie-gateway/streaming.js archie-gateway/conversations.js archie-gateway/metrics.js archie-gateway/file-ref.js archie-gateway/agentcore-client.js archie-gateway/agentcore-provisioning.js archie-gateway/dispatcher-metrics.js archie-gateway/tracing.js archie-gateway/routing-build.js archie-gateway/backpressure.js archie-gateway/connector-credential.js archie-gateway/session-tracker.js archie-gateway/image-source.js archie-gateway/turn-queue.js archie-gateway/spec-diff.js archie-gateway/cron-home.js archie-gateway/grants.js archie-gateway/agent-scope.js archie-gateway/semaphore.js archie-gateway/sdk-http.js archie-gateway/runtime-registry.js archie-gateway/session-tracker.js \
     archie-gateway/cron-service.js archie-gateway/cron-runner.js archie-gateway/cron-store.js archie-gateway/cron-fire.js archie-gateway/cron-delivery.js archie-gateway/cron-api.js archie-gateway/cron-hydrator.js archie-gateway/cron-metrics.js archie-gateway/cron-runner-flag.js archie-gateway/cron-inventory-metrics.js archie-gateway/peer-synth-fixture.js archie-gateway/hydrate-e2e.js archie-gateway/delivery-e2e.js archie-gateway/registry-e2e.js ./
 
 # A2 (§9.8): the agent's cap→IAM map + pure derived-role builder — the SINGLE source of truth,
@@ -71,7 +71,20 @@ COPY --chown=dispatcher:dispatcher archie-runner/config-seed/new-agent-skeleton/
 COPY --chown=dispatcher:dispatcher archie-runner/agentcore-pi/workspace-seed.mjs ./agentcore-pi/
 
 COPY --chown=dispatcher:dispatcher archie-runner/config-resolver/skill-iam-requirements.mjs archie-runner/config-resolver/derive-exec-role.mjs \
-     archie-runner/config-resolver/caps-from-config.mjs archie-runner/config-resolver/schema.mjs archie-runner/config-resolver/providers.mjs ./config-resolver/
+     archie-runner/config-resolver/caps-from-config.mjs archie-runner/config-resolver/schema.mjs ./config-resolver/
+
+# The tool/capability model the App Home Tools tab renders — THE AGENT'S OWN DECLARATIONS, not a
+# generated copy of them. tool-declarations.mjs has zero imports and provider-registry.mjs reads it
+# rather than tool-registry.mjs, so neither pulls in the Pi harness (every tool module does
+# `const T = piAi.Type` at module scope, and pi-runtime.mjs top-level-awaits the Pi packages). That is
+# what makes importing them here possible at all, and what removed the generated catalogue that used
+# to stand in for them.
+#
+# THE DIRECTORY STRUCTURE IS LOAD-BEARING, unlike the flattened config-resolver COPY above:
+# provider-registry.mjs imports `../tool-declarations.mjs` and `./capabilities.mjs` relatively, so
+# these must keep their agentcore-pi/ + permissions/ nesting or those specifiers resolve to nothing.
+COPY --chown=dispatcher:dispatcher archie-runner/agentcore-pi/tool-declarations.mjs ./agentcore-pi/
+COPY --chown=dispatcher:dispatcher archie-runner/agentcore-pi/permissions/capabilities.mjs archie-runner/agentcore-pi/permissions/provider-registry.mjs ./agentcore-pi/permissions/
 
 # ── BUILD-TIME GATES. Both run against the ASSEMBLED image, after every COPY. ─────────────────
 #
@@ -90,7 +103,7 @@ COPY --chown=dispatcher:dispatcher archie-runner/config-resolver/skill-iam-requi
 #    yet.
 RUN node -e "\
 const fs=require('fs'),path=require('path');\
-const entry=['index.js','cron-api.js','marketplace.js','derived-role.js','agentcore-client.js','cron-runner-flag.js'];\
+const entry=['index.js','cron-api.js','marketplace.js','grants.js','derived-role.js','agentcore-client.js','cron-runner-flag.js'];\
 const missing=[];\
 for(const f of entry){\
   if(!fs.existsSync(f)){missing.push(f+' (entrypoint itself not copied)');continue;}\

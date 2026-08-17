@@ -111,6 +111,7 @@ const IMAGES = {
       { path: 'archie-gateway/turn-queue.js' },
       { path: 'archie-gateway/spec-diff.js' },
       { path: 'archie-gateway/cron-home.js' },
+      { path: 'archie-gateway/grants.js' },
       { path: 'archie-gateway/semaphore.js' },
       { path: 'archie-gateway/sdk-http.js' },
       { path: 'archie-gateway/runtime-registry.js' },
@@ -138,7 +139,17 @@ const IMAGES = {
       { path: 'archie-runner/config-resolver/derive-exec-role.mjs' },
       { path: 'archie-runner/config-resolver/caps-from-config.mjs' },
       { path: 'archie-runner/config-resolver/schema.mjs' },
-      { path: 'archie-runner/config-resolver/providers.mjs' },
+
+      // Dockerfile:76-84. The tool/capability declarations the Tools tab renders, imported from the
+      // agent tree rather than mirrored. Declared here for the same reason as every file above: the
+      // digest is what turns "I edited it" into a new tag. Without them, adding a tool — which
+      // changes what the tab shows — would leave the tag identical and `gateway deploy` would report
+      // "unchanged" while the running image kept the old surface. ANOTHER overlap with the agent
+      // image, deliberately, exactly like the workspace-seed/cap→IAM files above: editing a tool
+      // declaration rolls both halves, which is correct, and the digest makes it visible.
+      { path: 'archie-runner/agentcore-pi/tool-declarations.mjs' },
+      { path: 'archie-runner/agentcore-pi/permissions/capabilities.mjs' },
+      { path: 'archie-runner/agentcore-pi/permissions/provider-registry.mjs' },
     ],
   },
 
