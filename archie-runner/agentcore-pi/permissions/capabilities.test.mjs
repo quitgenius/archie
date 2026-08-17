@@ -9,7 +9,6 @@ test('makeAllowCheck: silent baseline/grant check (no telemetry) — for the too
   assert.equal(allow('memory'), true);          // baseline
   assert.equal(allow('demo_query_app'), true);            // granted
   assert.equal(allow('demo_warehouse'), false);            // not granted
-  assert.equal(allow('connector.exec'), false);  // RCE carve, not granted
   assert.equal(allow('unknown'), false);        // fail-closed
 });
 
@@ -48,21 +47,25 @@ test('capabilityOf: connector — all three real naming forms (verified live)', 
   assert.equal(cap('connector_bind_cron_entity'), 'connector');    // plugin helper
 });
 
-test('capabilityOf: CONNECTOR_REMOTE_BASH_TOOL / _WORKBENCH are carved into grant-gated connector.exec', () => {
+// THE RCE CARVE-OUT IS DELETED, and this test pins its absence rather than being removed with it —
+// so that re-introducing a `connector.exec` branch is a deliberate act that fails a test, not a quiet
+// re-divergence from OpenClaw. The two remote-execution tools are ordinary baseline connector: every
+// agent with the plugin can call them, exactly as under OpenClaw. Audit lives in the OTEL slug field
+// (see permissions-extension.test.mjs), not in a capability.
+test('capabilityOf: the connector RCE tools are baseline connector — no exec carve-out', () => {
   const cap = makeCapabilityResolver({ toolCaps: TC });
   // The plugin registers tools as mcp_connector__<mcpName> — the LIVE names the hook actually sees.
-  assert.equal(cap('mcp_connector__CONNECTOR_REMOTE_BASH_TOOL'), 'connector.exec');
-  assert.equal(cap('mcp_connector__CONNECTOR_REMOTE_WORKBENCH'), 'connector.exec');
-  // bare names also map (defensive, in case a path registers unprefixed)
-  assert.equal(cap('CONNECTOR_REMOTE_BASH_TOOL'), 'connector.exec');
-  assert.equal(cap('CONNECTOR_REMOTE_WORKBENCH'), 'connector.exec');
-  // …but a NORMAL prefixed connector tool stays baseline (the carve-out must not over-match)
+  assert.equal(cap('mcp_connector__CONNECTOR_REMOTE_BASH_TOOL'), 'connector');
+  assert.equal(cap('mcp_connector__CONNECTOR_REMOTE_WORKBENCH'), 'connector');
+  // bare names too (defensive, in case a path registers unprefixed)
+  assert.equal(cap('CONNECTOR_REMOTE_BASH_TOOL'), 'connector');
+  assert.equal(cap('CONNECTOR_REMOTE_WORKBENCH'), 'connector');
+  // normal connector tools are unchanged and land in the same place
   assert.equal(cap('mcp_connector__CONNECTOR_SEARCH_TOOLS'), 'connector');
   assert.equal(cap('mcp_connector__gmail_send_email'), 'connector');
-  assert.equal(policyFor('connector.exec'), 'deny');               // default-deny via '*'
-  // still allowed once explicitly granted; denied otherwise
-  assert.equal(makeDecider({ grants: new Set() })('connector.exec'), false);
-  assert.equal(makeDecider({ grants: new Set(['connector.exec']) })('connector.exec'), true);
+  // and `connector` is baseline-allow, so NO grant is consulted for any of the above
+  assert.equal(policyFor('connector'), 'allow');
+  assert.equal(makeDecider({ grants: new Set() })('connector'), true);
 });
 
 test('capabilityOf: pelago data vs health', () => {

@@ -35,7 +35,9 @@ test('synthetic providers are DERIVED from the tools; baseline ones are mandator
 
 test('plugin providers are declared by capability surface', () => {
   assert.equal(REG.connector.kind, 'plugin');
-  for (const c of ['connector', 'connector.exec', 'health']) assert.equal(REG.connector.capabilities.has(c), true, c);
+  for (const c of ['connector', 'health']) assert.equal(REG.connector.capabilities.has(c), true, c);
+  // no `connector.exec`: the RCE carve-out was deleted for OpenClaw parity (capabilities.mjs)
+  assert.equal(REG.connector.capabilities.has('connector.exec'), false);
   assert.equal(REG['demo-cache'].capabilities.has('demo_cache'), true);
   assert.equal(REG['mcp-auth'].capabilities.has('demo_warehouse'), true);
   assert.equal(REG.hindsight.kind, 'plugin-hooks'); // §8.7 hooks plugin, no tool object

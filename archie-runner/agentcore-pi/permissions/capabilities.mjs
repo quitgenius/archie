@@ -48,16 +48,17 @@ export function makeCapabilityResolver({ mcpPrefixes = [], toolCaps = {} } = {})
     // 3) Dynamic/plugin surfaces with no static object to decorate. Health must come BEFORE the
     //    server-prefix rules so e.g. demo_cache__health / demo_query_app__health aren't gated as data caps.
     if (n.endsWith('_plugin_health') || n.endsWith('__health')) return 'health';
-    // Carve-out: CONNECTOR_REMOTE_BASH_TOOL / _WORKBENCH are remote code execution via connector. They
-    // ride the same connector plugin as the baseline meta-tools but are RCE-class, so they get their own
-    // grant-gated capability (default-deny via '*') instead of baseline connector. No config signal
-    // auto-grants it, so it's denied fleet-wide until an explicit grant — a ToolDenied surfaces any need.
-    // NB the connector-session-plugin REGISTERS discovered tools as `mcp_connector__<mcpName>`
-    // (tool-cache.ts TOOL_PREFIX), so the hook sees mcp_connector__CONNECTOR_REMOTE_BASH_TOOL — strip the
-    // prefix and match the bare mcpName (a bare-name match alone never fired on the live path).
-    const connectorBare = n.startsWith('mcp_connector__') ? n.slice('mcp_connector__'.length) : n;
-    if (connectorBare === 'CONNECTOR_REMOTE_BASH_TOOL' || connectorBare === 'CONNECTOR_REMOTE_WORKBENCH') return 'connector.exec';
-    // Everything else connector → baseline: core CONNECTOR_* meta-tools, mcp_connector__* toolkit/status
+    // NO RCE CARVE-OUT. There WAS a `connector.exec` capability here holding CONNECTOR_REMOTE_BASH_TOOL
+    // and CONNECTOR_REMOTE_WORKBENCH — remote code execution outside our sandbox — behind a default-deny
+    // grant. It was removed deliberately: it had no OpenClaw counterpart, so it was a restriction this
+    // migration INVENTED rather than carried, and the migration's contract is parity first. Both tools
+    // now resolve to baseline `connector` on the next line, which means any agent with the connector
+    // plugin can reach them — exactly as it can today under OpenClaw.
+    //
+    // That is a real widening against the pre-deletion state of this file, and it is the accepted
+    // trade. If it is ever re-restricted, do it as an ordinary forbidden slug group in the pin layer
+    // (where the deny is declared per-environment and analysable) rather than as a bespoke branch here.
+    // Everything connector → baseline: core CONNECTOR_* meta-tools, mcp_connector__* toolkit/status
     // tools, and connector_* plugin helpers.
     if (n.startsWith('CONNECTOR_') || n.startsWith('mcp_connector') || n.startsWith('connector_')) return 'connector';
     if (n.startsWith('demo_cache')) return 'demo_cache';

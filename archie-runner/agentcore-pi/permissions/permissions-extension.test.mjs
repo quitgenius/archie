@@ -11,10 +11,10 @@ function fakePi() {
   return { pi: { on: (evt, fn) => (handlers[evt] = fn) }, handlers };
 }
 
-function wire({ grants = new Set(), mcpPrefixes = [] } = {}) {
+function wire({ grants = new Set(), mcpPrefixes = [], toolCaps = TC } = {}) {
   const turnCtx = { channel: 'C0TEST', agent: 'a', trigger: 'user' };
   const signals = [];
-  const capabilityOf = makeCapabilityResolver({ mcpPrefixes, toolCaps: TC });
+  const capabilityOf = makeCapabilityResolver({ mcpPrefixes, toolCaps });
   const decide = makeDecider({ grants, onSignal: (s) => signals.push(s) });
   const { pi, handlers } = fakePi();
   createPermissionsExtension({ capabilityOf, decide, turnCtx })(pi);
@@ -141,13 +141,32 @@ test('a non-connector tool call carries no slugs field at all', () => {
   assert.equal('slugs' in signals.at(-1), false);
 });
 
-// A DENIED call is the one you most want to identify: connector.exec is default-deny, and "something
-// was blocked" is far less useful than "a remote bash was blocked".
+// THE SLUG IS NOW THE ONLY SIGNAL THAT A REMOTE BASH HAPPENED, which is why this test matters more
+// after the `connector.exec` deletion than before it. Both RCE tools resolve to baseline `connector`
+// and are therefore ALLOWED — no grant gates them (OpenClaw parity, see capabilities.mjs). So the
+// permission layer will not stop one, and the OTEL slug field is the whole of the audit trail.
+// If this assertion ever goes quiet, remote code execution becomes invisible rather than merely
+// permitted.
+test('the connector RCE tools are baseline-allowed, and the slug still identifies them', () => {
+  for (const name of ['mcp_connector__CONNECTOR_REMOTE_BASH_TOOL', 'mcp_connector__CONNECTOR_REMOTE_WORKBENCH']) {
+    const { onToolCall, signals } = wire();
+    const slug = name.slice('mcp_connector__'.length);
+    assert.equal(onToolCall({ toolName: name, input: { tool_slug: slug } }), undefined, `${name} proceeds`);
+    assert.equal(signals.at(-1).decision, 'allow');
+    assert.equal(signals.at(-1).capability, 'connector');
+    assert.equal(signals.at(-1).slugs, slug);
+  }
+});
+
+// PATH COVERAGE, not a production configuration. Since `connector` is baseline-allow there is no
+// longer any connector call the capability layer denies, so the deny branch is reached here by
+// DECLARING a connector-named tool with a non-baseline capability (toolCaps is consulted first). The
+// property under test is that the slug field is populated independently of the decision — "a remote
+// bash was blocked" beats "something was blocked" if a pin-layer forbid ever creates such a case.
 test('a denied connector call still reports its slug', () => {
-  const { onToolCall, signals } = wire();
-  const r = onToolCall({ toolName: 'mcp_connector__CONNECTOR_REMOTE_BASH_TOOL', input: { tool_slug: 'CONNECTOR_REMOTE_BASH_TOOL' } });
+  const { onToolCall, signals } = wire({ toolCaps: { ...TC, mcp_connector__SOME_FORBIDDEN: 'connector.forbidden' } });
+  const r = onToolCall({ toolName: 'mcp_connector__SOME_FORBIDDEN', input: { tool_slug: 'SOME_FORBIDDEN' } });
   assert.equal(r.block, true);
   assert.equal(signals.at(-1).decision, 'deny');
-  assert.equal(signals.at(-1).capability, 'connector.exec');
-  assert.equal(signals.at(-1).slugs, 'CONNECTOR_REMOTE_BASH_TOOL');
+  assert.equal(signals.at(-1).slugs, 'SOME_FORBIDDEN');
 });

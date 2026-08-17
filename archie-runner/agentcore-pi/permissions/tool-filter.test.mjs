@@ -21,7 +21,7 @@ const NAMES = [
   'read', 'memory_search', 'otel_my_turns', 'write', 'edit', // baseline + fs.write
   'demo_query_app__query',                                            // granted (demo_query_app)
   'mcp_connector__CONNECTOR_SEARCH_TOOLS',                    // baseline connector
-  'mcp_connector__CONNECTOR_REMOTE_BASH_TOOL',                // connector.exec — NOT granted
+  'mcp_connector__CONNECTOR_REMOTE_BASH_TOOL',                // baseline connector too — see below
   'otel_fleet_query',                                       // otel.fleet — NOT granted
   'demo_cache__query',                                    // demo_cache — NOT granted
   'demo_warehouse__execute_sql',                                  // demo_warehouse — NOT granted
@@ -35,13 +35,17 @@ test('applyToolFilter sets the active set to the grant-allowed subset', () => {
     turnCtx: {}, log: NOOP_LOG,
   });
   const active = session.getActive();
-  for (const k of ['read', 'memory_search', 'otel_my_turns', 'write', 'edit', 'demo_query_app__query', 'mcp_connector__CONNECTOR_SEARCH_TOOLS']) {
+  // CONNECTOR_REMOTE_BASH_TOOL is in the KEEP list, and that is the `connector.exec` deletion showing
+  // up where it is most visible: the model is now OFFERED remote code execution whenever it has the
+  // connector plugin, rather than having the tool hidden from it. Accepted for OpenClaw parity.
+  for (const k of ['read', 'memory_search', 'otel_my_turns', 'write', 'edit', 'demo_query_app__query',
+    'mcp_connector__CONNECTOR_SEARCH_TOOLS', 'mcp_connector__CONNECTOR_REMOTE_BASH_TOOL']) {
     assert.ok(active.includes(k), `keep ${k}`);
   }
-  for (const d of ['mcp_connector__CONNECTOR_REMOTE_BASH_TOOL', 'otel_fleet_query', 'demo_cache__query', 'demo_warehouse__execute_sql']) {
+  for (const d of ['otel_fleet_query', 'demo_cache__query', 'demo_warehouse__execute_sql']) {
     assert.ok(!active.includes(d), `hide ${d}`);
   }
-  assert.deepEqual(r.hidden.sort(), ['mcp_connector__CONNECTOR_REMOTE_BASH_TOOL', 'otel_fleet_query', 'demo_cache__query', 'demo_warehouse__execute_sql'].sort());
+  assert.deepEqual(r.hidden.sort(), ['otel_fleet_query', 'demo_cache__query', 'demo_warehouse__execute_sql'].sort());
 });
 
 test('revoking fs.write hides write/edit (the observable, connector-independent case)', () => {

@@ -89,12 +89,14 @@ export const CUSTOM_TOOLS = {
 // empty tool list here is therefore correct and NOT a gap — consumers flag these as dynamic rather
 // than reporting "0 tools".
 //
-// `connector.exec` is carved out of baseline `connector` on purpose: CONNECTOR_REMOTE_BASH_TOOL and
-// CONNECTOR_REMOTE_WORKBENCH are remote code execution outside our sandbox. `demo_warehouse` is the internal
-// DemoWarehouse MCP server; other per-agent prefixes (demo_query_app, demo_diagram_app, …) are NOT here, because they
-// come from each agent's own connector.extraMcpServers and no static list can know them.
+// connector surfaces ONE capability, not two. A `connector.exec` carve-out for
+// CONNECTOR_REMOTE_BASH_TOOL / CONNECTOR_REMOTE_WORKBENCH was removed for OpenClaw parity — see the
+// note in permissions/capabilities.mjs for why, and for where to put the deny if it comes back.
+// `demo_warehouse` is the internal DemoWarehouse MCP server; other per-agent prefixes (demo_query_app, demo_diagram_app, …) are
+// NOT here, because they come from each agent's own connector.extraMcpServers and no static list can
+// know them.
 export const PLUGIN_PROVIDERS = {
-  connector: { capabilities: ['connector', 'connector.exec', 'health'], kind: 'plugin' },
+  connector: { capabilities: ['connector', 'health'], kind: 'plugin' },
   'demo-cache': { capabilities: ['demo_cache'], kind: 'plugin' },
   'mcp-auth': { capabilities: ['demo_warehouse'], kind: 'plugin' },
   hindsight: { capabilities: ['hindsight.read', 'hindsight.write'], kind: 'plugin-hooks' },
