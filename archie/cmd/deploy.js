@@ -10,12 +10,17 @@
 // front of a fleet that cannot serve what it asks for, during the one window where nothing can reach
 // Slack anyway.
 //
-// THIS COMMAND ENDS WITH ~94 SECONDS OF TOTAL OUTAGE IF THE GATEWAY CHANGED. Not degraded service —
-// total: the dispatcher is the sole path from Slack to every agent, it runs at `desired_count = 1`
-// with `deployment_minimum_healthy_percent = 0` because two tasks would open two Socket Mode
-// connections and Slack would load-balance events across them (dispatcher.tf:216-233), so a roll is
-// stop-then-start with a measured 94s gap (§6.1). Nothing here hides that, and the agent half's
-// "zero downtime" is never claimed for the composed command.
+// WHAT THIS COMMAND COSTS WHEN THE GATEWAY CHANGED depends on the rollout shape configured in
+// `SERVICE.deploymentConfiguration` (lib/task-definition.js), and it is one or the other — never
+// neither. The dispatcher is the sole path from Slack to every agent at `desiredCount = 1`, so:
+//
+//   rolling (current, preprod)  no outage, but an OVERLAP: two tasks, two Socket Mode connections,
+//                               events load-balanced across them, two writers on the cron store.
+//   stop-then-start (prod)      ~94 SECONDS OF TOTAL OUTAGE — not degraded service, total. Events in
+//                               the gap are dropped, not queued (§6.1).
+//
+// Nothing here hides either one, and the agent half's "zero downtime" is never claimed for the
+// composed command.
 //
 // AND THAT IS WHY THE GATEWAY HALF IS SKIPPED WHEN ITS CONTENT DIGEST IS UNCHANGED. The two images'
 // declared input sets DIFFER, so their derived tags move independently (lib/digest.js): a dispatcher
@@ -26,6 +31,7 @@
 
 const { EXIT } = require('../lib/exit');
 const { digestFor, assertPure } = require('../lib/digest');
+const { ROLLING } = require('../lib/task-definition');
 const fleetCmd = require('./fleet');
 const gatewayCmd = require('./gateway');
 const preflightCmd = require('./preflight');
@@ -69,6 +75,7 @@ async function deploy(ctx, args, out, deps = {}) {
     gatewayRolled: false,
     gatewaySkipped: false,
     outageSeconds: null,
+    overlapSeconds: null,
     dryRun: Boolean(ctx.dryRun),
   };
 
@@ -160,10 +167,16 @@ async function deploy(ctx, args, out, deps = {}) {
   }, out, deps);
   result.gatewayBuild = built.result || null;
 
-  // SAID BEFORE IT HAPPENS, not after. §2.27: "Refuses to hide the gap."
-  out.warn('the dispatcher is about to roll: ~94 SECONDS OF TOTAL OUTAGE, however healthy the fleet '
-    + 'is, because the gateway is the sole path from Slack to every agent (§6.1). Slack messages sent '
-    + 'during the gap are not queued by this system.');
+  // SAID BEFORE IT HAPPENS, not after. §2.27: "Refuses to hide the gap." The rolling case gets the same
+  // treatment for the same reason — the cost changed shape, it did not disappear, and the shape is what
+  // decides whether an operator should be watching the workspace for duplicates or for silence.
+  out.warn(ROLLING
+    ? 'the dispatcher is about to roll: NO OUTAGE, but for the length of the overlap TWO tasks hold a '
+      + 'Socket Mode connection and Slack load-balances events across them — an event in that window may '
+      + 'be handled twice or by the outgoing task, and the cron store has two writers (§6.1).'
+    : 'the dispatcher is about to roll: ~94 SECONDS OF TOTAL OUTAGE, however healthy the fleet '
+      + 'is, because the gateway is the sole path from Slack to every agent (§6.1). Slack messages sent '
+      + 'during the gap are not queued by this system.');
 
   const rolled = await runStep(steps.gatewayDeploy, ctx, {
     positionals: [],
@@ -171,11 +184,12 @@ async function deploy(ctx, args, out, deps = {}) {
   }, out, deps);
   result.gateway = rolled.result || null;
   result.gatewayRolled = Boolean(result.gateway && result.gateway.rolled);
-  // The MEASURED gap, from `gateway deploy`'s own observations (cmd/gateway.js:770-783) — never the
-  // 94 from the document. `--no-wait` leaves it null, and a null here means "nothing observed the
-  // gap", not "there was none".
+  // The MEASURED numbers, from `gateway deploy`'s own observations — never the 94 from the document.
+  // `--no-wait` leaves both null, and a null here means "nothing observed this", not "there was none".
+  // Under a rolling deploy `outageSeconds` is a truthful 0 and `overlapSeconds` carries the cost.
   const timeline = result.gateway && result.gateway.timeline;
   result.outageSeconds = timeline ? timeline.gapSeconds : null;
+  result.overlapSeconds = timeline ? (timeline.overlapSeconds ?? null) : null;
 
   return emit(ctx, out, result, render);
 }
@@ -215,7 +229,9 @@ function render(r) {
   if (r.gatewaySkipped) {
     lines.push(`gateway     unchanged (${r.gatewayTag}) — skipped entirely, NO OUTAGE`);
   } else if (r.gatewayRolled) {
-    lines.push(`gateway     rolled to ${r.gatewayTag}${r.outageSeconds ? ` — ${r.outageSeconds}s of dispatcher downtime` : ''}`);
+    const cost = r.outageSeconds ? ` — ${r.outageSeconds}s of dispatcher downtime`
+      : (r.overlapSeconds !== null ? ` — no downtime, ${r.overlapSeconds}s of two Socket Mode connections` : '');
+    lines.push(`gateway     rolled to ${r.gatewayTag}${cost}`);
   } else {
     lines.push(`gateway     ${r.dryRun ? 'not rolled (dry run)' : 'not rolled'} — target ${r.gatewayTag}`);
   }

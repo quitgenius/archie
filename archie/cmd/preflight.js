@@ -40,7 +40,7 @@ const { usage, preflight: preflightError } = require('../lib/exit');
 // The dispatcher's own pointer reader, not a copy of it. It encodes the fail-closed rule that a
 // missing item, a wrong type and an empty string are all ABSENT (image-source.js:33-42) — preflight
 // must agree with the code that actually runs, or check 4 passes on a pointer no turn can use.
-const { readImageItem } = require('../../slack-dispatcher/image-source');
+const { readImageItem } = require('../../archie-gateway/image-source');
 
 const PASS = 'PASS';
 const WARN = 'WARN';

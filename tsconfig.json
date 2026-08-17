@@ -29,8 +29,8 @@
   "include": [
     "types/identity.d.ts",
     "types/identity.assert.ts",
-    "clawdbot/config-resolver/schema.mjs",
-    "clawdbot/config-resolver/rekey-to-scope.mjs",
-    "slack-dispatcher/agent-scope.js"
+    "archie-runner/config-resolver/schema.mjs",
+    "archie-runner/config-resolver/rekey-to-scope.mjs",
+    "archie-gateway/agent-scope.js"
   ]
 }

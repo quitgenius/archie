@@ -1,0 +1,133 @@
+{
+  "id": "openclaw-mcp-auth-plugin",
+  "name": "MCP Auth Plugin",
+  "description": "Injects per-agent MCP tools with API key auth and per-sender user_id on every call.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "upstreamUrl": {
+        "type": "string",
+        "description": "Default base URL for MCP servers (without user_id). Can be overridden per server."
+      },
+      "defaultAuthHeader": {
+        "type": "string",
+        "description": "Default auth header name. Defaults to x-api-key."
+      },
+      "agents": {
+        "type": "object",
+        "description": "Per-agent config keyed by agent ID.",
+        "additionalProperties": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "mcpServers"
+          ],
+          "properties": {
+            "mcpServers": {
+              "type": "array",
+              "description": "One or more MCP servers available to this agent. Tools from all servers are merged.",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "anyOf": [
+                  {
+                    "required": [
+                      "apiKey"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "oauth2"
+                    ]
+                  }
+                ],
+                "properties": {
+                  "apiKey": {
+                    "type": "string",
+                    "description": "API key for static auth. Required unless oauth2 is configured."
+                  },
+                  "oauth2": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "redirectUri"
+                    ],
+                    "description": "OAuth2 Authorization Code + PKCE auth (MCP spec 2025-03). When set, apiKey/authHeader are ignored and Bearer tokens are negotiated against the MCP server's authorization server.",
+                    "properties": {
+                      "redirectUri": {
+                        "type": "string",
+                        "description": "OAuth2 redirect_uri. Must match a URI registered with the IdP."
+                      },
+                      "clientId": {
+                        "type": "string",
+                        "description": "Pre-registered client_id. When set, dynamic registration is skipped (e.g. DemoQueryApp Cloud's 'demo_query_app-mcp-client')."
+                      },
+                      "callbackPort": {
+                        "type": "integer",
+                        "description": "Port for the plugin's built-in callback listener. Omit to require manual code submission via the submit_code tool."
+                      },
+                      "scopes": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        },
+                        "description": "OAuth2 scopes to request."
+                      },
+                      "clientName": {
+                        "type": "string",
+                        "description": "client_name sent during dynamic registration."
+                      },
+                      "authorizationEndpoint": {
+                        "type": "string",
+                        "description": "Override for the browser-facing authorization endpoint. Use when the MCP host's /oauth/authorize is network-gated but redirects to a public IdP page (e.g. DemoQueryApp Cloud's https://demoquerycloud.dev/auth/oauth2/authorize). Token exchange still uses the discovered token_endpoint."
+                      }
+                    }
+                  },
+                  "authHeader": {
+                    "type": "string"
+                  },
+                  "upstreamUrl": {
+                    "type": "string",
+                    "description": "Server-level URL override (without user_id)."
+                  },
+                  "senderUserMap": {
+                    "type": "object",
+                    "description": "Maps Slack sender IDs to MCP server user IDs (appended as ?user_id=...).",
+                    "additionalProperties": {
+                      "type": "string"
+                    }
+                  },
+                  "defaultUserId": {
+                    "type": "string",
+                    "description": "Fallback user_id when sender is not in senderUserMap. Also used for tool discovery."
+                  },
+                  "toolPrefix": {
+                    "type": "string",
+                    "description": "Optional prefix added to tool names from this server (e.g. 'connector' \u2192 'mcp_auth__connector__search'). Use to avoid collisions when multiple servers share tool names."
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "uiHints": {
+    "upstreamUrl": {
+      "label": "Upstream MCP URL",
+      "help": "Base URL of the MCP server (Streamable HTTP transport)."
+    },
+    "defaultAuthHeader": {
+      "label": "Default Auth Header",
+      "help": "Header name for API key auth. Default: x-api-key."
+    },
+    "agents": {
+      "label": "Per-agent Config",
+      "help": "MCP server lists and Slack\u2192user_id mappings per agent.",
+      "advanced": true
+    }
+  }
+}

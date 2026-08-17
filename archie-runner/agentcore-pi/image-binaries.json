@@ -1,0 +1,4 @@
+{
+  "_note": "Binaries present in the agentcore-pi runtime image (node:22-slim base + this dir's Dockerfile apt installs). KEEP IN SYNC WITH THE Dockerfile. The G7 coherence validator (config-resolver/validate-requires.mjs) checks every skill's requires.exec.safeBinProfiles against this list; a skill that needs a binary not here is a hard finding — either add the binary to the Dockerfile AND this list, or port the skill off the shell (the preferred pattern: in-process aws-sdk, like the otel_* tools). git is intentionally absent (git-free boot; config comes from DDB).",
+  "binaries": ["bash", "sh", "tar", "gzip", "node", "npm", "python3", "make", "g++"]
+}

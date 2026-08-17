@@ -93,10 +93,10 @@ function dispatcherClientFor(ctx, account, deps = {}) {
   if (deps.agentcore) return deps.agentcore(overrides);
   let mod;
   try {
-    mod = require('../../slack-dispatcher/agentcore-client');
+    mod = require('../../archie-gateway/agentcore-client');
   } catch (e) {
-    throw preflight('cannot load the dispatcher\'s spec computation (slack-dispatcher/agentcore-client)',
-      { cause: e, detail: 'run `npm ci` in docker/slack-dispatcher — the CLI reuses it rather than reimplementing it' });
+    throw preflight('cannot load the dispatcher\'s spec computation (archie-gateway/agentcore-client)',
+      { cause: e, detail: 'run `npm ci` in docker/archie-gateway — the CLI reuses it rather than reimplementing it' });
   }
   return mod.createAgentCoreClient(overrides);
 }
@@ -171,7 +171,7 @@ function derivedSpecFor(client, agent, imageUri) {
  * CLI and it is the dispatcher's.
  */
 function runtimeNameFor(client, agent, imageUri) {
-  const { generationRuntimeName } = require('../../slack-dispatcher/agentcore-client');
+  const { generationRuntimeName } = require('../../archie-gateway/agentcore-client');
   return generationRuntimeName(agent, derivedSpecFor(client, agent, imageUri));
 }
 
@@ -184,7 +184,7 @@ function runtimeNameFor(client, agent, imageUri) {
  */
 function specDigestFor(spec, deps = {}) {
   const { createHash } = require('node:crypto');
-  const canonicalize = deps.canonicalize || require('../../slack-dispatcher/agentcore-client').canonicalize;
+  const canonicalize = deps.canonicalize || require('../../archie-gateway/agentcore-client').canonicalize;
   const json = JSON.stringify(canonicalize(spec));
   return { json, specDigest: createHash('sha1').update(json).digest('hex').slice(0, 16) };
 }

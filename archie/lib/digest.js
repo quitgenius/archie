@@ -17,7 +17,7 @@
 //    digestFor() never shells out to git. (modifiedInputs() does, for a different question.)
 //
 // 2. NOT the build context. The gateway's context is all of docker/ (Makefile:297-300) and the
-//    agent's is docker/clawdbot/ (Makefile:272-276) — both far wider than what each Dockerfile
+//    agent's is docker/archie-runner/ (Makefile:272-276) — both far wider than what each Dockerfile
 //    COPYs, and they overlap heavily. Hashing the context would give the two images near-identical
 //    change sets and destroy the property the whole feature exists for: THE TWO HALVES ROLL
 //    INDEPENDENTLY. A dispatcher-only change must not roll every agent in the fleet; an agent-only change must not
@@ -35,23 +35,23 @@ const { usage, preflight, refused } = require('./exit');
 
 // docker/ — the root every declared path below is relative to. archie/lib/digest.js → ../../ .
 // Both images' contexts live under it, so one relative vocabulary covers both, and the paths printed
-// in the dirty warning read exactly as the reference's example does (`slack-dispatcher/index.js`).
+// in the dirty warning read exactly as the reference's example does (`archie-gateway/index.js`).
 const ROOT = path.resolve(__dirname, '..', '..');
 
 // Never walked, whatever .dockerignore says. node_modules is reinstalled by every build stage and is
 // never COPYed (that is what docker/.dockerignore:8 exists to say); .git is not build input at all.
-// Hard-coding both means a context that forgets to ignore them — clawdbot/.dockerignore's bare
+// Hard-coding both means a context that forgets to ignore them — archie-runner/.dockerignore's bare
 // `node_modules/` misses agentcore-pi/node_modules, since .dockerignore patterns are not recursive —
 // cannot poison a digest with a few hundred MB of reinstallable files.
 const HARD_EXCLUDES = new Set(['node_modules', '.git']);
 
 // The lint stage of BOTH Dockerfiles COPYs these from docker/ — the agent's via the
 // `--build-context lintroot=.` the Makefile is required to pass (Makefile:267-274,
-// agentcore-pi/Dockerfile:27,29; slack-dispatcher/Dockerfile:16,22).
+// agentcore-pi/Dockerfile:27,29; archie-gateway/Dockerfile:16,22).
 //
 // JUDGEMENT CALL, stated so it can be reversed in one place: these files do not appear in the
 // shipped filesystem, only in a gate. They are still inputs. The lint gate is a build-time GATE
-// (slack-dispatcher/Dockerfile:110-116, agentcore-pi/Dockerfile:120-126) — a rule added to
+// (archie-gateway/Dockerfile:110-116, agentcore-pi/Dockerfile:120-126) — a rule added to
 // eslint.config.mjs that the current source violates must fail the next build, and if the config
 // were not part of the digest the tag would be unchanged, the build skipped as "already in ECR", and
 // the new rule would never run against anything. Plan §5 lists them for the gateway; the agent row
@@ -69,80 +69,80 @@ const LINT_ROOT_INPUTS = [
  * feature (plan §5). Every path is relative to docker/; `dir: true` means "walk it".
  *
  * `context` is the docker build context, and it selects which .dockerignore applies. It is not
- * cosmetic: docker/.dockerignore and clawdbot/.dockerignore have different contents and the wrong
+ * cosmetic: docker/.dockerignore and archie-runner/.dockerignore have different contents and the wrong
  * one gives the wrong file set.
  */
 const IMAGES = {
-  // slack-dispatcher/Dockerfile. Context is docker/, NOT docker/slack-dispatcher/ (Dockerfile:53-56,
-  // Makefile:297-300), so every dispatcher path here carries the `slack-dispatcher/` prefix.
+  // archie-gateway/Dockerfile. Context is docker/, NOT docker/archie-gateway/ (Dockerfile:53-56,
+  // Makefile:297-300), so every dispatcher path here carries the `archie-gateway/` prefix.
   gateway: {
     name: 'gateway',
-    dockerfile: 'slack-dispatcher/Dockerfile',
+    dockerfile: 'archie-gateway/Dockerfile',
     context: '.',
     inputs: [
       ...LINT_ROOT_INPUTS,
 
       // Dockerfile:18,57. `package-lock.json*` is written with a trailing `*` so the build survives
       // its absence; it is present today, hence optional rather than missing-is-an-error.
-      { path: 'slack-dispatcher/package.json' },
-      { path: 'slack-dispatcher/package-lock.json', optional: true },
+      { path: 'archie-gateway/package.json' },
+      { path: 'archie-gateway/package-lock.json', optional: true },
 
       // Dockerfile:60-61 — the explicit COPY allowlist, verbatim and in order. This allowlist is
       // itself load-bearing: a local module added to index.js and not listed here is a
       // MODULE_NOT_FOUND crash-loop after a green build (Dockerfile:78-81, "this has happened
       // twice"). session-tracker.js appears TWICE on line 60 in the Dockerfile; it is listed once
       // here, and resolveInputs() dedupes anyway.
-      { path: 'slack-dispatcher/index.js' },
-      { path: 'slack-dispatcher/marketplace.js' },
-      { path: 'slack-dispatcher/derived-role.js' },
-      { path: 'slack-dispatcher/streaming.js' },
-      { path: 'slack-dispatcher/conversations.js' },
-      { path: 'slack-dispatcher/metrics.js' },
-      { path: 'slack-dispatcher/file-ref.js' },
-      { path: 'slack-dispatcher/agentcore-client.js' },
-      { path: 'slack-dispatcher/agentcore-provisioning.js' },
-      { path: 'slack-dispatcher/dispatcher-metrics.js' },
-      { path: 'slack-dispatcher/tracing.js' },
-      { path: 'slack-dispatcher/routing-build.js' },
-      { path: 'slack-dispatcher/backpressure.js' },
-      { path: 'slack-dispatcher/connector-credential.js' },
-      { path: 'slack-dispatcher/session-tracker.js' },
-      { path: 'slack-dispatcher/image-source.js' },
-      { path: 'slack-dispatcher/turn-queue.js' },
-      { path: 'slack-dispatcher/spec-diff.js' },
-      { path: 'slack-dispatcher/cron-home.js' },
-      { path: 'slack-dispatcher/semaphore.js' },
-      { path: 'slack-dispatcher/sdk-http.js' },
-      { path: 'slack-dispatcher/runtime-registry.js' },
-      { path: 'slack-dispatcher/cron-service.js' },
-      { path: 'slack-dispatcher/cron-runner.js' },
-      { path: 'slack-dispatcher/cron-store.js' },
-      { path: 'slack-dispatcher/cron-fire.js' },
-      { path: 'slack-dispatcher/cron-delivery.js' },
-      { path: 'slack-dispatcher/cron-api.js' },
-      { path: 'slack-dispatcher/cron-hydrator.js' },
-      { path: 'slack-dispatcher/cron-metrics.js' },
-      { path: 'slack-dispatcher/cron-inventory-metrics.js' },
-      { path: 'slack-dispatcher/peer-synth-fixture.js' },
-      { path: 'slack-dispatcher/hydrate-e2e.js' },
-      { path: 'slack-dispatcher/delivery-e2e.js' },
-      { path: 'slack-dispatcher/registry-e2e.js' },
+      { path: 'archie-gateway/index.js' },
+      { path: 'archie-gateway/marketplace.js' },
+      { path: 'archie-gateway/derived-role.js' },
+      { path: 'archie-gateway/streaming.js' },
+      { path: 'archie-gateway/conversations.js' },
+      { path: 'archie-gateway/metrics.js' },
+      { path: 'archie-gateway/file-ref.js' },
+      { path: 'archie-gateway/agentcore-client.js' },
+      { path: 'archie-gateway/agentcore-provisioning.js' },
+      { path: 'archie-gateway/dispatcher-metrics.js' },
+      { path: 'archie-gateway/tracing.js' },
+      { path: 'archie-gateway/routing-build.js' },
+      { path: 'archie-gateway/backpressure.js' },
+      { path: 'archie-gateway/connector-credential.js' },
+      { path: 'archie-gateway/session-tracker.js' },
+      { path: 'archie-gateway/image-source.js' },
+      { path: 'archie-gateway/turn-queue.js' },
+      { path: 'archie-gateway/spec-diff.js' },
+      { path: 'archie-gateway/cron-home.js' },
+      { path: 'archie-gateway/semaphore.js' },
+      { path: 'archie-gateway/sdk-http.js' },
+      { path: 'archie-gateway/runtime-registry.js' },
+      { path: 'archie-gateway/cron-service.js' },
+      { path: 'archie-gateway/cron-runner.js' },
+      { path: 'archie-gateway/cron-store.js' },
+      { path: 'archie-gateway/cron-fire.js' },
+      { path: 'archie-gateway/cron-delivery.js' },
+      { path: 'archie-gateway/cron-api.js' },
+      { path: 'archie-gateway/cron-hydrator.js' },
+      { path: 'archie-gateway/cron-metrics.js' },
+      { path: 'archie-gateway/cron-inventory-metrics.js' },
+      { path: 'archie-gateway/peer-synth-fixture.js' },
+      { path: 'archie-gateway/hydrate-e2e.js' },
+      { path: 'archie-gateway/delivery-e2e.js' },
+      { path: 'archie-gateway/registry-e2e.js' },
 
       // Dockerfile:63-74. THE OVERLAP WITH THE AGENT IS INTENTIONAL AND MUST STAY: both images build
       // from the same source for the workspace seed and the cap→IAM map (§9.8/§9.9a) so there is no
       // mirrored implementation to drift. Editing one of these files therefore rolls BOTH halves —
       // correct, and the digest is what makes it visible.
-      { path: 'clawdbot/config-seed/new-agent-skeleton', dir: true },
-      { path: 'clawdbot/agentcore-pi/workspace-seed.mjs' },
-      { path: 'clawdbot/config-resolver/skill-iam-requirements.mjs' },
-      { path: 'clawdbot/config-resolver/derive-exec-role.mjs' },
-      { path: 'clawdbot/config-resolver/caps-from-config.mjs' },
-      { path: 'clawdbot/config-resolver/schema.mjs' },
-      { path: 'clawdbot/config-resolver/providers.mjs' },
+      { path: 'archie-runner/config-seed/new-agent-skeleton', dir: true },
+      { path: 'archie-runner/agentcore-pi/workspace-seed.mjs' },
+      { path: 'archie-runner/config-resolver/skill-iam-requirements.mjs' },
+      { path: 'archie-runner/config-resolver/derive-exec-role.mjs' },
+      { path: 'archie-runner/config-resolver/caps-from-config.mjs' },
+      { path: 'archie-runner/config-resolver/schema.mjs' },
+      { path: 'archie-runner/config-resolver/providers.mjs' },
     ],
   },
 
-  // clawdbot/agentcore-pi/Dockerfile. Context is docker/clawdbot/ (Dockerfile:5-6, Makefile:272-276)
+  // archie-runner/agentcore-pi/Dockerfile. Context is docker/archie-runner/ (Dockerfile:5-6, Makefile:272-276)
   // — documented there as load-bearing "because it has bitten people" — plus the lintroot context.
   //
   // WHOLE DIRECTORIES, not per-file allowlists, and deliberately: this Dockerfile COPYs
@@ -153,35 +153,35 @@ const IMAGES = {
   // states the agent's inputs at directory granularity for the same reason.
   agent: {
     name: 'agent',
-    dockerfile: 'clawdbot/agentcore-pi/Dockerfile',
-    context: 'clawdbot',
+    dockerfile: 'archie-runner/agentcore-pi/Dockerfile',
+    context: 'archie-runner',
     inputs: [
       ...LINT_ROOT_INPUTS,
 
       // Dockerfile:30,34-37,84-100,107-108 — sources, package.json, openclaw-compat/, permissions/,
       // and spike/ (lint stage only, but a lint failure there fails this build).
-      { path: 'clawdbot/agentcore-pi', dir: true },
+      { path: 'archie-runner/agentcore-pi', dir: true },
 
       // Dockerfile:32-33,38,115-116. All of it: the lint stage lints the whole package and the
       // runtime stage COPYs the whole directory. Most of what is on disk here — ground-truth/,
       // resolved/, resolved-ddb/, items/, ~1400 of its ~1480 files — is regenerated local output and
-      // is excluded by clawdbot/.dockerignore, which is precisely why that file is honoured below.
+      // is excluded by archie-runner/.dockerignore, which is precisely why that file is honoured below.
       // Without it the agent digest would churn on every hydrate run and roll every agent in the fleet for nothing.
-      { path: 'clawdbot/config-resolver', dir: true },
+      { path: 'archie-runner/config-resolver', dir: true },
 
       // Dockerfile:46-71 — stage 1 bundles the three compat plugins against the local plugin-sdk
       // shim. Their sources are inputs even though only the bundled .cjs ships.
-      { path: 'clawdbot/plugin-sdk', dir: true },
-      { path: 'clawdbot/connector-session-plugin', dir: true },
-      { path: 'clawdbot/demo-cache-plugin', dir: true },
-      { path: 'clawdbot/openclaw-mcp-auth-plugin', dir: true },
+      { path: 'archie-runner/plugin-sdk', dir: true },
+      { path: 'archie-runner/connector-session-plugin', dir: true },
+      { path: 'archie-runner/demo-cache-plugin', dir: true },
+      { path: 'archie-runner/openclaw-mcp-auth-plugin', dir: true },
 
       // Dockerfile:101-106 — the single source of truth for the OTEL query corpus, shared with the
       // dashboard builder and the BDD suite so the tools and the dashboard cannot drift.
-      { path: 'clawdbot/agentcore-observability/insight-queries.js' },
+      { path: 'archie-runner/agentcore-observability/insight-queries.js' },
 
       // Dockerfile:117 — the hand-authored new-agent skeleton (the skill library lives in DynamoDB).
-      { path: 'clawdbot/config-seed', dir: true },
+      { path: 'archie-runner/config-seed', dir: true },
     ],
   },
 };
@@ -446,7 +446,7 @@ function git(args, { root, env }) {
  * the digest already makes it honest (plan §5).
  *
  * Untracked files inside a declared path COUNT. `-uall` is required for that: the default collapses
- * them to the containing directory, and "clawdbot/agentcore-pi/" is not a filename anyone can act on.
+ * them to the containing directory, and "archie-runner/agentcore-pi/" is not a filename anyone can act on.
  *
  * `gitEnv` is injectable so the tests can run against a hermetic repo — a developer's global
  * core.excludesfile would otherwise decide whether an untracked fixture file is reported.

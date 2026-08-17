@@ -1,0 +1,71 @@
+// Agent → dispatcher connectivity (pi-cron-migration-plan.md §2b, Blocker A).
+//
+// Thin HTTP client the Pi cron tool (+ flip-time hydrator) uses to reach the
+// dispatcher's cron manager API. Under AgentCore the agent has no gateway to RPC and
+// no in-agent Slack surface, so cron CRUD is routed to the always-on dispatcher, which
+// owns the scheduler. Auth mirrors the ECS path: the x-dispatcher-secret header.
+//
+// Config comes from env, resolved at boot by pi-entrypoint.mjs:
+//   DISPATCHER_BASE_URL      — the dispatcher FQDN (same one ECS agents use; reachable
+//                              from the in-VPC Pi runtime via the shared internal ALB)
+//   DISPATCHER_SHARED_SECRET — resolved from Secrets Manager at boot (== the ECS value)
+//
+// Routes mirror slack-dispatcher/cron-api.js exactly:
+//   POST   /cron                        add
+//   GET    /cron/:agentId               list
+//   PUT    /cron/:agentId/:jobId        update
+//   DELETE /cron/:agentId/:jobId        remove
+//   POST   /cron/:agentId/:jobId/run    run-now
+//
+// `fetch` and env are injectable for tests.
+
+const DEFAULT_TIMEOUT_MS = 10_000;
+
+export function createDispatcherClient(opts = {}) {
+  const base = String(opts.baseUrl ?? process.env.DISPATCHER_BASE_URL ?? '').replace(/\/+$/, '');
+  const secret = opts.secret ?? process.env.DISPATCHER_SHARED_SECRET ?? '';
+  const doFetch = opts.fetchImpl || globalThis.fetch;
+  const timeoutMs = opts.timeoutMs || DEFAULT_TIMEOUT_MS;
+
+  function assertConfigured() {
+    if (!base) throw new Error('dispatcher-client: DISPATCHER_BASE_URL not set');
+    if (!secret) throw new Error('dispatcher-client: DISPATCHER_SHARED_SECRET not set');
+  }
+
+  async function call(method, path, body) {
+    assertConfigured();
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), timeoutMs);
+    try {
+      const res = await doFetch(`${base}${path}`, {
+        method,
+        headers: { 'content-type': 'application/json', 'x-dispatcher-secret': secret },
+        ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+        signal: ac.signal,
+      });
+      const text = res.text ? await res.text().catch(() => '') : '';
+      let json;
+      try { json = text ? JSON.parse(text) : {}; } catch { json = { raw: text }; }
+      if (res.ok === false || (typeof res.status === 'number' && res.status >= 400)) {
+        const err = new Error(`dispatcher ${method} ${path} -> HTTP ${res.status}: ${(json && json.error) || text}`);
+        err.status = res.status;
+        err.body = json;
+        throw err;
+      }
+      return json;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  const enc = encodeURIComponent;
+  return {
+    isConfigured: () => Boolean(base && secret),
+    add: (job) => call('POST', '/cron', job),
+    list: (agentId) => call('GET', `/cron/${enc(agentId)}`),
+    update: (agentId, jobId, patch) => call('PUT', `/cron/${enc(agentId)}/${enc(jobId)}`, patch),
+    remove: (agentId, jobId) => call('DELETE', `/cron/${enc(agentId)}/${enc(jobId)}`),
+    run: (agentId, jobId) => call('POST', `/cron/${enc(agentId)}/${enc(jobId)}/run`),
+    _base: base,
+  };
+}

@@ -4,7 +4,7 @@
 // HOW TO RUN (from docker/ — `npm install` here once first)
 // ─────────────────────────────────────────────────────────────────────────────
 //   npx eslint .                      whole tree, ~2s
-//   npx eslint slack-dispatcher       one package
+//   npx eslint archie-gateway        one package
 //   npm run lint                      inside any covered package
 //   npm run swallowed-errors          the §8(d) backlog count, per package
 //   npm test                          unit-tests the one LOCAL rule below
@@ -22,7 +22,7 @@
 // `node --check` all passed. Each one only surfaced with the real image running
 // against real AWS, so each one cost a full build → push → roll cycle to find:
 //
-//   1. `@aws-sdk/client-secrets-manager` was require()d by slack-dispatcher but
+//   1. `@aws-sdk/client-secrets-manager` was require()d by the gateway but
 //      was not in its package.json, so `npm ci` never installed it in the image.
 //      → caught by n/no-extraneous-require (declared nowhere) and, when the
 //        module is absent from node_modules too, n/no-missing-require.
@@ -54,7 +54,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // PACKAGES AND THEIR MODULE SYSTEMS (they differ — hence the blocks below)
 // ─────────────────────────────────────────────────────────────────────────────
-//   slack-dispatcher/                  CommonJS .js  (+ 1 .mjs), vitest globals
+//   archie-gateway/                  CommonJS .js  (+ 1 .mjs), vitest globals
 //   clawdbot/agentcore-pi/             ESM .mjs      (+ .cjs)
 //   clawdbot/config-resolver/          ESM .mjs      (+ .cjs)
 //   clawdbot/agentcore-tests/          CommonJS .js  (+ .mjs), cucumber
@@ -164,7 +164,7 @@ export const noStatementlessCatch = {
 
 const local = { rules: { 'no-statementless-catch': noStatementlessCatch } };
 
-// Vitest injects these because slack-dispatcher/vitest.config.js sets
+// Vitest injects these because archie-gateway/vitest.config.js sets
 // `test.globals: true`. Without them every *.test.js is a wall of no-undef.
 const vitestGlobals = {
   describe: 'readonly',
@@ -219,7 +219,7 @@ const bugRules = {
   // BASELINE at 2026-08-14 — 137 sites, and this count IS the backlog (unlike
   // `no-empty`'s, below). `npm run swallowed-errors` from docker/ reprints it:
   //
-  //    52  slack-dispatcher                      30  clawdbot/agentcore-pi
+  //    52  archie-gateway                        30  archie-runner/agentcore-pi
   //    47  clawdbot/agentcore-tests               1  clawdbot/config-resolver
   //     7  clawdbot/agentcore-provision           0  clawdbot/agentcore-observability
   //
@@ -239,14 +239,14 @@ const bugRules = {
   // block — no new structure. Append to the block, after `rules: bugRules`:
   //
   //   {
-  //     files: ['clawdbot/agentcore-observability/**/*.{js,cjs}'],
+  //     files: ['archie-runner/agentcore-observability/**/*.{js,cjs}'],
   //     ...
   //     rules: { ...bugRules, 'local/no-statementless-catch': 'error' },
   //   }
   //
   // or, for a subtree finer than a package, add a new block after it:
   //
-  //   { files: ['slack-dispatcher/cron-*.js'],
+  //   { files: ['archie-gateway/cron-*.js'],
   //     rules: { 'local/no-statementless-catch': 'error' } }
   //
   // Later blocks win, so a narrow error block always beats the package's warn.
@@ -293,13 +293,18 @@ export default [
       'management-console/**',
       'demo_warehouse-mcp-server/**',
       'example-iac-runner/**',
-      'clawdbot/agentcore-skills/**',
-      'clawdbot/config-seed/**',
-      'clawdbot/hindsight-ingest/**',
-      'clawdbot/openclaw-mcp-auth-plugin/**',
-      'clawdbot/demo-cache-plugin/**',
-      'clawdbot/plugin-sdk/**',
-      'clawdbot/slack-reply-plugin/**',
+      // The two OpenClaw trees restored from master. They are master's code, linted by
+      // whatever master does (nothing, today) — adopting them is a separate, deliberate
+      // change, exactly like the dirs above.
+      'slack-dispatcher/**',
+      'clawdbot/**',
+      'archie-runner/agentcore-skills/**',
+      'archie-runner/config-seed/**',
+      'archie-runner/hindsight-ingest/**',
+      'archie-runner/openclaw-mcp-auth-plugin/**',
+      'archie-runner/demo-cache-plugin/**',
+      'archie-runner/plugin-sdk/**',
+      'archie-runner/slack-reply-plugin/**',
       // TypeScript — covered by tsc, see header.
       '**/*.ts',
       '**/*.tsx',
@@ -320,9 +325,9 @@ export default [
     rules: bugRules,
   },
 
-  // ── slack-dispatcher: CommonJS ────────────────────────────────────────────
+  // ── archie-gateway: CommonJS ────────────────────────────────────────────
   {
-    files: ['slack-dispatcher/**/*.js'],
+    files: ['archie-gateway/**/*.js'],
     languageOptions: {
       ecmaVersion: 2023,
       sourceType: 'commonjs',
@@ -334,7 +339,7 @@ export default [
   {
     // vitest.config.js is ESM (`import { defineConfig } …`) despite the .js
     // extension and the package having no "type": "module".
-    files: ['slack-dispatcher/vitest.config.js', 'slack-dispatcher/**/*.mjs'],
+    files: ['archie-gateway/vitest.config.js', 'archie-gateway/**/*.mjs'],
     languageOptions: {
       ecmaVersion: 2023,
       sourceType: 'module',
@@ -344,11 +349,11 @@ export default [
     rules: bugRules,
   },
   {
-    files: ['slack-dispatcher/**/*.test.js'],
+    files: ['archie-gateway/**/*.test.js'],
     languageOptions: { globals: { ...globals.node, ...vitestGlobals } },
   },
   {
-    // DUAL-PATH ESM BRIDGES. These three files dynamic-import the agent's ESM modules
+    // DUAL-PATH ESM BRIDGES. These files dynamic-import the agent's ESM modules
     // (config-resolver/*.mjs, agentcore-pi/workspace-seed.mjs) as the single source of truth for
     // the cap→IAM map and the workspace seed. They try the IN-IMAGE path first
     // (`./config-resolver/schema.mjs` — the Dockerfile COPYs those files to /app/config-resolver/)
@@ -361,19 +366,20 @@ export default [
     // AND import('./…') specifiers against the assembled image. Add a new bridge and forget the
     // COPY and the build fails there. Do not widen this block to the whole package.
     files: [
-      'slack-dispatcher/derived-role.js',
-      'slack-dispatcher/agentcore-client.js',
-      'slack-dispatcher/marketplace.js',
+      'archie-gateway/derived-role.js',
+      'archie-gateway/agentcore-client.js',
+      'archie-gateway/marketplace.js',
+      'archie-gateway/cron-runner-flag.js',
     ],
     rules: { 'n/no-missing-import': 'off' },
   },
 
-  // ── clawdbot/agentcore-pi, config-resolver, agentcore-provision: ESM ──────
+  // ── archie-runner/agentcore-pi, config-resolver, agentcore-provision: ESM ─
   {
     files: [
-      'clawdbot/agentcore-pi/**/*.mjs',
-      'clawdbot/config-resolver/**/*.mjs',
-      'clawdbot/agentcore-provision/**/*.mjs',
+      'archie-runner/agentcore-pi/**/*.mjs',
+      'archie-runner/config-resolver/**/*.mjs',
+      'archie-runner/agentcore-provision/**/*.mjs',
     ],
     languageOptions: {
       ecmaVersion: 2023,
@@ -384,7 +390,7 @@ export default [
     rules: bugRules,
   },
   {
-    files: ['clawdbot/agentcore-pi/**/*.cjs', 'clawdbot/config-resolver/**/*.cjs'],
+    files: ['archie-runner/agentcore-pi/**/*.cjs', 'archie-runner/config-resolver/**/*.cjs'],
     languageOptions: {
       ecmaVersion: 2023,
       sourceType: 'commonjs',
@@ -400,7 +406,7 @@ export default [
   // ever written against globals (Given/When/Then free), add them here rather
   // than disabling no-undef for the file.
   {
-    files: ['clawdbot/agentcore-tests/**/*.js'],
+    files: ['archie-runner/agentcore-tests/**/*.js'],
     languageOptions: {
       ecmaVersion: 2023,
       sourceType: 'commonjs',
@@ -410,7 +416,7 @@ export default [
     rules: bugRules,
   },
   {
-    files: ['clawdbot/agentcore-tests/**/*.mjs'],
+    files: ['archie-runner/agentcore-tests/**/*.mjs'],
     languageOptions: {
       ecmaVersion: 2023,
       sourceType: 'module',
@@ -422,7 +428,7 @@ export default [
 
   // ── clawdbot/agentcore-observability: CommonJS ────────────────────────────
   {
-    files: ['clawdbot/agentcore-observability/**/*.{js,cjs}'],
+    files: ['archie-runner/agentcore-observability/**/*.{js,cjs}'],
     languageOptions: {
       ecmaVersion: 2023,
       sourceType: 'commonjs',
@@ -445,7 +451,7 @@ export default [
   // Move a package here the moment it reaches zero — that is the whole ratchet. Do NOT add one that
   // still has sites "to fix later"; a failing gate gets disabled, and then it protects nothing.
   {
-    files: ['clawdbot/config-resolver/**/*.{mjs,cjs}', 'clawdbot/agentcore-observability/**/*.{js,cjs}'],
+    files: ['archie-runner/config-resolver/**/*.{mjs,cjs}', 'archie-runner/agentcore-observability/**/*.{js,cjs}'],
     rules: { 'local/no-statementless-catch': 'error' },
   },
 ];

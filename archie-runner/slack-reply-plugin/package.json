@@ -1,0 +1,13 @@
+{
+  "name": "@myorg/slack-reply-plugin",
+  "version": "0.1.0",
+  "description": "Registers a slack_send tool that POSTs to the clawdbot dispatcher. Outbound Slack transport for per-agent containers that never hold Slack tokens directly.",
+  "type": "module",
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.0.0"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  }
+}

@@ -12,7 +12,7 @@
 
 const {
   runtimeIdOf, PK_PREFIX, SK_PREFIX, nameFromSk,
-} = require('../../slack-dispatcher/runtime-registry');
+} = require('../../archie-gateway/runtime-registry');
 
 /** `…/repo:content-abc` → `content-abc`; null when the row records no image. */
 function tagOf(row) {

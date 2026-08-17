@@ -154,7 +154,15 @@ function taskDefinition({ env = GOOD_ENV, image = `${REPO_URI}:archie-0.2.22`, h
   };
 }
 
-function service({ runningCount = 1, deployments = null, taskDefinitionArn = TD_69 } = {}) {
+function service({
+  runningCount = 1, deployments = null, taskDefinitionArn = TD_69,
+  // ECS ALWAYS RETURNS THIS, and the fixture used to omit it entirely — which made the deployment-shape
+  // convergence fire against `undefined` on every fixture in the file. Defaulting to the configured
+  // shape models a service that is already correct, so a test only sees a convergence when it asks for
+  // one. The extra fields are here on purpose: `DescribeServices` returns more than `UpdateService`
+  // accepts, so a deep-equal comparison would report a difference forever.
+  deploymentConfiguration = { minimumHealthyPercent: 100, maximumPercent: 200 },
+} = {}) {
   return {
     status: 'ACTIVE',
     serviceName: 'agent-gn0p84-dispatcher',
@@ -162,6 +170,12 @@ function service({ runningCount = 1, deployments = null, taskDefinitionArn = TD_
     desiredCount: 1,
     runningCount,
     pendingCount: 0,
+    deploymentConfiguration: {
+      ...deploymentConfiguration,
+      deploymentCircuitBreaker: { enable: false, rollback: false },
+      strategy: 'ROLLING',
+      bakeTimeInMinutes: 0,
+    },
     deployments: deployments || [{ status: 'PRIMARY', taskDefinition: taskDefinitionArn, runningCount, createdAt: new Date('2026-08-14T20:12:00Z') }],
   };
 }
@@ -320,8 +334,8 @@ test('build: --push over an existing tag is refused BEFORE docker runs', async (
   assert.match(e.message, /IMMUTABLE/);
 });
 
-test('build: the build context is docker/, not docker/slack-dispatcher/', async () => {
-  // slack-dispatcher/Dockerfile:70-74 COPYs clawdbot/config-seed, workspace-seed.mjs and
+test('build: the build context is docker/, not docker/archie-gateway/', async () => {
+  // archie-gateway/Dockerfile:70-74 COPYs archie-runner/config-seed, workspace-seed.mjs and
   // config-resolver files. A narrower context fails on those COPY lines (Makefile:297-301).
   const invocations = [];
   const out = makeOut();
@@ -333,7 +347,7 @@ test('build: the build context is docker/, not docker/slack-dispatcher/', async 
   assert.equal(cmd, 'docker');
   assert.equal(opts.cwd, ROOT);
   assert.equal(args[args.length - 1], '.', 'the context is docker/');
-  assert.ok(args.includes('-f') && args[args.indexOf('-f') + 1] === './slack-dispatcher/Dockerfile');
+  assert.ok(args.includes('-f') && args[args.indexOf('-f') + 1] === './archie-gateway/Dockerfile');
   assert.ok(args.includes('--platform=linux/amd64'));
   assert.ok(args.includes(`${REPO_URI}:archie-0.2.23`));
   assert.equal(result.pushed, false);
@@ -399,7 +413,7 @@ test('build: a failed docker build keeps the subprocess stderr on the cause', as
   // region mismatch look identical to an unpublished image" (agent-image.js:52-56).
   const run = () => {
     const e = new Error('`docker build …` exited 1');
-    e.stderr = 'ERROR: failed to compute cache key: "/clawdbot/config-seed" not found';
+    e.stderr = 'ERROR: failed to compute cache key: "/archie-runner/config-seed" not found';
     return Promise.reject(e);
   };
   const e = await expectExit(EXIT.FAILED, () => gateway.build(
@@ -448,6 +462,7 @@ function ecsFor({ services = [service()], describeTasks = null, listTasks = null
       };
     },
     UpdateServiceCommand: () => ({ service: {} }),
+    CreateServiceCommand: () => ({ service: {} }),
     ListTasksCommand: listTasks || ((input) => ({ taskArns: input.desiredStatus === 'RUNNING' ? ['arn:aws:ecs:us-east-1:203366135563:task/agent-gn0p84/running1'] : [] })),
     DescribeTasksCommand: describeTasks || (() => ({
       tasks: [{ taskArn: 'arn:…/running1', taskDefinitionArn: TD_70, lastStatus: 'RUNNING', healthStatus: 'HEALTHY' }],
@@ -608,10 +623,15 @@ test('deploy: registers the COMPOSED definition, with no read-only fields', asyn
   assert.equal(registered.volumes[0].efsVolumeConfiguration.authorizationConfig.accessPointId, AP_ID);
 });
 
-test('deploy: waits stopped -> started -> healthy and reports the measured gap', async () => {
+test('deploy (stop-then-start): waits stopped -> started -> healthy and reports the measured gap', async () => {
+  // THE PROD SHAPE, exercised explicitly via `rolling: false` now that the configured default is
+  // rolling (lib/task-definition.js `SERVICE.deploymentConfiguration`). It is not dead code — it is
+  // where prod goes at cutover, and the day it is switched back is not the day to find out its wait
+  // was untested.
+  //
   // The measured rollout: runningCount fell to 0 at 20:12:53 and the healthcheck passed at 20:14:27
   // — 94 seconds (§6.1). The service is NEVER scripted with two running tasks, because that state
-  // cannot occur (desired_count=1, max 100%) and a wait that needed it would hang forever.
+  // cannot occur under min 0% / max 100% and a wait that needed it would hang forever.
   const ecs = ecsFor({
     services: sequence([
       [service()],                                                                   // initial read
@@ -628,10 +648,12 @@ test('deploy: waits stopped -> started -> healthy and reports the measured gap',
   const clock = fakeClock('2026-08-14T20:12:53Z');
   const result = await gateway.deploy(makeCtx(), makeArgs({ tag: 'archie-0.2.23' }), out, {
     clients: discoveryClients(),
-    ecr: ecrFor({ image: true }), ecs, sts: stsOk(), ...clock, pollIntervalMs: 47000,
+    ecr: ecrFor({ image: true }), ecs, sts: stsOk(), ...clock, pollIntervalMs: 47000, rolling: false,
   });
 
+  assert.equal(result.timeline.mode, 'stop-then-start');
   assert.equal(result.timeline.gapSeconds, 94);
+  assert.equal(result.timeline.overlapSeconds, null);
   assert.equal(result.timeline.gapApproximate, false);
   assert.equal(result.timeline.healthcheckVerified, true);
   assert.equal(result.registeredTaskDefinition, 'agent-gn0p84-dispatcher:70');
@@ -641,6 +663,148 @@ test('deploy: waits stopped -> started -> healthy and reports the measured gap',
   assert.match(text, /20:14:27\s+healthCheck HEALTHY\s+gap 94s/);
   assert.match(text, /dropped Slack events/);
   assert.doesNotMatch(text, /zero downtime|no downtime/i);
+});
+
+test('deploy (rolling): measures the two-connection overlap and never calls it downtime', async () => {
+  // THE CONFIGURED SHAPE. runningCount goes 1 -> 2 -> 1 and NEVER reaches 0, which is exactly why this
+  // cannot reuse the wait above: the zero the stop-then-start path keys on does not occur here.
+  //
+  // Scripted timeline, 47s per poll (the clock only moves when the code sleeps): the new task is
+  // RUNNING alongside the old on the first poll at 20:12:53, HEALTHY at 20:13:40, and the old
+  // deployment is gone at 20:14:27 — an overlap of 94s. It deliberately extends PAST healthy: the old
+  // task's Socket Mode connection lives until ECS drains it, so stopping the clock at HEALTHY would
+  // under-report the hazard window by a whole poll.
+  const bothUp = service({
+    runningCount: 2,
+    taskDefinitionArn: TD_69,
+    deployments: [
+      { status: 'PRIMARY', taskDefinition: TD_70, runningCount: 1, rolloutState: 'IN_PROGRESS' },
+      { status: 'ACTIVE', taskDefinition: TD_69, runningCount: 1 },
+    ],
+  });
+  const drained = service({
+    runningCount: 1,
+    taskDefinitionArn: TD_70,
+    deployments: [{ status: 'PRIMARY', taskDefinition: TD_70, runningCount: 1, rolloutState: 'COMPLETED' }],
+  });
+  const ecs = ecsFor({
+    services: sequence([
+      [service()],   // initial read
+      [bothUp],      // 20:13:40 — new task running, old still up
+      [bothUp],      // 20:14:27 — healthy, but the old task has NOT drained
+      [drained],     // 20:15:14 — old deployment gone
+    ]),
+    describeTasks: sequence([
+      { tasks: [{ taskArn: 'arn:…/new1', taskDefinitionArn: TD_70, lastStatus: 'RUNNING', healthStatus: 'UNKNOWN' }] },
+      { tasks: [{ taskArn: 'arn:…/new1', taskDefinitionArn: TD_70, lastStatus: 'RUNNING', healthStatus: 'HEALTHY' }] },
+    ]),
+  });
+  const out = makeOut();
+  const result = await gateway.deploy(makeCtx(), makeArgs({ tag: 'archie-0.2.23' }), out, {
+    clients: discoveryClients(),
+    ecr: ecrFor({ image: true }), ecs, sts: stsOk(), ...fakeClock('2026-08-14T20:12:53Z'), pollIntervalMs: 47000,
+  });
+
+  assert.equal(result.timeline.mode, 'rolling');
+  assert.equal(result.timeline.overlapSeconds, 94);
+  assert.equal(result.timeline.gapSeconds, 0, 'a rolling deploy is not down for any length of time');
+  assert.equal(result.timeline.stoppedAt, null, 'nothing stopped, so there is no stop to timestamp');
+  assert.equal(result.timeline.drainedAt, '2026-08-14T20:14:27.000Z');
+
+  const text = out.text();
+  assert.match(text, /20:12:53\s+runningCount 1 -> 2/);
+  assert.match(text, /20:14:27\s+runningCount 2 -> 1/);
+  // PRINTED IN CHRONOLOGICAL ORDER. The healthCheck line used to be emitted after the loop, which was
+  // only ever chronological because under stop-then-start HEALTHY is the last transition. The live
+  // archie-dispatcher:17 rollout printed the 09:50:02 drain above a healthCheck stamped 09:48:38.
+  assert.ok(text.indexOf('healthCheck HEALTHY') < text.indexOf('runningCount 2 -> 1'),
+    'healthy is observed before the drain, so it must be printed before it');
+  assert.match(text, /overlap\s+94s with TWO Socket Mode connections/);
+  // The gap language must not survive into a mode that has no gap — a "94s of dropped Slack events"
+  // line here would send someone hunting an outage that did not happen.
+  assert.doesNotMatch(text, /dropped Slack events/);
+});
+
+test('deploy (from scratch): reports startup, not downtime, and does not date it to 1970', async () => {
+  // THE THIRD SHAPE, and previously untested — which is how it carried a live arithmetic bug. Nothing
+  // assigns `stoppedAt` when there is no task to stop, and the old code returned
+  // `new Date(stoppedAt).toISOString()` and `healthyAt - stoppedAt` unconditionally: `null` coerces to
+  // 0, so a brand-new service reported a stop at 1970-01-01 and a "startup" of ~1.8 billion seconds.
+  const ecs = ecsFor({
+    services: sequence([
+      [],                                                                            // absent -> create
+      [service({ runningCount: 1, taskDefinitionArn: TD_70, deployments: [{ status: 'PRIMARY', taskDefinition: TD_70, runningCount: 1 }] })],
+    ]),
+  });
+  const out = makeOut();
+  const result = await gateway.deploy(makeCtx(), makeArgs({ tag: 'archie-0.2.23' }), out, {
+    clients: discoveryClients(), ecr: ecrFor({ image: true }), ecs, sts: stsOk(),
+    ...fakeClock('2026-08-14T20:12:53Z'), pollIntervalMs: 47000,
+  });
+
+  assert.equal(result.created, true);
+  assert.equal(result.timeline.mode, 'created');
+  assert.equal(result.timeline.stoppedAt, null);
+  assert.equal(result.timeline.gapSeconds, 0);
+  assert.equal(result.timeline.overlapSeconds, null);
+  assert.ok(result.timeline.startupSeconds < 300, `startup was ${result.timeline.startupSeconds}s`);
+  // A created service is created with the configured shape, so there is nothing to converge later.
+  const created = ecs.calls.find((c) => c.name === 'CreateServiceCommand');
+  assert.deepEqual(created.input.deploymentConfiguration, { minimumHealthyPercent: 100, maximumPercent: 200 });
+  assert.match(gateway.renderDeploy(result), /startup     0s to HEALTHY — nothing was interrupted/);
+  assert.doesNotMatch(out.text(), /dropped Slack events|overlap /);
+});
+
+test('deploy: an unchanged image STILL converges a stale deployment shape, without replacing a task', async () => {
+  // The gap that made this necessary: min/max percent live on the SERVICE, not in the image or the
+  // composed definition. If the only path that sends them is the roll, then flipping the constant on a
+  // tree whose gateway image is unchanged does nothing at all — and the NEXT deploy runs the old shape
+  // while the file, the docs and the wait all describe the new one. So the convergence does not get to
+  // depend on an unrelated image change.
+  const ecs = ecsFor({
+    services: [service({ deploymentConfiguration: { minimumHealthyPercent: 0, maximumPercent: 100 } })],
+    taskDefinition: deployedAsComposed(`${REPO_URI}:archie-0.2.22`),
+  });
+  const out = makeOut();
+  const result = await gateway.deploy(makeCtx(), makeArgs({ tag: 'archie-0.2.22' }), out, {
+    ecr: ecrFor({ image: true }), ecs, sts: stsOk(), clients: discoveryClients(),
+  });
+
+  assert.equal(result.unchanged, true, 'the image really is unchanged — this is not a rollout');
+  assert.deepEqual(result.deploymentShapeConverged, { from: 'min=0% max=100%', to: 'min=100% max=200%', applied: true });
+  const updates = ecs.calls.filter((c) => c.name === 'UpdateServiceCommand');
+  assert.equal(updates.length, 1);
+  // NO taskDefinition on it. That is what makes this free: ECS applies the configuration to the service
+  // without replacing the running task, so it costs neither a gap nor an overlap.
+  assert.equal('taskDefinition' in updates[0].input, false, 'a config-only update must not roll the task');
+  assert.deepEqual(updates[0].input.deploymentConfiguration, { minimumHealthyPercent: 100, maximumPercent: 200 });
+  assert.equal(ecs.calls.filter((c) => c.name === 'RegisterTaskDefinitionCommand').length, 0);
+  assert.match(out.text(), /shape       min=0% max=100% -> min=100% max=200%/);
+});
+
+test('deploy: a service already on the configured shape is not re-sent it', async () => {
+  // `DescribeServices` returns `strategy`, `bakeTimeInMinutes` and a disabled `deploymentCircuitBreaker`
+  // that `UpdateService` does not accept — so a deep-equal against the target would report a difference
+  // on every call and re-send the same values forever. Two percentages, nothing else.
+  const ecs = ecsFor({ taskDefinition: deployedAsComposed(`${REPO_URI}:archie-0.2.22`) });
+  const result = await gateway.deploy(makeCtx(), makeArgs({ tag: 'archie-0.2.22' }), makeOut(), {
+    ecr: ecrFor({ image: true }), ecs, sts: stsOk(), clients: discoveryClients(),
+  });
+  assert.equal(result.deploymentShapeConverged, null);
+  assert.equal(ecs.calls.filter((c) => c.name === 'UpdateServiceCommand').length, 0);
+});
+
+test('deploy (rolling): sends the deployment configuration, or a live service keeps min 0% forever', async () => {
+  // ECS stores min/max on the SERVICE. A service created under stop-then-start keeps those values until
+  // something overwrites them, and UpdateService cannot express "unset and re-inherit the default" — so
+  // if the roll omits the configuration, the sandbox service stays on stop-then-start while
+  // lib/task-definition.js claims it rolls, and the wait then keys on a zero that never comes.
+  const ecs = ecsFor();
+  await gateway.deploy(makeCtx(), makeArgs({ tag: 'archie-0.2.23', 'no-wait': true }), makeOut(), {
+    clients: discoveryClients(), ecr: ecrFor({ image: true }), ecs, sts: stsOk(),
+  });
+  const update = ecs.calls.find((c) => c.name === 'UpdateServiceCommand');
+  assert.deepEqual(update.input.deploymentConfiguration, { minimumHealthyPercent: 100, maximumPercent: 200 });
 });
 
 test('deploy: reports no terraform follow-up — there is nothing left for Terraform to agree with', async () => {
@@ -655,7 +819,7 @@ test('deploy: reports no terraform follow-up — there is nothing left for Terra
   assert.equal('terraform' in result, false);
 });
 
-test('deploy: a stop observed between polls still reports a gap, flagged approximate', async () => {
+test('deploy (stop-then-start): a stop observed between polls still reports a gap, flagged approximate', async () => {
   // An unreported gap reads as "no downtime", which is the one claim this command must never make.
   const ecs = ecsFor({
     services: sequence([
@@ -665,10 +829,37 @@ test('deploy: a stop observed between polls still reports a gap, flagged approxi
   });
   const result = await gateway.deploy(makeCtx(), makeArgs({ tag: 'archie-0.2.23' }), makeOut(), {
     clients: discoveryClients(),
-    ecr: ecrFor({ image: true }), ecs, sts: stsOk(), ...fakeClock('2026-08-14T20:13:00Z'), pollIntervalMs: 1000,
+    ecr: ecrFor({ image: true }), ecs, sts: stsOk(), ...fakeClock('2026-08-14T20:13:00Z'), pollIntervalMs: 1000, rolling: false,
   });
   assert.equal(result.timeline.gapApproximate, true);
   assert.ok(result.timeline.gapSeconds >= 7);
+});
+
+test('deploy (rolling): the same "stop between polls" state is NOT read as a stop', async () => {
+  // THE INVERSE OF THE TEST ABOVE, and the reason the wait had to become mode-aware rather than gaining
+  // a branch. This is the identical scripted state — the target deployment at runningCount 1 with a
+  // createdAt — and under stop-then-start it is correctly read as "the stop happened between polls,
+  // report an approximate gap". Under rolling it means the new task came up ALONGSIDE the old one, and
+  // reading it as a stop fabricates an outage from `createdAt` that never occurred.
+  const ecs = ecsFor({
+    services: sequence([
+      [service()],
+      [service({
+        runningCount: 2,
+        taskDefinitionArn: TD_69,
+        deployments: [
+          { status: 'PRIMARY', taskDefinition: TD_70, runningCount: 1, createdAt: new Date('2026-08-14T20:12:53Z'), rolloutState: 'COMPLETED' },
+        ],
+      })],
+    ]),
+  });
+  const result = await gateway.deploy(makeCtx(), makeArgs({ tag: 'archie-0.2.23' }), makeOut(), {
+    clients: discoveryClients(),
+    ecr: ecrFor({ image: true }), ecs, sts: stsOk(), ...fakeClock('2026-08-14T20:13:00Z'), pollIntervalMs: 1000,
+  });
+  assert.equal(result.timeline.gapApproximate, false);
+  assert.equal(result.timeline.gapSeconds, 0);
+  assert.equal(result.timeline.stoppedAt, null);
 });
 
 test('deploy: a STOPPED new task is exit 1 and is NOT rolled back', async () => {

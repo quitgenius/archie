@@ -52,9 +52,9 @@ const {
   clientsFor, resolveAccount, imageUriFor, dispatcherClientFor, derivedSpecFor, registryHostFor,
 } = require('../lib/spec');
 const { describeImage, assertArm64 } = require('../lib/ecr');
-const { diffObserved } = require('../../slack-dispatcher/spec-diff');
+const { diffObserved } = require('../../archie-gateway/spec-diff');
 const { adoptedRootFor } = require('../lib/efs-root');
-const { runtimeIdOf } = require('../../slack-dispatcher/runtime-registry');
+const { runtimeIdOf } = require('../../archie-gateway/runtime-registry');
 
 // AgentCore microVMs are arm64. Not overridable — §2.6, Makefile:59-68.
 const PLATFORM = 'linux/arm64';
@@ -63,9 +63,9 @@ const MAKE_TARGET = 'build-agentcore-pi';
 /** The answer, shaped for the reader: an object under --json, a block otherwise. */
 const answer = (out, ctx, obj, text) => out.answer(ctx.json ? obj : text);
 
-// docker/ — the same root lib/digest.js resolves, and where slack-dispatcher/ lives.
+// docker/ — the same root lib/digest.js resolves, and where archie-gateway/ lives.
 const ROOT = path.resolve(__dirname, '..', '..');
-const SPEC_BASELINE = path.join(ROOT, 'slack-dispatcher', 'spec-baseline.mjs');
+const SPEC_BASELINE = path.join(ROOT, 'archie-gateway', 'spec-baseline.mjs');
 
 // ── composition plumbing ─────────────────────────────────────────────────────────────────────────
 
@@ -517,7 +517,7 @@ function classifyCompare(nowAgents, baseAgents) {
 /**
  * `archie fleet drift [--fix] [--compare <baseline.json>]` — §2.21.
  *
- * WRAPS `slack-dispatcher/spec-baseline.mjs`, which is complete: it reads the deployed task
+ * WRAPS `archie-gateway/spec-baseline.mjs`, which is complete: it reads the deployed task
  * definition, applies it, drives the dispatcher's OWN `runtimeSpecFor` /`generationRuntimeName`, and
  * compares against a baseline file (`:121-142`) with the data-loss gate at `:128-134`. Reimplementing
  * any of that here would give two answers to the migration gate's one question (plan §12.4).
@@ -543,7 +543,7 @@ async function fleetDrift(ctx, args, out, deps = {}) {
 
   const argv = [deps.script || SPEC_BASELINE, ...(compare ? ['--compare', compare] : [])];
   out.progress(`deriving    ${path.basename(argv[0])} against ${ctx.resources.cluster}/${ctx.resources.dispatcherService}`);
-  const proc = await run(argv, { env: baselineEnv(ctx, deps.env || process.env), cwd: path.join(ROOT, 'slack-dispatcher') });
+  const proc = await run(argv, { env: baselineEnv(ctx, deps.env || process.env), cwd: path.join(ROOT, 'archie-gateway') });
   // The script's stderr IS its report — task definition, fleet image, agent count, which derived
   // names are absent from AWS. It is progress, so it goes to stderr here too, never to stdout (§1.4).
   for (const line of String(proc.stderr || '').split('\n')) if (line.trim()) out.verbose(line);
@@ -764,7 +764,7 @@ function assertMakeConstraints(text) {
   const required = [
     [`--platform=${PLATFORM}`, 'AgentCore microVMs are arm64 (Makefile:59-68)'],
     ['--build-context lintroot=.', 'the lint gate\'s first `COPY --from=lintroot` fails without it (Makefile:267-270)'],
-    ['-f ./clawdbot/agentcore-pi/Dockerfile', 'the Dockerfile must be named explicitly, since the context is its parent'],
+    ['-f ./archie-runner/agentcore-pi/Dockerfile', 'the Dockerfile must be named explicitly, since the context is its parent'],
     ['./clawdbot', 'the build context is ./clawdbot, NOT agentcore-pi/ — the Dockerfile COPYs sibling plugin-sdk/ and connector-session-plugin/'],
     ['$(AGENTCORE_PI_TAG)', 'archie passes the tag as a make override; a hard-coded tag would silently ignore it'],
   ];

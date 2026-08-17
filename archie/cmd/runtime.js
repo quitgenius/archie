@@ -25,10 +25,10 @@
 
 const {
   createRuntimeRegistry, runtimeIdOf, nameFromSk, PK_PREFIX,
-} = require('../../slack-dispatcher/runtime-registry');
+} = require('../../archie-gateway/runtime-registry');
 const { tagOf } = require('../lib/bindings');
-const { isGenerationOf } = require('../../slack-dispatcher/agentcore-client');
-const { waitForRuntimeDeleted } = require('../../slack-dispatcher/agentcore-provisioning');
+const { isGenerationOf } = require('../../archie-gateway/agentcore-client');
+const { waitForRuntimeDeleted } = require('../../archie-gateway/agentcore-provisioning');
 const { CliError, EXIT, usage, refused } = require('../lib/exit');
 const { makeClient } = require('../lib/aws');
 

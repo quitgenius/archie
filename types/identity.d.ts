@@ -33,7 +33,7 @@
  * THE agent identity everywhere in archie: the DynamoDB partition key, the routing GSI sort key, the
  * derived IAM role name, the Connector secret suffix, and the owner of a cron job. Produced by
  * exactly two functions, which are held in lockstep by a test: `scopeIdFor` (config-resolver/
- * rekey-to-scope.mjs) and `scopeIdForRouting` (slack-dispatcher/agent-scope.js). Nothing else may
+ * rekey-to-scope.mjs) and `scopeIdForRouting` (archie-gateway/agent-scope.js). Nothing else may
  * mint one, because "the name IS the route, recomputed on every message" only holds if there is one
  * rule.
  */

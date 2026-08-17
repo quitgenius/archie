@@ -80,6 +80,7 @@ const COMMANDS = {
   'grants apply': { options: {}, module: 'wrappers', task: 'W1-G', needsAws: true, positional: 'agent', summary: 'rewrite the role policy only, from GRANT#* as stored' },
   'cron hydrate': { options: { as:{type:'string'} }, module: 'wrappers', task: 'W1-G', needsAws: true, dryRunDefault: true, positional: 'agent', summary: 'fold an agent EFS cron store into the dispatcher store' },
   'cron list': { options: {}, module: 'wrappers', task: 'W1-G', needsAws: true, positional: 'agent', summary: 'list scheduled jobs via the manager API' },
+  'cron runner': { options: { set:{type:'string'} }, module: 'wrappers', task: 'W1-G', needsAws: true, dryRunDefault: true, positional: 'agent', summary: 'read (or --set) which scheduler fires a scope\'s jobs' },
   'cron arm': { options: {}, module: 'wrappers', task: 'W1-G', needsAws: true, summary: 'arm the cron scheduler' },
   'cron disarm': { options: {}, module: 'wrappers', task: 'W1-G', needsAws: true, summary: 'disarm the cron scheduler' },
   'dashboard deploy': { options: { dashboard:{type:'string'} }, module: 'wrappers', task: 'W1-G', needsAws: true, summary: 'PutDashboard for the fleet board' },
@@ -191,7 +192,7 @@ function load(key, command, { require: req = require } = {}) {
   if (command.phase === 2) {
     throw new CliError(`\`archie ${key}\` is deferred to phase 2 and is not built`, {
       code: EXIT.USAGE,
-      detail: 'Phase 1 is the CLI only — see clawdbot/RUNTIME-RELEASE-PLAN.md, phase-1 scope block.',
+      detail: 'Phase 1 is the CLI only — see archie-runner/RUNTIME-RELEASE-PLAN.md, phase-1 scope block.',
     });
   }
   if (!command.module) return null;
@@ -204,7 +205,7 @@ function load(key, command, { require: req = require } = {}) {
       // stack underneath it reads like a broken install rather than an unwritten command.
       throw new CliError(`\`archie ${key}\` is not implemented yet`, {
         code: EXIT.USAGE,
-        detail: `Owned by task ${command.task} (cmd/${command.module}.js) — see clawdbot/PHASE-1-TASKS.md.`,
+        detail: `Owned by task ${command.task} (cmd/${command.module}.js) — see archie-runner/PHASE-1-TASKS.md.`,
       });
     }
     throw e;
@@ -225,7 +226,7 @@ function load(key, command, { require: req = require } = {}) {
   if (typeof handler !== 'function') {
     throw new CliError(`\`archie ${key}\` is declared but cmd/${command.module}.js exports no "${verb}"`, {
       code: EXIT.USAGE,
-      detail: `Owned by task ${command.task} — see clawdbot/PHASE-1-TASKS.md.`,
+      detail: `Owned by task ${command.task} — see archie-runner/PHASE-1-TASKS.md.`,
     });
   }
   return handler;

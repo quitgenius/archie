@@ -39,11 +39,11 @@
 
 const { CliError, EXIT, drift } = require('../lib/exit');
 const { makeClient } = require('../lib/aws');
-const { collectFromDdb } = require('../../slack-dispatcher/routing-build');
-const { createRuntimeRegistry } = require('../../slack-dispatcher/runtime-registry');
-const { readImageItem } = require('../../slack-dispatcher/image-source');
+const { collectFromDdb } = require('../../archie-gateway/routing-build');
+const { createRuntimeRegistry } = require('../../archie-gateway/runtime-registry');
+const { readImageItem } = require('../../archie-gateway/image-source');
 const { listTaints } = require('../lib/image-pointer');
-const corpus = require('../../clawdbot/agentcore-observability/insight-queries');
+const corpus = require('../../archie-runner/agentcore-observability/insight-queries');
 
 // Item keys. ONE pointer: `CONFIG#image / FLEET`, which is what the dispatcher reads on every turn.
 // There is no separate image pointer to reconcile against it any more — status used to read both

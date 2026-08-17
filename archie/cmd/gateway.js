@@ -5,24 +5,31 @@
 //
 // THE ONE THING TO KNOW BEFORE READING ANY OF THIS:
 //
-// `gateway deploy` is a STOP-THEN-START WITH REAL DOWNTIME, and cannot be anything else.
-// `aws_ecs_service.dispatcher` pins desired_count = 1, deployment_minimum_healthy_percent = 0,
-// deployment_maximum_percent = 100 (dispatcher.tf:216-233) because "two tasks would open two Slack
-// Socket Mode connections, and Slack load-balances events across connections for the same app — so
-// events would be handled non-deterministically, sometimes twice. It would also break the cron
-// store's sole-writer invariant and per-session turn serialisation."
+// `gateway deploy` HAS TWO ROLLOUT SHAPES, and which one runs is decided by a single constant —
+// `SERVICE.deploymentConfiguration` in lib/task-definition.js, whose comment carries the reasoning and
+// the cutover condition. It is currently ROLLING (min 100% / max 200%, the same values the OpenClaw
+// dispatcher inherits by omitting them), because verification runs against archie's own Slack app.
 //
-// So a wait for "a new healthy task while the old one is still running" — which is what
-// `aws ecs wait services-stable` and every rolling-deploy helper is built around — WAITS FOREVER,
-// because that state never occurs. This file waits for three transitions in order instead:
-// runningCount -> 0, runningCount -> 1 on the NEW task definition, then the container healthcheck
-// (GET /health, dispatcher.tf:196-202, handler slack-dispatcher/index.js:1840) reporting HEALTHY.
-// The healthcheck has a 30s startPeriod (dispatcher.tf:204-210), which is part of why the measured
-// gap on the archie-0.2.22 rollout was 94 SECONDS — 20:12:53 to 20:14:27 (§6.1). The command prints
-// that number from its own observations rather than claiming the Terraform comment's "a few
-// seconds", and there is deliberately NO automatic rollback on a failed healthcheck: that would be a
-// second uninstrumented ~94s outage stacked on the first. ECS holds the failed deployment; the
-// operator decides.
+//   rolling           no downtime; instead a window where BOTH tasks hold a Socket Mode connection and
+//                     Slack load-balances events across them, so an event in that window may be handled
+//                     by either or by both. The cron store has two writers for the same window.
+//   stop-then-start   min 0% / max 100%. No overlap; a real gap instead — a measured 94s on the
+//                     archie-0.2.22 rollout, 20:12:53 to 20:14:27 (§6.1) — during which the connection
+//                     is CLOSED and events are dropped, not queued. This is what PROD wants: for the
+//                     production Slack app and a live cron store, dropping is cheaper than duplicating.
+//
+// THE WAIT IS NOT SHARED BETWEEN THEM, and that is the subtle part. Under stop-then-start the
+// observable is runningCount 1 -> 0 -> 1; under rolling the zero NEVER OCCURS (1 -> 2 -> 1), so a wait
+// looking for it hangs until the budget expires and then reports a timeout on a rollout that worked.
+// `waitForRollout` reads the same constant the roll sends to `UpdateService` and picks its phases from
+// it; its doc comment has the full state table.
+//
+// Either way the last transition is the container healthcheck (GET /health, handler
+// archie-gateway/index.js:1840) reporting HEALTHY, with a 30s startPeriod
+// (lib/task-definition.js:330-338) that is a large part of the stop-then-start number. The command
+// prints what it OBSERVED rather than a figure from a document, and there is deliberately NO automatic
+// rollback on a failed healthcheck: under stop-then-start that would stack a second uninstrumented
+// ~94s outage on the first. ECS holds the failed deployment; the operator decides.
 //
 // TAGS ARE DERIVED, NOT TYPED (plan §5, reference §2.27). Without --tag, the tag is a content digest
 // of this image's declared COPY inputs (../lib/digest.js). If that tag is already in ECR the build
@@ -48,6 +55,11 @@ const { GetCallerIdentityCommand } = require('@aws-sdk/client-sts');
 const { CliError, EXIT, usage, preflight, refused, drift, timeout } = require('../lib/exit');
 const { makeClient } = require('../lib/aws');
 const { IMAGES, ROOT, digestFor, assertPure, dirtyWarning } = require('../lib/digest');
+
+// The configured rollout shape, read through a function rather than destructured at module load: every
+// other use of `lib/task-definition` in this file is a lazy require, and a top-level one here would be
+// the only thing forcing that module to load before a command runs.
+const ROLLING_DEFAULT = () => require('../lib/task-definition').ROLLING;
 
 // §2.4: "Budget for stopped -> started -> healthcheck passing. Sized against ~2 minutes plus margin."
 const DEFAULT_WAIT_SECONDS = 300;
@@ -318,9 +330,9 @@ async function build(ctx, args, out, deps = {}) {
   // literal here: the digest is computed over the inputs that declaration names, so a build from a
   // different context would tag content the digest never hashed.
   //
-  // Context is docker/, NOT docker/slack-dispatcher/ (Makefile:297-301), because the Dockerfile
-  // COPYs clawdbot/config-seed, clawdbot/agentcore-pi/workspace-seed.mjs and files from
-  // clawdbot/config-resolver/ (slack-dispatcher/Dockerfile:70-74). A narrower context fails on
+  // Context is docker/, NOT docker/archie-gateway/ (Makefile:297-301), because the Dockerfile
+  // COPYs archie-runner/config-seed, archie-runner/agentcore-pi/workspace-seed.mjs and files from
+  // archie-runner/config-resolver/ (archie-gateway/Dockerfile:70-74). A narrower context fails on
   // those COPY lines.
   const spec = IMAGES.gateway;
   const buildArgs = [
@@ -524,7 +536,16 @@ function checkEnvAgainstName(ctx, env) {
  */
 async function deploy(ctx, args, out, deps = {}) {
   const { discoverFacts, readGatewayConfig } = require('../lib/deployment-facts');
-  const { composeTaskDefinition, SERVICE } = require('../lib/task-definition');
+  const {
+    composeTaskDefinition, SERVICE, ROLLING, DEPLOYMENT_SHAPES,
+  } = require('../lib/task-definition');
+  // ONE effective shape for the whole command. `deps.rolling` is the test seam; resolving it once here
+  // is what stops the progress line, the values sent to ECS and the wait from describing three
+  // different rollouts — the first version of this read the module constant in one place and the seam
+  // in another, and a test forcing stop-then-start got a "no downtime expected" line above a
+  // stop-then-start wait.
+  const rolling = deps.rolling ?? ROLLING;
+  const deploymentConfiguration = rolling ? DEPLOYMENT_SHAPES.rolling : DEPLOYMENT_SHAPES['stop-then-start'];
   const { diffTaskDefinition, renderDiff } = require('../lib/td-diff');
   const ecr = client.ecr(ctx, deps);
   const ecs = client.ecs(ctx, deps);
@@ -574,6 +595,9 @@ async function deploy(ctx, args, out, deps = {}) {
       });
     }
   }
+  // Resolved ONCE, and nullable by design: on a `--dry-run` whose tag is not in ECR the branch above
+  // deliberately does not build, so there is no digest and every consumer has to tolerate its absence.
+  const imageDigest = inEcr ? inEcr.digest : null;
 
   // COMPOSED, NOT CLONED. This used to register a revision of the DEPLOYED definition with only the
   // image swapped, because Terraform owned the definition's shape and archie owned which revision
@@ -594,7 +618,7 @@ async function deploy(ctx, args, out, deps = {}) {
     if (ctx.dryRun) {
       out.progress(`would register ${composed.family} and CREATE the service on it — no outage, there is nothing running`);
       return emit(ctx, out, {
-        tag, image, imageDigest: inEcr.digest, cluster: ctx.resources.cluster, service: ctx.resources.dispatcherService,
+        tag, image, imageDigest, cluster: ctx.resources.cluster, service: ctx.resources.dispatcherService,
         created: false, previousTaskDefinition: null, registeredTaskDefinition: null,
         rolled: false, unchanged: false, waited: false, timeline: null,
       }, renderDeploy);
@@ -602,7 +626,7 @@ async function deploy(ctx, args, out, deps = {}) {
 
     const registered = await registerComposed(ecs, composed);
     out.progress(`registered  ${arnTail(registered.taskDefinitionArn)}  (image ${image})`);
-    await createService(ecs, ctx, facts, config, registered.taskDefinitionArn);
+    await createService(ecs, ctx, facts, config, registered.taskDefinitionArn, deploymentConfiguration);
     out.progress('created     the service is new, so there is NO downtime to report — nothing was running');
 
     const timeline = args.values['no-wait'] ? null : await waitForRollout({
@@ -616,7 +640,7 @@ async function deploy(ctx, args, out, deps = {}) {
       pollIntervalMs: deps.pollIntervalMs || POLL_INTERVAL_MS,
     });
     return emit(ctx, out, {
-      tag, image, imageDigest: inEcr.digest, cluster: ctx.resources.cluster, service: ctx.resources.dispatcherService,
+      tag, image, imageDigest, cluster: ctx.resources.cluster, service: ctx.resources.dispatcherService,
       created: true, previousTaskDefinition: null, registeredTaskDefinition: arnTail(registered.taskDefinitionArn),
       rolled: true, unchanged: false, waited: Boolean(timeline), timeline,
     }, renderDeploy);
@@ -646,22 +670,40 @@ async function deploy(ctx, args, out, deps = {}) {
   // check is why this is not just an image comparison: an SSM value can change with no new image,
   // and that DOES need a rollout.
   if (currentImage === image && diff.equivalent) {
+    // BUT THE DEPLOYMENT SHAPE STILL CONVERGES, because it is not part of the image OR the composition.
+    // min/max percent live on the SERVICE, so changing the constant in lib/task-definition.js has no
+    // effect until something sends the new values — and if the only path that sends them is the roll,
+    // then flipping the shape on a tree whose gateway image is unchanged silently does nothing, and the
+    // next deploy uses the OLD shape while the file, the docs and the wait all describe the new one.
+    // That is the exact class of "the code claims what the account does not do" this file exists to
+    // avoid, so the convergence does not get to depend on an unrelated image change.
+    //
+    // It is free: an UpdateService carrying only deploymentConfiguration does not replace a task. No
+    // gap, no overlap, nothing restarts.
+    const converged = await convergeDeploymentShape(ecs, ctx, out, deployed, deploymentConfiguration);
     out.progress(`unchanged   ${currentTd} already runs ${image}, and the composition matches — no rollout, no outage`);
     return emit(ctx, out, {
       tag, image, cluster: deployed.cluster, service: deployed.service,
       created: false, previousTaskDefinition: currentTd, registeredTaskDefinition: null,
       rolled: false, unchanged: true, waited: false, timeline: null,
+      deploymentShapeConverged: converged,
     }, renderDeploy);
   }
 
   out.progress(`image       ${currentImage}`);
-  out.progress(`         -> ${image}  (${inEcr.digest})`);
+  // NULL ON A DRY-RUN WHOSE IMAGE IS NOT YET IN ECR. `--dry-run` deliberately does not build (:583), so
+  // there is no digest to report — and every one of these sites used to dereference it unguarded, which
+  // made `gateway deploy --dry-run` on an unpublished tree die with "Cannot read properties of null".
+  // The one command whose entire job is to tell you what a rollout would cost, before you pay it.
+  out.progress(`         -> ${image}${imageDigest ? `  (${imageDigest})` : '  (not yet built)'}`);
 
   if (ctx.dryRun) {
     out.progress(`would register ${composed.family} composed from SSM + discovery, and point the service at it`);
-    out.progress(`would update ${deployed.cluster}/${deployed.service} onto it — ~94s of dispatcher downtime`);
+    out.progress(`would update ${deployed.cluster}/${deployed.service} onto it — ${rolling
+      ? 'a rolling replacement: no downtime, but two Socket Mode connections for the overlap'
+      : '~94s of dispatcher downtime'}`);
     return emit(ctx, out, {
-      tag, image, imageDigest: inEcr.digest, cluster: deployed.cluster, service: deployed.service,
+      tag, image, imageDigest, cluster: deployed.cluster, service: deployed.service,
       created: false, previousTaskDefinition: currentTd, registeredTaskDefinition: null,
       rolled: false, unchanged: false, waited: false, timeline: null, diff,
     }, renderDeploy);
@@ -671,16 +713,28 @@ async function deploy(ctx, args, out, deps = {}) {
   const newArn = registered.taskDefinitionArn;
   out.progress(`registered  ${arnTail(newArn)}  (image ${image})`);
 
+  // THE DEPLOYMENT CONFIGURATION IS SENT ON EVERY ROLL, not just at create. It is not drift-chasing:
+  // ECS stores min/max on the SERVICE, so a service created under the old stop-then-start values keeps
+  // them until something overwrites them, and `UpdateService` cannot express "unset and re-inherit the
+  // default". Sending SERVICE's values here is the only thing that converges a live service onto what
+  // lib/task-definition.js says it runs — and the wait below is chosen from the same constant, so the
+  // two can never disagree about which shape of rollout to expect.
   await ecs.send(new UpdateServiceCommand({
-    cluster: deployed.cluster, service: deployed.service, taskDefinition: newArn,
+    cluster: deployed.cluster,
+    service: deployed.service,
+    taskDefinition: newArn,
+    deploymentConfiguration,
   }));
-  out.progress('rolling     desired=1 min=0% max=100%  — stop-then-start, downtime expected');
+  const { minimumHealthyPercent: minPct, maximumPercent: maxPct } = deploymentConfiguration;
+  out.progress(`rolling     desired=1 min=${minPct}% max=${maxPct}%  — ${rolling
+    ? 'rolling, two tasks overlap, no downtime expected'
+    : 'stop-then-start, downtime expected'}`);
 
   if (args.values['no-wait']) {
     out.warn('--no-wait: nothing is monitoring the rollout. The wait is the value of this command; '
       + 'the gap, a STOPPED task and a failing healthcheck are all invisible from here.');
     return emit(ctx, out, {
-      tag, image, imageDigest: inEcr.digest, cluster: deployed.cluster, service: deployed.service,
+      tag, image, imageDigest, cluster: deployed.cluster, service: deployed.service,
       created: false, previousTaskDefinition: currentTd, registeredTaskDefinition: arnTail(newArn),
       rolled: true, unchanged: false, waited: false, timeline: null, diff,
     }, renderDeploy);
@@ -694,10 +748,15 @@ async function deploy(ctx, args, out, deps = {}) {
     hasHealthcheck: Boolean((registered.containerDefinitions || []).some((c) => c.healthCheck)),
     budgetMs: waitBudgetSeconds(ctx, args) * 1000,
     pollIntervalMs: deps.pollIntervalMs || POLL_INTERVAL_MS,
+    // The shape resolved at the top of this function, never re-read from the module — see the note
+    // there. The seam exists so the tests can exercise BOTH shapes against a scripted ECS:
+    // stop-then-start is the prod target, and the day it is switched back is not the day to discover
+    // its wait was never covered.
+    rolling,
   });
 
   return emit(ctx, out, {
-    tag, image, imageDigest: inEcr.digest, cluster: deployed.cluster, service: deployed.service,
+    tag, image, imageDigest, cluster: deployed.cluster, service: deployed.service,
     created: false, previousTaskDefinition: currentTd, registeredTaskDefinition: arnTail(newArn),
     rolled: true, unchanged: false, waited: true, timeline, diff,
   }, renderDeploy);
@@ -740,6 +799,36 @@ async function registerComposed(ecs, composed) {
 }
 
 /**
+ * Bring a live service's min/max percent onto the configured shape, and say so when it moves.
+ *
+ * COMPARED ON THE TWO PERCENTAGES ONLY. `DescribeServices` returns a wider object than `UpdateService`
+ * accepts — `strategy`, `bakeTimeInMinutes`, and a `deploymentCircuitBreaker` block that is present and
+ * disabled on a service created without one. A deep-equal against the target would therefore report a
+ * difference on every single call and re-send the same values forever.
+ *
+ * Returns the change if one was made, `null` if the service already agreed. `--dry-run` reports and
+ * sends nothing.
+ */
+async function convergeDeploymentShape(ecs, ctx, out, deployed, target) {
+  const live = (deployed.svc && deployed.svc.deploymentConfiguration) || {};
+  if (live.minimumHealthyPercent === target.minimumHealthyPercent
+    && live.maximumPercent === target.maximumPercent) return null;
+
+  const from = `min=${live.minimumHealthyPercent}% max=${live.maximumPercent}%`;
+  const to = `min=${target.minimumHealthyPercent}% max=${target.maximumPercent}%`;
+  if (ctx.dryRun) {
+    out.progress(`would converge the deployment shape: ${from} -> ${to} (no task is replaced by this)`);
+    return { from, to, applied: false };
+  }
+  await ecs.send(new UpdateServiceCommand({
+    cluster: deployed.cluster, service: deployed.service, deploymentConfiguration: target,
+  }));
+  out.progress(`shape       ${from} -> ${to}  — the service now matches lib/task-definition.js; `
+    + 'nothing was replaced, so this cost neither a gap nor an overlap');
+  return { from, to, applied: true };
+}
+
+/**
  * Create the service. Everything not in `SERVICE`'s constants is DISCOVERED, not configured (§5.2).
  *
  * The subnets come from the file system's mount targets, which is not a coincidence of one
@@ -748,9 +837,13 @@ async function registerComposed(ecs, composed) {
  * against the live service before the move — the three subnets matched exactly, though AWS returns
  * both lists UNORDERED, which is why anything comparing them compares sets.
  */
-async function createService(ecs, ctx, facts, config, taskDefinitionArn) {
+async function createService(ecs, ctx, facts, config, taskDefinitionArn, deploymentConfiguration) {
   const { CreateServiceCommand } = require('@aws-sdk/client-ecs');
   const { SERVICE } = require('../lib/task-definition');
+  // PASSED IN, not re-read from SERVICE. The caller resolved one shape for the whole command; reading
+  // the module constant here would let a create disagree with the wait that follows it — the same
+  // mistake the roll's own comment describes, one function further along.
+  const shape = deploymentConfiguration || SERVICE.deploymentConfiguration;
   const enableExecuteCommand = String(config.values.ENABLE_EXECUTE_COMMAND || '').toLowerCase() === 'true';
 
   try {
@@ -760,7 +853,7 @@ async function createService(ecs, ctx, facts, config, taskDefinitionArn) {
       taskDefinition: taskDefinitionArn,
       launchType: SERVICE.launchType,
       desiredCount: SERVICE.desiredCount,
-      deploymentConfiguration: SERVICE.deploymentConfiguration,
+      deploymentConfiguration: shape,
       enableExecuteCommand,
       networkConfiguration: {
         awsvpcConfiguration: {
@@ -795,27 +888,47 @@ function waitBudgetSeconds(ctx, args) {
 
 
 /**
- * Wait for the three transitions, in order. See the file header for why it cannot be two.
+ * Wait for the transitions of whichever rollout shape the service is configured for.
  *
- * Timestamps come from OBSERVATION, at poll resolution — the printed gap is what this command saw,
- * not a number copied from a document. If the poll interval straddles the whole stop (possible only
- * on a very fast start), the zero is inferred from the deployment's own createdAt and the gap is
- * reported as approximate rather than silently omitted.
+ * THERE ARE THREE SHAPES, and the phases differ because the OBSERVABLE STATES differ. Choosing the
+ * wrong one does not produce a slightly-off number, it hangs or it fabricates one:
+ *
+ *   'stop-then-start'  min 0% / max 100%. runningCount 1 -> 0 -> 1, then HEALTHY. The transition that
+ *                      matters is the ZERO, and the number to report is the GAP across it.
+ *   'rolling'          min 100% / max 200%. runningCount 1 -> 2 -> 1: the zero NEVER OCCURS, so a wait
+ *                      that looks for it burns the whole budget and reports a timeout on a rollout
+ *                      that succeeded. Worse, the old code's "stop observed between polls" fallback
+ *                      WOULD fire here — the target deployment does reach runningCount 1 while the old
+ *                      task is still up — and it would print a fabricated gap anchored on the
+ *                      deployment's createdAt. A number describing an outage that did not happen is
+ *                      the one output this command must never produce, in either direction. What
+ *                      matters here is the OVERLAP: the window with two Socket Mode connections.
+ *   'created'          nothing was running. No gap, no overlap, just startup.
+ *
+ * The shape is read from `SERVICE.deploymentConfiguration` (via ROLLING), the same constant the roll
+ * sends to `UpdateService`, so the wait cannot disagree with what was asked for.
+ *
+ * Timestamps come from OBSERVATION, at poll resolution — the printed number is what this command saw,
+ * not one copied from a document. In 'stop-then-start', if the poll interval straddles the whole stop
+ * (possible only on a very fast start), the zero is inferred from the deployment's own createdAt and
+ * the gap is reported as approximate rather than silently omitted.
  */
 async function waitForRollout({
   ecs, ctx, out, now, sleep, cluster, service, taskDefinitionArn, hasHealthcheck, budgetMs, pollIntervalMs,
-  expectStop = true,
+  expectStop = true, rolling = ROLLING_DEFAULT(),
 }) {
   const startedWaitingAt = now();
   // A CREATED service has no task to stop, so it starts a phase later. Waiting for `stopping` on one
   // works by accident — the count is already 0 — but it labels the wait "old task stopped; Socket
   // Mode closed" and reports the elapsed time as DOWNTIME, which is a number describing an outage
   // that did not happen. Someone reading that in an incident note would be misled by it.
-  let phase = expectStop ? 'stopping' : 'starting';
+  const mode = !expectStop ? 'created' : (rolling ? 'rolling' : 'stop-then-start');
+  let phase = mode === 'stop-then-start' ? 'stopping' : 'starting';
   let stoppedAt = null;
   let stoppedApproximate = false;
   let startedAt = null;
   let healthyAt = null;
+  let drainedAt = null;
 
   if (!hasHealthcheck) {
     // Terraform defines the healthcheck (dispatcher.tf:196-210). If a revision arrives without one,
@@ -824,6 +937,16 @@ async function waitForRollout({
     out.warn('the new task definition declares no container healthcheck — waiting for RUNNING only. '
       + 'GET /health is not being verified (dispatcher.tf:196-202).');
   }
+
+  // ANNOUNCED WHERE IT IS OBSERVED, not after the loop. It used to print at the end, which was
+  // chronological only because under stop-then-start HEALTHY *is* the last transition. Under rolling the
+  // drain comes after it, and the live archie-dispatcher:17 rollout printed the drain at 09:50:02 above
+  // a healthCheck line stamped 09:48:38 — a timeline out of order by 84 seconds, in the one output an
+  // operator reads to reconstruct what happened.
+  const announceHealthy = () => out.progress(`${at(healthyAt)}    healthCheck ${hasHealthcheck ? 'HEALTHY' : 'RUNNING'}        `
+    + (mode === 'stop-then-start'
+      ? `gap ${Math.max(0, Math.round((healthyAt - stoppedAt) / 1000))}s${stoppedApproximate ? ' (approximate)' : ''}`
+      : `${Math.max(0, Math.round((healthyAt - startedWaitingAt) / 1000))}s from the update`));
 
   for (;;) {
     const elapsed = now() - startedWaitingAt;
@@ -858,9 +981,10 @@ async function waitForRollout({
     if (phase === 'starting') {
       if (target && target.runningCount >= 1) {
         startedAt = now();
-        out.progress(`${at(startedAt)}    runningCount 0 -> 1        (task def ${arnTail(taskDefinitionArn)} provisioning)`);
-        phase = hasHealthcheck ? 'health' : 'done';
-        if (phase === 'done') healthyAt = startedAt;
+        const counts = mode === 'rolling' ? '1 -> 2' : '0 -> 1';
+        out.progress(`${at(startedAt)}    runningCount ${counts}        (task def ${arnTail(taskDefinitionArn)} provisioning)`);
+        phase = hasHealthcheck ? 'health' : 'healthy';
+        if (phase === 'healthy') { healthyAt = startedAt; announceHealthy(); }
       } else {
         await assertNoStoppedTask({ ecs, cluster, service, taskDefinitionArn, out });
       }
@@ -870,10 +994,29 @@ async function waitForRollout({
       const task = await findTask({ ecs, cluster, service, taskDefinitionArn });
       if (task && task.healthStatus === 'HEALTHY') {
         healthyAt = now();
-        phase = 'done';
+        announceHealthy();
+        phase = 'healthy';
       } else {
         if (task) out.verbose(`${at(now())}    task ${arnTail(task.taskArn)} ${task.lastStatus} health=${task.healthStatus}`);
         await assertNoStoppedTask({ ecs, cluster, service, taskDefinitionArn, out });
+      }
+    }
+
+    // HEALTHY IS NOT THE END OF A ROLLING DEPLOY. The old task — and its Socket Mode connection —
+    // lives until ECS drains it, so stopping the wait at HEALTHY would report an overlap shorter than
+    // the one that actually happened, and would hand back control while two tasks were still
+    // competing for events. Draining is the transition that ends the hazard, so it is the one waited
+    // for. Two independent signals, because ECS populates them on different schedules: the old
+    // deployment leaving `deployments`, and rolloutState reaching COMPLETED.
+    if (phase === 'healthy') {
+      if (mode !== 'rolling') {
+        phase = 'done';
+      } else if ((svc.deployments || []).length <= 1 || (target && target.rolloutState === 'COMPLETED')) {
+        drainedAt = now();
+        out.progress(`${at(drainedAt)}    runningCount 2 -> 1        (old task drained; its Socket Mode connection closed)`);
+        phase = 'done';
+      } else {
+        out.verbose(`${at(now())}    waiting for the old task to drain (${(svc.deployments || []).length} deployments)`);
       }
     }
 
@@ -881,20 +1024,42 @@ async function waitForRollout({
     await sleep(pollIntervalMs);
   }
 
-  const gapMs = healthyAt - stoppedAt;
-  const gapSeconds = Math.max(0, Math.round(gapMs / 1000));
-  // Reported, never hidden, and never described as zero. §6.1: "Every `archie gateway deploy` costs
-  // ~90 seconds of dropped Slack messages… stated here so nobody spends an outage investigating it."
-  out.progress(`${at(healthyAt)}    healthCheck ${hasHealthcheck ? 'HEALTHY' : 'RUNNING'}        `
-    + `gap ${gapSeconds}s${stoppedApproximate ? ' (approximate)' : ''}`);
-  out.progress(`downtime    ${gapSeconds}s of dropped Slack events — the Socket Mode connection was `
-    + 'CLOSED, so the durable turn queue did not cover it (§6.1)');
+  // Three shapes, three numbers, and each one names what it measures. `gapSeconds` stays 0 rather than
+  // null for anything that is not stop-then-start: it is the field every consumer already reads, and a
+  // rolling deploy's honest answer to "how long was the dispatcher down" is zero, not "unknown".
+  const gapSeconds = mode === 'stop-then-start' ? Math.max(0, Math.round((healthyAt - stoppedAt) / 1000)) : 0;
+  const overlapSeconds = mode === 'rolling' ? Math.max(0, Math.round((drainedAt - startedAt) / 1000)) : null;
+  const startupSeconds = Math.max(0, Math.round((healthyAt - startedWaitingAt) / 1000));
+
+  if (mode === 'stop-then-start') {
+    // Reported, never hidden, and never described as zero. §6.1: "Every `archie gateway deploy` costs
+    // ~90 seconds of dropped Slack messages… stated here so nobody spends an outage investigating it."
+    out.progress(`downtime    ${gapSeconds}s of dropped Slack events — the Socket Mode connection was `
+      + 'CLOSED, so the durable turn queue did not cover it (§6.1)');
+  } else if (mode === 'rolling') {
+    // The symmetric obligation to the downtime line. No gap is not the same as no cost, and the cost
+    // is the one thing an operator reading this needs in order to interpret anything odd in the
+    // workspace afterwards: for this many seconds Slack had two connections for the app and
+    // load-balanced events across them, so an event in that window may have been handled by the old
+    // task, the new one, or both.
+    out.progress(`overlap     ${overlapSeconds}s with TWO Socket Mode connections — no downtime, but `
+      + 'events in that window were load-balanced across both tasks, and the cron store had two writers');
+  }
 
   return {
-    stoppedAt: new Date(stoppedAt).toISOString(),
+    mode,
+    // `stoppedAt` is NULL for the two shapes with no stop, not `new Date(null)`. It used to be
+    // unconditional, and on the create path — where nothing assigns `stoppedAt` — that produced
+    // `1970-01-01T00:00:00.000Z` and a `gapSeconds` of ~1.8 billion from `healthyAt - null`, printed
+    // as "startup 1787…s to HEALTHY". Untested path, no consumer that read it, but the whole point of
+    // this function is that its numbers are trustworthy.
+    stoppedAt: stoppedAt ? new Date(stoppedAt).toISOString() : null,
     startedAt: startedAt ? new Date(startedAt).toISOString() : null,
     healthyAt: new Date(healthyAt).toISOString(),
+    drainedAt: drainedAt ? new Date(drainedAt).toISOString() : null,
     gapSeconds,
+    overlapSeconds,
+    startupSeconds,
     gapApproximate: stoppedApproximate,
     healthcheckVerified: Boolean(hasHealthcheck),
   };
@@ -946,12 +1111,18 @@ function renderDeploy(r) {
   lines.push(`image       ${r.image}${r.imageDigest ? `  (${r.imageDigest})` : ''}`);
   lines.push(`taskdef     ${r.created ? '(new service)' : r.previousTaskDefinition} -> `
     + `${r.registeredTaskDefinition || '(not registered)'}`);
-  if (r.timeline && r.created) {
+  if (r.timeline && r.timeline.mode === 'created') {
     // NOT "downtime". A created service had nothing running to interrupt, so the elapsed time is
     // startup, not an outage — calling it downtime would put a number into someone's incident notes
     // that describes no incident. The measurement is still worth printing: it is the floor for what
     // a rollout of this image costs.
-    lines.push(`startup     ${r.timeline.gapSeconds}s to HEALTHY — nothing was interrupted`);
+    lines.push(`startup     ${r.timeline.startupSeconds}s to HEALTHY — nothing was interrupted`);
+  } else if (r.timeline && r.timeline.mode === 'rolling') {
+    // Also not downtime, and for a rolling deploy that is the WHOLE POINT of the setting — but the
+    // overlap is the cost that replaced the gap, so it is stated with the same prominence the gap had.
+    lines.push(`overlap     ${r.timeline.overlapSeconds}s of two Socket Mode connections `
+      + `— ${r.timeline.startedAt} to ${r.timeline.drainedAt}, no downtime`);
+    if (!r.timeline.healthcheckVerified) lines.push('healthcheck NOT verified (the revision declares none)');
   } else if (r.timeline) {
     lines.push(`downtime    ${r.timeline.gapSeconds}s${r.timeline.gapApproximate ? ' (approximate)' : ''} `
       + `— ${r.timeline.stoppedAt} to ${r.timeline.healthyAt}`);
@@ -1168,5 +1339,9 @@ module.exports = {
   // Exported for tests — each is a rail that fails in a way the command's own output would not
   // distinguish, so each is asserted directly.
   checkEnvAgainstName, readDeployedOrNull, registerComposed, createService, waitForRollout,
+  convergeDeploymentShape,
   waitBudgetSeconds, defaultRun,
+  // Which of downtime / overlap / startup a rollout is called is the whole reporting contract, and the
+  // three now diverge on `timeline.mode`. Asserted directly rather than through `--json`.
+  renderDeploy,
 };

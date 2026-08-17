@@ -158,7 +158,12 @@ test('an unchanged gateway digest skips the gateway half ENTIRELY — no build, 
   assert.equal(r.gatewaySkipped, true);
   assert.equal(r.gatewayRolled, false);
   assert.equal(r.outageSeconds, null);
-  assert.ok(!out.warnings.some((w) => /94 SECONDS/.test(w)), 'no outage is announced because none happens');
+  assert.equal(r.overlapSeconds, null);
+  // Asserted on the WARNING ITSELF, not on the "94 SECONDS" wording. The pre-roll warning now has two
+  // forms — a gap for stop-then-start, an overlap for rolling — and matching only the gap's text would
+  // let the rolling one be emitted here unnoticed. Nothing rolled, so neither belongs.
+  assert.ok(!out.warnings.some((w) => /the dispatcher is about to roll/.test(w)),
+    'no cost is announced because the gateway half never ran');
 });
 
 test('an agent-only change does not cost the gateway outage', async () => {
@@ -206,9 +211,33 @@ test('the ~94s outage is announced BEFORE the roll, not after it', async () => {
 });
 
 test('the composed answer never claims zero downtime when the gateway rolled', async () => {
+  // The fixture's timeline is a stop-then-start one (`gapSeconds: 94`, no `overlapSeconds`), which is
+  // the prod shape — the gap must reach the answer whatever the current default is.
   const s = fakeSteps({ runningTag: RUNNING_TAG });
   const { out } = await run({}, { steps: s.steps, digestFor: digestFor(NEW_TAG) }, { json: false });
   assert.match(out.answers[0], /94s of dispatcher downtime/);
+});
+
+test('a rolling gateway roll reports the overlap instead — no downtime, but not silence either', async () => {
+  // The symmetric obligation. A rolling timeline has `gapSeconds: 0`, and the old render keyed on
+  // `r.outageSeconds ? …` — so a truthful zero printed "rolled to <tag>" with NO cost at all, which
+  // reads as free. The overlap is what replaced the gap, so it takes the gap's place in the answer.
+  const rollingSteps = () => fakeSteps({
+    runningTag: RUNNING_TAG,
+    gatewayDeploy: async () => ({
+      tag: NEW_TAG, rolled: true, unchanged: false,
+      timeline: { mode: 'rolling', gapSeconds: 0, overlapSeconds: 47, healthyAt: '20:13:40' },
+    }),
+  });
+  // `--json` returns the result and suppresses the rendered answer, so the numbers and the wording are
+  // two runs of the same scenario.
+  const { r } = await run({}, { steps: rollingSteps().steps, digestFor: digestFor(NEW_TAG) });
+  assert.equal(r.outageSeconds, 0, 'a rolling deploy was down for zero seconds — that is a fact, not a gap in knowledge');
+  assert.equal(r.overlapSeconds, 47);
+
+  const { out } = await run({}, { steps: rollingSteps().steps, digestFor: digestFor(NEW_TAG) }, { json: false });
+  assert.match(out.answers[0], /no downtime, 47s of two Socket Mode connections/);
+  assert.match(out.warnings.join('\n'), /NO OUTAGE, but .* TWO tasks/);
 });
 
 // ── tags and purity ──────────────────────────────────────────────────────────────────────────────

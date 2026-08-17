@@ -1,0 +1,19 @@
+{
+  "name": "@myorg/openclaw-mcp-auth-plugin",
+  "version": "0.1.0",
+  "description": "Per-agent MCP proxy with API key auth and Slack caller identity injection",
+  "type": "module",
+  "dependencies": {
+    "undici": "^6.0.0"
+  },
+  "devDependencies": {
+    "@mariozechner/pi-agent-core": "0.61.1",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.0.0",
+    "vitest": "^3.0.0"
+  },
+  "scripts": {
+    "test": "node node_modules/vitest/vitest.mjs run",
+    "typecheck": "node node_modules/typescript/bin/tsc --noEmit"
+  }
+}

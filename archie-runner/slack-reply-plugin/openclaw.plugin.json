@@ -1,0 +1,11 @@
+{
+  "id": "slack-reply-plugin",
+  "name": "Slack Reply",
+  "description": "Registers a slack_send tool. Posts chat.postMessage to Slack via the clawdbot dispatcher — per-agent containers never hold Slack tokens directly. All config from env (SLACK_PROXY_URL, DISPATCHER_SHARED_SECRET); the plugin itself takes no configSchema.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  },
+  "uiHints": {}
+}

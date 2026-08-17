@@ -49,11 +49,11 @@
 // so it always defaults; tests pass fakes. One code path — the tested one is the shipped one — and no
 // test needs AWS credentials or a network.
 
-const provisioning = require('../../slack-dispatcher/agentcore-provisioning');
-const derivedRole = require('../../slack-dispatcher/derived-role');
-const routingBuild = require('../../slack-dispatcher/routing-build');
-const { createRuntimeRegistry } = require('../../slack-dispatcher/runtime-registry');
-const { efsRootDir, generationRuntimeName } = require('../../slack-dispatcher/agentcore-client');
+const provisioning = require('../../archie-gateway/agentcore-provisioning');
+const derivedRole = require('../../archie-gateway/derived-role');
+const routingBuild = require('../../archie-gateway/routing-build');
+const { createRuntimeRegistry } = require('../../archie-gateway/runtime-registry');
+const { efsRootDir, generationRuntimeName } = require('../../archie-gateway/agentcore-client');
 const { derivedSpecFor, imageUriFor } = require('../lib/spec');
 const { readFleetPointer, readTaint } = require('../lib/image-pointer');
 const { describeImage } = require('../lib/ecr');
@@ -114,13 +114,13 @@ function withDefaults(deps = {}) {
     sleep: deps.sleep || sleep,
     clients: deps.clients || null,
     modules: {
-      deriveExecRole: () => import('../../clawdbot/config-resolver/derive-exec-role.mjs'),
-      schema: () => import('../../clawdbot/config-resolver/schema.mjs'),
-      rekey: () => import('../../clawdbot/config-resolver/rekey-to-scope.mjs'),
-      batchWrite: () => import('../../clawdbot/config-resolver/batch-write.mjs'),
-      workspaceSeed: () => import('../../clawdbot/agentcore-pi/workspace-seed.mjs'),
-      agentcore: () => require('../../slack-dispatcher/agentcore-client'),
-      connector: () => require('../../slack-dispatcher/connector-credential'),
+      deriveExecRole: () => import('../../archie-runner/config-resolver/derive-exec-role.mjs'),
+      schema: () => import('../../archie-runner/config-resolver/schema.mjs'),
+      rekey: () => import('../../archie-runner/config-resolver/rekey-to-scope.mjs'),
+      batchWrite: () => import('../../archie-runner/config-resolver/batch-write.mjs'),
+      workspaceSeed: () => import('../../archie-runner/agentcore-pi/workspace-seed.mjs'),
+      agentcore: () => require('../../archie-gateway/agentcore-client'),
+      connector: () => require('../../archie-gateway/connector-credential'),
       wrappers: () => require('./wrappers'),
       ...(deps.modules || {}),
     },
@@ -208,9 +208,9 @@ function dispatcherClient(ctx, account, deps, overrides = {}) {
     // The CLI require()s the dispatcher's modules rather than forking them (see the eslint config's
     // archie block). If that tree is not installed, say so — a locally re-implemented runtimeEnv or
     // ClientToken is the one failure this design exists to prevent.
-    throw preflight('cannot load the dispatcher\'s provisioning code (slack-dispatcher/agentcore-client)', {
+    throw preflight('cannot load the dispatcher\'s provisioning code (archie-gateway/agentcore-client)', {
       cause: e,
-      detail: 'run `npm ci` in docker/slack-dispatcher — the CLI reuses it rather than reimplementing it',
+      detail: 'run `npm ci` in docker/archie-gateway — the CLI reuses it rather than reimplementing it',
     });
   }
   return mod.createAgentCoreClient(base);
@@ -725,7 +725,7 @@ async function seedWorkspace(ctx, args, out, deps) {
   if (!names.length) {
     throw new CliError(`the new-agent skeleton at ${config.newAgentSkeletonDir} is empty or unreadable`, {
       code: EXIT.FAILED,
-      detail: 'NEW_AGENT_SKELETON_DIR overrides it; the repo layout is clawdbot/config-seed/new-agent-skeleton.',
+      detail: 'NEW_AGENT_SKELETON_DIR overrides it; the repo layout is archie-runner/config-seed/new-agent-skeleton.',
     });
   }
   out.progress(`${names.length} skeleton file(s) → AGENT#${agent}/SEED${adoptedFrom ? ` (workspace root ${root}, adopted from ${adoptedFrom})` : ''}`);

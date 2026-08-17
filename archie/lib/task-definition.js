@@ -143,18 +143,53 @@ const SSM_SERVICE = [
 //                                 would be handled non-deterministically and sometimes twice. It
 //                                 would also break the cron store's sole-writer invariant (no mutex)
 //                                 and per-session turn serialisation.
-//   minimumHealthyPercent 0     — stop-then-start, not rolling. A rolling deployment briefly runs two
-//   maximumPercent 100            tasks, which is precisely the double-connection problem above. A
-//                                 gap is CORRECT here: Socket Mode events during it are dropped
-//                                 rather than duplicated. It is ~94s measured, and it is why
-//                                 `gateway deploy` is idempotent on an unchanged image.
+//   minimumHealthyPercent 100   — ROLLING, matching the OpenClaw dispatcher, which reaches the same
+//   maximumPercent 200            values by omitting them and inheriting the ECS defaults
+//                                 (modules/clawdbot/dispatcher.tf:287-313). See ROLLING below for why
+//                                 this is a PREPROD setting with a cutover condition attached.
 //   assignPublicIp false        — egress is via NAT; the task has no business being reachable.
+
+// The two shapes, NAMED, so that switching between them is one word in one place and nothing has to
+// remember which pair of numbers means which behaviour. `gateway deploy` selects from this map for both
+// the values it sends and the wait it runs, so the two cannot describe different rollouts.
+const DEPLOYMENT_SHAPES = {
+  rolling: { minimumHealthyPercent: 100, maximumPercent: 200 },
+  'stop-then-start': { minimumHealthyPercent: 0, maximumPercent: 100 },
+};
+
 const SERVICE = {
   desiredCount: 1,
-  deploymentConfiguration: { minimumHealthyPercent: 0, maximumPercent: 100 },
+  deploymentConfiguration: DEPLOYMENT_SHAPES.rolling,   // ← the one word. See ROLLING below.
   launchType: 'FARGATE',
   assignPublicIp: 'DISABLED',
 };
+
+// ── ROLLING vs STOP-THEN-START, and why this is a preprod setting ────────────────────────────────
+//
+// This was `{ minimumHealthyPercent: 0, maximumPercent: 100 }` — stop-then-start, a measured ~94s of
+// dropped Slack events on every gateway release (§6.1). The gap was chosen over the alternative
+// deliberately: a rolling deployment runs two tasks for the length of the overlap, and two tasks is
+// exactly the double-Socket-Mode problem in `desiredCount` above.
+//
+// It is now rolling because during verification archie points at ITS OWN Slack app, not the one the
+// OpenClaw dispatcher holds. That does NOT remove the hazard — the overlap is between archie's two
+// tasks on whichever app archie is pointed at, so a fresh app does not make two connections safe. It
+// makes the consequences CHEAP: duplicated or non-deterministically routed events land in a test
+// workspace, and the sole-writer window is over a test cron store. Paying 94 seconds of blindness on
+// every iteration of a verification loop costs more than that.
+//
+// THE CUTOVER CONDITION, stated here because this is the line someone will read: before this gateway
+// holds the PRODUCTION Slack app, `SERVICE.deploymentConfiguration` goes back to
+// `DEPLOYMENT_SHAPES['stop-then-start']` — or the receipt/processing split in §6.1 lands first, which
+// is the only way to get both. In prod the overlap is duplicate handling of real internal traffic and a
+// cron store with two writers; there, dropping events is the cheaper failure.
+//
+// WHY BOTH VALUES ARE STATED RATHER THAN OMITTED. Terraform gets the ECS defaults by leaving the
+// argument out at create time. That does not work here for the service that ALREADY EXISTS with 0/100
+// stored on it: `UpdateService` has no way to express "unset", so the only way to converge a live
+// service is to send the values explicitly (`cmd/gateway.js`'s roll does). Omitting them would leave
+// the sandbox service on stop-then-start forever while this file claimed otherwise.
+const ROLLING = SERVICE.deploymentConfiguration.minimumHealthyPercent > 0;
 
 /**
  * The parameter path — a CONSTANT, not derived from `--name`, matching modules/archie/ssm.tf.
@@ -460,7 +495,8 @@ function requireFacts(facts, keys) {
 }
 
 module.exports = {
-  CONSTANTS, SSM_PARAMETERS, SSM_HANDLES, SSM_SERVICE, SERVICE, PORT, CPU, MEMORY,
+  CONSTANTS, SSM_PARAMETERS, SSM_HANDLES, SSM_SERVICE, SERVICE, ROLLING, DEPLOYMENT_SHAPES,
+  PORT, CPU, MEMORY,
   SSM_PREFIX, dispatcherBaseUrl, healthCheckCommand,
   composeEnvironment, composeTaskDefinition, composeCronHydratorTaskDefinition,
 };

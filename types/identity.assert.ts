@@ -13,7 +13,7 @@
 // It is type-level only: nothing here executes, and nothing imports it at runtime.
 
 import type { ScopeId, LegacyName } from './identity';
-import { agentMetaKey, agentGrantKey } from '../clawdbot/config-resolver/schema.mjs';
+import { agentMetaKey, agentGrantKey } from '../archie-runner/config-resolver/schema.mjs';
 
 declare const scope: ScopeId;      // 'dm-ux0mz5ckp2r'      — what routing resolves to
 declare const legacy: LegacyName;  // 'agent-xx9aff'  — what the EFS directory is called

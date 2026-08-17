@@ -5,9 +5,10 @@
 // GATEWAY-OWNERSHIP-PLAN.md §6 step 5 and §7. This is the ONLY evidence that moving ownership is
 // safe. Phase D removes `aws_ecs_task_definition.dispatcher` from Terraform, after which the
 // composed definition is what runs — and if it differs from Terraform's in any field, the difference
-// arrives as a live behaviour change on a service that has already stopped its only task
-// (desired_count 1, minimum_healthy_percent 0, ~94s measured). A clean diff here, taken against the
-// real deployed revision, is what turns that from a hope into a check.
+// arrives as a live behaviour change on a service with no plan-time validation left. Under the prod
+// stop-then-start shape it lands on a service that has already stopped its only task (~94s measured);
+// under the rolling shape it lands as a replacement task that never comes healthy. A clean diff here,
+// taken against the real deployed revision, is what turns that from a hope into a check.
 //
 // It is also §7's standing mitigation, not a one-off migration tool. `terraform plan` used to
 // validate the task definition on every apply; after Phase D nothing does, so this diff is what a

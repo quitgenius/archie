@@ -57,9 +57,9 @@ const { scanBindings, tagOf } = require('../lib/bindings');
 const { derivedSpecFor, specDigestFor, imageUriFor } = require('../lib/spec');
 const { describeImage, assertArm64 } = require('../lib/ecr');
 const { readTaint, taintTag } = require('../lib/image-pointer');
-const { diffObserved } = require('../../slack-dispatcher/spec-diff');
-const { collectFromDdb } = require('../../slack-dispatcher/routing-build');
-const { pkFor: bindingPkFor, skFor: bindingSkFor } = require('../../slack-dispatcher/runtime-registry');
+const { diffObserved } = require('../../archie-gateway/spec-diff');
+const { collectFromDdb } = require('../../archie-gateway/routing-build');
+const { pkFor: bindingPkFor, skFor: bindingSkFor } = require('../../archie-gateway/runtime-registry');
 const {
   CliError, EXIT, usage, preflight, refused, tainted, headroom,
 } = require('../lib/exit');
@@ -202,11 +202,11 @@ function dispatcherClientFor(ctx, account, deps = {}) {
   if (deps.agentcore) return deps.agentcore(overrides);
   let mod;
   try {
-    mod = require('../../slack-dispatcher/agentcore-client');
+    mod = require('../../archie-gateway/agentcore-client');
   } catch (e) {
-    throw preflight('cannot load the dispatcher\'s provisioning saga (slack-dispatcher/agentcore-client)', {
+    throw preflight('cannot load the dispatcher\'s provisioning saga (archie-gateway/agentcore-client)', {
       cause: e,
-      detail: 'run `npm ci` in docker/slack-dispatcher — the CLI drives that saga rather than reimplementing it',
+      detail: 'run `npm ci` in docker/archie-gateway — the CLI drives that saga rather than reimplementing it',
     });
   }
   return mod.createAgentCoreClient(overrides);
@@ -215,7 +215,7 @@ function dispatcherClientFor(ctx, account, deps = {}) {
 /** The pure name helper, lazily — requiring agentcore-client pulls the OTEL API and the AWS SDK. */
 function runtimeNameFn(deps = {}) {
   if (deps.runtimeNameFor) return deps.runtimeNameFor;
-  return require('../../slack-dispatcher/agentcore-client').generationRuntimeName;
+  return require('../../archie-gateway/agentcore-client').generationRuntimeName;
 }
 
 // ── the healthcheck seam (W2-A) ──────────────────────────────────────────────────────────────────

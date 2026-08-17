@@ -30,7 +30,7 @@ function write(root, relPath, content) {
 }
 
 // Two images that OVERLAP on one file and differ elsewhere — the shape of the real gateway/agent
-// pair (both COPY clawdbot/agentcore-pi/workspace-seed.mjs; everything else is their own).
+// pair (both COPY archie-runner/agentcore-pi/workspace-seed.mjs; everything else is their own).
 const ALPHA = {
   name: 'alpha',
   context: '.',
@@ -174,7 +174,7 @@ test('.dockerignore is honoured, and its patterns are NOT recursive by default',
 });
 
 test('the .dockerignore of the image CONTEXT is the one that applies', () => {
-  // The real pair differ here: the gateway builds from docker/ and the agent from docker/clawdbot/,
+  // The real pair differ here: the gateway builds from docker/ and the agent from docker/archie-runner/,
   // and those two .dockerignore files have different contents. Reading the wrong one silently
   // produces the wrong file set.
   const root = buildTree();
@@ -248,12 +248,12 @@ test('the two declared sets overlap but differ — that difference is the featur
   const gateway = new Set(IMAGES.gateway.inputs.map((e) => e.path));
   const agent = new Set(IMAGES.agent.inputs.map((e) => e.path));
 
-  assert.ok(gateway.has('slack-dispatcher/index.js') && !agent.has('slack-dispatcher/index.js'));
-  assert.ok(agent.has('clawdbot/agentcore-pi') && !gateway.has('clawdbot/agentcore-pi'));
+  assert.ok(gateway.has('archie-gateway/index.js') && !agent.has('archie-gateway/index.js'));
+  assert.ok(agent.has('archie-runner/agentcore-pi') && !gateway.has('archie-runner/agentcore-pi'));
   // The intentional overlap: both images build the workspace seed and the cap→IAM map from the SAME
-  // source so there is no mirrored implementation to drift (slack-dispatcher/Dockerfile:63-74).
-  assert.ok(gateway.has('clawdbot/agentcore-pi/workspace-seed.mjs'));
-  assert.ok(agent.has('clawdbot/agentcore-pi'), 'the agent declares that file via its directory');
+  // source so there is no mirrored implementation to drift (archie-gateway/Dockerfile:63-74).
+  assert.ok(gateway.has('archie-runner/agentcore-pi/workspace-seed.mjs'));
+  assert.ok(agent.has('archie-runner/agentcore-pi'), 'the agent declares that file via its directory');
   assert.notEqual(IMAGES.gateway.context, IMAGES.agent.context);
 });
 
@@ -265,12 +265,12 @@ test('every declared input of both real images exists in this tree', () => {
     assert.ok(files.length > 0, `${name} resolved no inputs`);
     assert.ok(!files.some((f) => f.includes('/node_modules/')));
   }
-  // …and the generated corpora under config-resolver are excluded by clawdbot/.dockerignore. They
+  // …and the generated corpora under config-resolver are excluded by archie-runner/.dockerignore. They
   // are ~1400 of that package's ~1480 files and are rewritten by every hydrate run; digesting them
   // would roll every agent in the fleet for local output that never enters the image.
   const agentFiles = resolveInputs('agent');
   assert.ok(!agentFiles.some((f) => /config-resolver\/(ground-truth|resolved|resolved-ddb|items)\//.test(f)));
-  assert.ok(agentFiles.includes('clawdbot/config-resolver/schema.mjs'));
+  assert.ok(agentFiles.includes('archie-runner/config-resolver/schema.mjs'));
 });
 
 test('the halves roll independently: a gateway-only edit leaves the agent digest alone', () => {
@@ -285,17 +285,17 @@ test('the halves roll independently: a gateway-only edit leaves the agent digest
   const ag0 = digestFor('agent', { root }).digest;
   assert.notEqual(gw0, ag0);
 
-  write(root, 'slack-dispatcher/turn-queue.js', 'edited\n');           // gateway-only
+  write(root, 'archie-gateway/turn-queue.js', 'edited\n');           // gateway-only
   assert.notEqual(digestFor('gateway', { root }).digest, gw0);
   assert.equal(digestFor('agent', { root }).digest, ag0, 'a dispatcher edit would have rolled every agent in the fleet');
 
   const gw1 = digestFor('gateway', { root }).digest;
-  write(root, 'clawdbot/agentcore-pi/pi-adapter.mjs', 'edited\n');     // agent-only
+  write(root, 'archie-runner/agentcore-pi/pi-adapter.mjs', 'edited\n');     // agent-only
   assert.notEqual(digestFor('agent', { root }).digest, ag0);
   assert.equal(digestFor('gateway', { root }).digest, gw1, 'an agent edit would have cost a ~94s gateway outage');
 
   const ag1 = digestFor('agent', { root }).digest;
-  write(root, 'clawdbot/agentcore-pi/workspace-seed.mjs', 'edited\n'); // shared on purpose
+  write(root, 'archie-runner/agentcore-pi/workspace-seed.mjs', 'edited\n'); // shared on purpose
   assert.notEqual(digestFor('gateway', { root }).digest, gw1);
   assert.notEqual(digestFor('agent', { root }).digest, ag1);
 });

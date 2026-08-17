@@ -31,7 +31,7 @@
 //   3. SESSION IDS MUST BE >= 33 CHARACTERS or AgentCore rejects with ParamValidation. A 31-char id
 //      once meant "the nudge silently never ran and @connector's discovery never fired"
 //      (`agentcore-fixture.js:649-651`). Same padding rule as the dispatcher's own
-//      `agentcoreSessionId` (`slack-dispatcher/index.js:532-535`).
+//      `agentcoreSessionId` (`archie-gateway/index.js:532-535`).
 //
 //   4. AN EMPTY-TEXT TURN AFTER AN `error` EVENT IS A FAILURE, NOT A PASS. The runtime reports a
 //      thrown turn in-band as `error` then `final {text:''}`; a caller reading only `final` sees an
@@ -156,7 +156,7 @@ async function runHealthcheck({
  */
 function defaultInvoke(ctx, deps = {}) {
   const { createAgentCoreClient } = deps.agentcoreClientModule
-    || require(path.join(__dirname, '..', '..', 'slack-dispatcher', 'agentcore-client.js'));
+    || require(path.join(__dirname, '..', '..', 'archie-gateway', 'agentcore-client.js'));
   // NOOP_METRICS, because the CLI is not the dispatcher and must not publish its metrics.
   //
   // Observed live 2026-08-15: without this, a single healthcheck emitted SessionQueueDepth and
@@ -168,7 +168,7 @@ function defaultInvoke(ctx, deps = {}) {
   // Release-scoped signals belong to `archie emit-release-metrics`, under its own dimension, with
   // agent and tag as EMF properties (plan §7).
   const { NOOP_METRICS } = deps.metricsModule
-    || require(path.join(__dirname, '..', '..', 'slack-dispatcher', 'dispatcher-metrics.js'));
+    || require(path.join(__dirname, '..', '..', 'archie-gateway', 'dispatcher-metrics.js'));
   const client = createAgentCoreClient({
     region: ctx.region,
     metrics: NOOP_METRICS,

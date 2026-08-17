@@ -3,7 +3,7 @@
 
 // `archie` — the fleet CLI. Entry point and dispatch.
 //
-// See clawdbot/ARCHIE.md for the front door, RUNTIME-CLI-REFERENCE.md for the full surface, and
+// See archie-runner/ARCHIE.md for the front door, RUNTIME-CLI-REFERENCE.md for the full surface, and
 // PHASE-1-TASKS.md for who owns what. This file owns argument parsing, dispatch and the exit code;
 // it deliberately knows nothing about AWS.
 

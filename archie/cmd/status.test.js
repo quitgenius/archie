@@ -22,7 +22,7 @@ const {
 const { createContext, resourcesFor } = require('../lib/context');
 const { createOutput } = require('../lib/output');
 const { EXIT } = require('../lib/exit');
-const corpus = require('../../clawdbot/agentcore-observability/insight-queries');
+const corpus = require('../../archie-runner/agentcore-observability/insight-queries');
 
 const AWS_COMMAND = { needsAws: true };
 

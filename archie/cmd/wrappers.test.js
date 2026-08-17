@@ -582,6 +582,50 @@ test('cron list goes through the manager API', async () => {
   assert.equal(r.enabled, 1);
 });
 
+// §3a' — the CRON_RUNNER flag. `--set` is a cutover: it decides which of the two schedulers fires
+// this scope's jobs, so it honours --dry-run like every other mutation in this file.
+test('cron runner reads the flag, and reports where the value came from', async () => {
+  const { deps } = cronDeps();
+  deps.managerApi.getRunner = async (a) => ({ agentId: a, runner: 'openclaw', source: 'default', setBy: null });
+  const out = makeOut();
+  const r = await wrappers['cron runner'](makeCtx(), args(['dm-ue9q979xw']), out, deps);
+  assert.equal(r.runner, 'openclaw');
+  assert.match(out.text(), /CRON_RUNNER=openclaw \(default\)/);
+});
+
+test('cron runner --set states what will change, and writes nothing on a dry run', async () => {
+  const { deps } = cronDeps();
+  const written = [];
+  deps.managerApi.getRunner = async (a) => ({ agentId: a, runner: 'openclaw', source: 'store' });
+  deps.managerApi.setRunner = async (...a) => { written.push(a); return { runner: 'agentcore', wrote: true }; };
+  const out = makeOut();
+  const r = await wrappers['cron runner'](makeCtx({ dryRun: true }), args(['dm-ue9q979xw'], { set: 'agentcore' }), out, deps);
+  assert.deepEqual([r.dryRun, r.from, r.to], [true, 'openclaw', 'agentcore']);
+  assert.equal(written.length, 0);
+  assert.match(out.text(), /archie will START firing/);
+});
+
+test('cron runner --set applies the flip through the manager API, never DynamoDB', async () => {
+  const { deps } = cronDeps();
+  const written = [];
+  deps.managerApi.getRunner = async (a) => ({ agentId: a, runner: 'openclaw', source: 'store' });
+  deps.managerApi.setRunner = async (...a) => { written.push(a); return { runner: 'agentcore', wrote: true }; };
+  const r = await wrappers['cron runner'](makeCtx(), args(['dm-ue9q979xw'], { set: 'agentcore' }), makeOut(), deps);
+  // Through the dispatcher, because it CACHES the resolved flag — a write behind its back is a
+  // flip that appears to have worked and has not.
+  assert.equal(written[0][0], 'dm-ue9q979xw');
+  assert.equal(written[0][1], 'agentcore');
+  assert.equal(r.changed, true);
+});
+
+test('cron runner --set to the value it already holds is a no-op', async () => {
+  const { deps } = cronDeps();
+  deps.managerApi.getRunner = async (a) => ({ agentId: a, runner: 'agentcore', source: 'store' });
+  deps.managerApi.setRunner = async () => { throw new Error('must not write'); };
+  const r = await wrappers['cron runner'](makeCtx(), args(['dm-ue9q979xw'], { set: 'agentcore' }), makeOut(), deps);
+  assert.equal(r.changed, false);
+});
+
 test('cron arm/disarm report the deployed switch and refuse to drift from Terraform', async () => {
   const armed = { ecsCronEnabled: async () => ({ taskDefinition: 'td:9', value: true, raw: 'true' }) };
   const r = await wrappers['cron arm'](makeCtx(), args(), makeOut(), armed);
