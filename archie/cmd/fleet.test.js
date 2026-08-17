@@ -156,12 +156,22 @@ const routingItem = (agent) => ({ pk: `AGENT#${agent}`, sk: 'META#routing', gsi1
 
 const fakeSts = () => ({ async send() { return { Account: '203366135563' }; } });
 
-/** ECR double. `found: false` is "the tag is not in ECR", which the gate refuses on. */
+/**
+ * ECR double. `found: false` is "the tag is not in ECR", which the gate refuses on.
+ *
+ * `found` may also be a FUNCTION, read on every call: `fleet build` publishes and its caller then
+ * re-reads the same tag, so a test about building an absent image needs a registry whose answer changes
+ * when the push happens — a fixed boolean can only assert one side of that.
+ */
 const fakeEcr = (found = true) => ({
   async send(cmd) {
     const n = cmd.constructor.name;
+    const present = typeof found === 'function' ? found() : found;
+    if (n === 'GetAuthorizationTokenCommand') {
+      return { authorizationData: [{ authorizationToken: Buffer.from('AWS:tok3n').toString('base64') }] };
+    }
     if (n === 'DescribeImagesCommand') {
-      if (!found) { const e = new Error('nope'); e.name = 'ImageNotFoundException'; throw e; }
+      if (!present) { const e = new Error('nope'); e.name = 'ImageNotFoundException'; throw e; }
       return { imageDetails: [{ imageDigest: 'sha256:abc', imagePushedAt: new Date(0), imageSizeInBytes: 1 }] };
     }
     if (n === 'BatchGetImageCommand') {
@@ -419,6 +429,151 @@ test('a refusal still publishes the report — a thrown handler returns nothing'
   assert.equal(out.answers[0].imageTag, TAG, 'the --json envelope still says what was attempted');
 });
 
+// ── fleet build ──────────────────────────────────────────────────────────────────────────────────
+//
+// The one thing in this file that is not composition. It had NO export key until 2026-08-17 — it
+// arrived with the tag noun and the keys did not come with it — so `archie fleet build` answered
+// "declared but cmd/fleet.js exports no \"build\"", which is the command both cmd/stage.js:816 and
+// cmd/image.js:115 tell an operator to run when a tag is absent from ECR.
+//
+// NOTHING HERE SHELLS OUT. `run` is injected everywhere, and on the paths that must not build it is an
+// assertion rather than a stub, so a lost skip shows up as a failure and not as a slow test.
+
+/** `fleet build`, with the answer read off `out` — the handler answers rather than returning. */
+async function runBuild(ctx, values, deps) {
+  const out = fakeOut();
+  await fleet['fleet build'](ctx, { positionals: [], values }, out, { sts: fakeSts(), ...deps });
+  return { out, result: out.answers[0], text: [...out.progressLines, ...out.warnings, ...out.verboseLines].join('\n') };
+}
+
+test('build: the tag is derived from the AGENT image\'s declared inputs, and is not the gateway\'s', async () => {
+  // Two input sets, two tags, on purpose (lib/digest.js:19-24): an agent-only change must not cost the
+  // gateway rollout and a dispatcher-only change must not roll 208 runtimes. Deriving the agent tag
+  // from the `agent` key in that IMAGES map is what makes that true of this command.
+  const { digestFor } = require('../lib/digest');
+  const { result } = await runBuild(ctxFor(), {}, {
+    ecr: fakeEcr(true), run: () => assert.fail('a tag already in ECR must not be built'),
+  });
+  assert.match(result.tag, /^content-[0-9a-f]{16}$/);
+  assert.equal(result.tag, digestFor('agent').tag);
+  assert.notEqual(result.tag, digestFor('gateway').tag);
+  assert.equal(result.derived, true);
+  assert.equal(result.platform, 'linux/arm64');
+});
+
+test('build: a derived tag already in ECR skips the build AND the push', async () => {
+  // The whole point of deriving tags: same content, same tag, already published, do nothing. It is
+  // what makes `archie deploy` idempotent and what stops a no-op release re-provisioning the fleet.
+  const { result, text } = await runBuild(ctxFor(), { push: true }, {
+    ecr: fakeEcr(true), run: () => assert.fail('docker/make must not run when the tag is already in ECR'),
+  });
+  assert.equal(result.skipped, true);
+  assert.equal(result.built, false);
+  assert.equal(result.pushed, false);
+  assert.match(text, /already in ECR/);
+});
+
+test('build --dry-run: prints the make command and the push, and runs nothing', async () => {
+  // ALSO the guard on the Makefile itself: `assertMakeConstraints` reads the REAL Makefile before the
+  // dry-run branch, so this fails if the target stops passing --platform=linux/arm64, `lintroot=.`,
+  // the ./archie-runner context or $(AGENTCORE_PI_TAG) — the last of which would silently ignore our
+  // tag and publish content under a name it does not contain.
+  const { result, text } = await runBuild(ctxFor({ dryRun: true }), { push: true }, {
+    ecr: fakeEcr(false), run: () => assert.fail('a dry run must not shell out'),
+  });
+  assert.match(text, /would run: make -C .* build-agentcore-pi AGENTCORE_PI_TAG=content-[0-9a-f]{16}/);
+  assert.match(text, new RegExp(`would push: .*${NAME}-agentcore:content-[0-9a-f]{16}`));
+  assert.equal(result.built, false);
+  assert.equal(result.pushed, false);
+  assert.equal(result.dryRun, true);
+});
+
+test('build --push: the Makefile builds, and the push goes to the CLI\'s registry, not the Makefile\'s', async () => {
+  // The build stays in `make` because the three constraints live there; the PUSH deliberately does not
+  // (`make push-agentcore-pi`'s registry, account and profile are sandbox literals — Makefile:288-290),
+  // because every resource this CLI touches must come from --name/--region/the caller's account.
+  const ran = [];
+  const { result } = await runBuild(ctxFor(), { push: true }, {
+    ecr: fakeEcr(false),
+    run: (cmd, argv) => { ran.push([cmd, argv]); return ''; },
+  });
+  assert.equal(ran[0][0], 'make');
+  assert.ok(ran[0][1].includes('build-agentcore-pi'), `make target: ${ran[0][1].join(' ')}`);
+  assert.ok(ran.some(([c, a]) => c === 'docker' && a[0] === 'login'), 'ECR auth is per-account and per-region');
+  assert.deepEqual(ran.filter(([c, a]) => c === 'docker' && a[0] === 'push').map(([, a]) => a[1]), [result.image]);
+  assert.equal(result.built, true);
+  assert.equal(result.pushed, true);
+});
+
+test('build: --push over a PINNED tag that already exists is refused before anything runs', async () => {
+  // The repo is IMMUTABLE (ecr.tf:57-61) so "a rollback would return what it claimed to". A derived tag
+  // that exists is proof the content is there and is skipped; a pinned one is a name someone chose over
+  // a tree that may be anything, so it is refused instead.
+  await assert.rejects(
+    () => fleet['fleet build'](ctxFor(), { positionals: [], values: { tag: 'archie-0.2.22', push: true } }, fakeOut(),
+      { sts: fakeSts(), ecr: fakeEcr(true), run: () => assert.fail('nothing runs on a refused push') }),
+    (e) => e.exitCode === EXIT.REFUSED,
+  );
+});
+
+test('build: --platform is not overridable — an amd64 agent image cannot run at all', async () => {
+  await assert.rejects(
+    () => fleet['fleet build'](ctxFor(), { positionals: [], values: { platform: 'linux/amd64' } }, fakeOut(),
+      { sts: fakeSts(), ecr: fakeEcr(false), run: () => assert.fail('refused before the build') }),
+    (e) => e.exitCode === EXIT.REFUSED,
+  );
+});
+
+test('the composed build step IS `fleet build` — one implementation, one derivation', () => {
+  // Not tidiness: two implementations could derive two tags from one tree, and the composed path is
+  // the one that would then stage an image nobody built.
+  assert.equal(fleet.stepsFor().build, fleet['fleet build']);
+  assert.equal(fleet.stepsFor({ steps: { build: 'x' } }).build, 'x', 'still injectable for these tests');
+});
+
+test('fleet deploy BUILDS an absent tag itself instead of refusing', async () => {
+  // The gap this closes: `fleet stage` refuses a tag that is not in ECR and names `archie fleet build`
+  // as the remedy, and that command did not exist — so the only way through a first release of a tree
+  // was `make` by hand with a content tag copied out of a dry run. Step 1 builds and pushes, and it
+  // does it BEFORE staging creates anything.
+  const s = fakeSteps();
+  delete s.steps.build;                       // no fake: the REAL build, which is `fleet build`
+  let published = false;
+  const ran = [];
+  const out = fakeOut();
+  const result = await fleet['fleet deploy'](ctxFor(), { positionals: [], values: { tag: TAG } }, out, {
+    doc: fakeDoc(healthyTable()),
+    sts: fakeSts(),
+    ecr: fakeEcr(() => published),
+    steps: s.steps,
+    run: (cmd, argv) => { ran.push(cmd); if (cmd === 'docker' && argv[0] === 'push') published = true; return ''; },
+  });
+
+  assert.ok(ran.includes('make'), 'it built rather than telling the operator to run another command');
+  assert.ok(published, 'and pushed, or staging would refuse the tag one step later');
+  assert.equal(result.imageTag, TAG);
+  assert.deepEqual(s.names(), ['gc', 'stage', 'publish'], 'and the release still completed');
+  assert.ok(!out.warnings.some((w) => /dry run builds nothing/.test(w)), 'no dry-run caveat on a real run');
+});
+
+test('fleet deploy --dry-run over an unpublished tree says why staging will stop', async () => {
+  // A dry run builds nothing, so `fleet stage` (which checks ECR unconditionally) cannot plan a tree
+  // that has never been published. Saying so where the reason is visible beats an absent-image error
+  // against a content tag the operator has not seen before.
+  const s = fakeSteps();
+  delete s.steps.build;
+  const out = fakeOut();
+  await fleet['fleet deploy'](ctxFor({ dryRun: true }), { positionals: [], values: {} }, out, {
+    doc: fakeDoc([]),
+    sts: fakeSts(),
+    ecr: fakeEcr(false),
+    steps: s.steps,
+    run: () => assert.fail('a dry run must not shell out'),
+  });
+  assert.ok(out.warnings.some((w) => /not in ECR and a dry run builds nothing/.test(w)),
+    `warnings: ${out.warnings.join(' | ')}`);
+});
+
 // ── dry run ──────────────────────────────────────────────────────────────────────────────────────
 
 test('a dry run stops after staging and never evaluates the gate or the flip', async () => {
@@ -634,8 +789,14 @@ test('isLegacyAdopt matches only a trailing path segment', () => {
 
 // ── registry wiring ──────────────────────────────────────────────────────────────────────────────
 
-test('both commands resolve through the registry under their full keys', () => {
-  for (const key of ['fleet deploy', 'fleet drift']) {
+test('EVERY command this module declares resolves through the registry under its full key', () => {
+  // ENUMERATED FROM THE CONTRACT, not listed by hand, and that is the point. This test named `fleet
+  // deploy` and `fleet drift` — so when `build` and `verify` arrived from cmd/tag.js without export
+  // keys, both commands were dead at the entry point and a green suite said nothing. `fleet build` in
+  // particular is the command every absent-image message tells the operator to run.
+  const keys = Object.keys(COMMANDS).filter((k) => COMMANDS[k].module === 'fleet' && COMMANDS[k].phase !== 2);
+  assert.ok(keys.length >= 4, `expected the fleet module's commands, got ${keys.join(', ') || 'none'}`);
+  for (const key of keys) {
     assert.equal(typeof load(key, COMMANDS[key]), 'function', `registry cannot load \`archie ${key}\``);
   }
 });

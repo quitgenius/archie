@@ -22,8 +22,14 @@ const { CliError, EXIT } = require('./exit');
 // `phase: 2` — deliberately deferred (plan phase-1 scope block), declared so help can say so.
 const COMMANDS = {
   // ── top level ────────────────────────────────────────────────────────────
+  // WHAT THE GATEWAY HALF COSTS DEPENDS ON `SERVICE.deploymentConfiguration` (lib/task-definition.js),
+  // so the summary names the shape rather than quoting a number. It said "~94s gateway outage", which
+  // is stop-then-start's MEASURED gap (§6.1) and has not been the default since verification moved to
+  // archie's own Slack app: live rolls measure ~118s of two overlapping Socket Mode connections and
+  // zero downtime. A help line promising an outage that does not happen is how an operator learns to
+  // discount the ones that do.
   deploy: { options: { hotfix:{type:'boolean', 'skip-gc':{type:'boolean'}}, keep:{type:'string'}, 'skip-preflight':{type:'boolean'}, pure:{type:'boolean'}, 'agent-tag':{type:'string'}, 'gateway-tag':{type:'string'} }, top: true, module: 'deploy', task: 'W2-C', needsAws: true,
-    summary: 'preflight, then the agent half, then the gateway (ends with ~94s gateway outage)' },
+    summary: 'preflight, the agent half, then the gateway (rolling: an overlap, no outage; stop-then-start: a real gap)' },
   preflight: { options: { checks:{type:'string'}, skip:{type:'string'} }, top: true, module: 'preflight', task: 'W1-A', needsAws: true,
     summary: 'verify the target account has the infrastructure; never creates anything' },
   status: { options: { agents:{type:'string'}, brief:{type:'boolean'} }, top: true, module: 'status', task: 'W1-F', needsAws: true,

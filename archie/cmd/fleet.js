@@ -59,6 +59,12 @@ const { runtimeIdOf } = require('../../archie-gateway/runtime-registry');
 // AgentCore microVMs are arm64. Not overridable — §2.6, Makefile:59-68.
 const PLATFORM = 'linux/arm64';
 const MAKE_TARGET = 'build-agentcore-pi';
+// The build context, named ONCE because two places have to agree about it: `assertMakeConstraints`
+// refuses a Makefile that stopped passing it, and the `building` progress line reports it. They
+// disagreed until 2026-08-17 — the progress line still said `./clawdbot`, the pre-rename path
+// (b85027f97) — and that is exactly the detail an operator trusts when a COPY fails and they are
+// working out which tree the daemon was sent.
+const BUILD_CONTEXT = './archie-runner';
 
 /** The answer, shaped for the reader: an object under --json, a block otherwise. */
 const answer = (out, ctx, obj, text) => out.answer(ctx.json ? obj : text);
@@ -255,10 +261,15 @@ async function fleetDeploy(ctx, args, out, deps = {}) {
     plan.imageTag = values.tag || (deps.digestFor || digestFor)('agent').tag;
     out.progress(`step 1/5  build       skipped (--skip-build) — using tag ${plan.imageTag}`);
   } else {
+    // THE BUILD HAPPENS HERE, not in a command the operator has to run first. `steps.build` IS
+    // `fleet build`, so a derived tag absent from ECR is BUILT AND PUSHED rather than refused — the
+    // same rule cmd/gateway.js:39-43 states for the other half, for the same reason: absent means this
+    // tree has never been published, so there is exactly one image it could want.
+    //
+    // --push always: staging refuses a tag absent from ECR, which would fail this run one step later
+    // with a much worse message.
     const built = await runStep(steps.build, ctx, {
       positionals: [],
-      // --push always: staging refuses a tag absent from ECR, which would fail this run one step
-      // later with a much worse message.
       values: { tag: values.tag, push: true, pure: values.pure },
     }, out, deps);
     plan.build = built.result || null;
@@ -266,7 +277,18 @@ async function fleetDeploy(ctx, args, out, deps = {}) {
     plan.image = (plan.build && plan.build.image) || null;
     out.progress(`step 1/5  image       ${plan.image || plan.imageTag}`
       + `${plan.build && plan.build.skipped ? '  (already in ECR — inputs unchanged)' : ''}`);
+    // A DRY RUN BUILDS NOTHING, so an unpublished tree cannot be planned all the way through: `fleet
+    // stage` checks ECR unconditionally (cmd/stage.js:812-818) and stops at exit 1 two steps below.
+    // Said here, where the reason is still in view, rather than left to arrive as "no image <tag>"
+    // against a content tag the operator has never seen before.
+    if (ctx.dryRun && plan.build && plan.build.dryRun) {
+      out.warn(`${plan.imageTag} is not in ECR and a dry run builds nothing, so staging will stop at `
+        + '"no image" below. `archie fleet build --push` publishes it; a real run of THIS command '
+        + 'builds it in step 1.');
+    }
   }
+  // THE FALLBACK, for a build that produced no tag at all — a genuinely unbuildable state, not merely
+  // an unpublished one. The unpublished case never reaches here; it was built above.
   if (!plan.imageTag) {
     throw new CliError('could not determine the agent image tag for this deploy', {
       code: EXIT.FAILED,
@@ -765,7 +787,7 @@ function assertMakeConstraints(text) {
     [`--platform=${PLATFORM}`, 'AgentCore microVMs are arm64 (Makefile:59-68)'],
     ['--build-context lintroot=.', 'the lint gate\'s first `COPY --from=lintroot` fails without it (Makefile:267-270)'],
     ['-f ./archie-runner/agentcore-pi/Dockerfile', 'the Dockerfile must be named explicitly, since the context is its parent'],
-    ['./archie-runner', 'the build context is ./archie-runner, NOT agentcore-pi/ — the Dockerfile COPYs sibling plugin-sdk/ and connector-session-plugin/'],
+    [BUILD_CONTEXT, `the build context is ${BUILD_CONTEXT}, NOT agentcore-pi/ — the Dockerfile COPYs sibling plugin-sdk/ and connector-session-plugin/`],
     ['$(AGENTCORE_PI_TAG)', 'archie passes the tag as a make override; a hard-coded tag would silently ignore it'],
   ];
   for (const [needle, why] of required) {
@@ -796,14 +818,28 @@ function assertMakeConstraints(text) {
  */
 
 
-// ── tag build ─────────────────────────────────────────────────────────────────────────────
+// ── fleet build ───────────────────────────────────────────────────────────────────────────
 
 /**
- * Build (and optionally push) the arm64 Pi runtime image — §2.6.
+ * `archie fleet build [--tag <tag>] [--push] [--pure]` — the arm64 Pi runtime image, §2.6.
  *
  * NO DEPLOYMENT EFFECT. The fleet's image is chosen by a tag, so a push alone changes nothing
  * (Makefile:64-67). That is what makes the derived tag safe: same content, same tag, tag already in
  * ECR, skip the build and the push.
+ *
+ * THIS FUNCTION IS ALSO STEP 1 OF `fleet deploy` (`stepsFor`), and it is the only place the make
+ * command is constructed. One implementation is what stops the two entry points deriving different
+ * tags, wording the dirty-tree warning differently, or disagreeing about whether an image is already
+ * published — the same argument cmd/gateway.js:39-43 makes for its own build being called from its own
+ * deploy.
+ *
+ * IT ARRIVED HERE FROM cmd/tag.js WITH THE TAG NOUN (see the banner above) AND THE MOVE DROPPED ITS
+ * EXPORT KEY. `archie fleet build` answered "declared but cmd/fleet.js exports no \"build\"" for as
+ * long as it took someone to be told to run it — and it is the command every absent-image message
+ * names (cmd/stage.js:816, cmd/image.js:115), so the only way through a first release of a tree was
+ * `make` by hand with a content tag copied out of a dry run. The registry-wiring test now ENUMERATES
+ * this module's commands instead of listing two of them, because a hand-written list is what let that
+ * hide.
  */
 async function build(ctx, args, out, deps = {}) {
   const values = (args && args.values) || {};
@@ -829,15 +865,30 @@ async function build(ctx, args, out, deps = {}) {
     if (warning) out.warn(warning);
   }
 
-  // The tag: pinned, or derived from the image's own declared inputs (lib/digest.js).
+  // The tag: pinned, or derived from the image's own declared inputs (lib/digest.js). `agent` is the
+  // AGENT image's key in that IMAGES map, and the two images' input sets differ on purpose — that is
+  // what lets an agent-only change roll 208 runtimes without touching the gateway (digest.js:19-24).
   const pinned = Boolean(values.tag);
   const digest = pinned ? null : digestFor('agent', { root });
   const tag = values.tag || tagFor(digest.digest);
-  if (!pinned) out.verbose(`agent digest ${digest.digest} over ${digest.fileCount} declared inputs`);
+  if (!pinned) out.verbose(`agent digest ${digest.digest} over ${digest.fileCount} declared inputs -> ${tag}`);
 
   const account = await resolveAccount(ctx, aws);
   const uri = imageUriFor(ctx, account, tag);
   const repo = ctx.resources.agentRepo;
+
+  // Shared by every answer below, so `--json` reports the same fields whichever path ran — and the
+  // same fields `gateway build` reports, because an operator reads both halves of one release.
+  const base = {
+    image: uri,
+    tag,
+    derived: !pinned,
+    platform: PLATFORM,
+    repository: repo,
+    account,
+    inputDigest: digest ? digest.digest : null,
+    inputFiles: digest ? digest.fileCount : null,
+  };
 
   const found = await describeImage(aws, { account, repo, tag });
   if (found) {
@@ -850,8 +901,12 @@ async function build(ctx, args, out, deps = {}) {
       throw refused(`${repo}:${tag} already exists in ECR and the repository is immutable`,
         { detail: 'a rollback target must return what it claimed to — cut a new tag, or drop --tag and let the digest name it' });
     }
-    out.progress(`${uri} already in ECR (${found.digest || 'no digest'}) — skipping build and push`);
-    answer(out, ctx, { image: uri, tag, built: false, pushed: false, skipped: true, ecr: found }, `${uri}\n  already in ECR — nothing to build`);
+    // THE SKIP, and it is why the tags are derived rather than typed: same content, same tag, tag
+    // already published, so a re-run of `archie deploy` costs no build, no push and no provisioning
+    // pass at all (§2.27, digest.js:6-10).
+    out.progress(`skipped     ${uri} is already in ECR (${found.digest || 'no digest'}) — inputs unchanged`);
+    const skipped = { ...base, built: false, pushed: false, skipped: true, ecr: found };
+    answer(out, ctx, skipped, renderBuild(skipped));
     return undefined;
   }
 
@@ -861,11 +916,12 @@ async function build(ctx, args, out, deps = {}) {
   if (ctx.dryRun) {
     out.progress(`would run: make ${makeArgs.join(' ')}`);
     if (values.push) out.progress(`would push: ${uri}`);
-    answer(out, ctx, { image: uri, tag, built: false, pushed: false, dryRun: true }, `${uri}\n  [dry-run] not built`);
+    const planned = { ...base, built: false, pushed: false, skipped: false, dryRun: true };
+    answer(out, ctx, planned, renderBuild(planned));
     return undefined;
   }
 
-  out.progress(`building ${localImage}:${tag} (${PLATFORM}, context ./clawdbot, lintroot=.)`);
+  out.progress(`building    ${localImage}:${tag} (${PLATFORM}, context ${BUILD_CONTEXT}, lintroot=.)`);
   run('make', makeArgs, { cwd: root });
 
   let pushed = false;
@@ -882,25 +938,47 @@ async function build(ctx, args, out, deps = {}) {
     const decoded = Buffer.from(token, 'base64').toString('utf8');
     run('docker', ['login', '--username', 'AWS', '--password-stdin', host], { input: decoded.slice(decoded.indexOf(':') + 1) });
     run('docker', ['tag', `${localImage}:${tag}`, uri]);
-    out.progress(`pushing ${uri}`);
+    out.progress(`pushing     ${uri}`);
     run('docker', ['push', uri]);
     pushed = true;
   }
 
-  answer(out, ctx, { image: uri, tag, built: true, pushed, skipped: false }, [
-    uri,
-    `  built     ${localImage}:${tag} (${PLATFORM})`,
-    pushed ? '  pushed    yes' : '  pushed    no (--push to publish)',
-    `  next      archie generation create --image ${tag}`,
-  ].join('\n'));
+  const result = { ...base, built: true, pushed, skipped: false };
+  answer(out, ctx, result, renderBuild(result));
   return undefined;
+}
+
+/**
+ * The summary, deliberately the same shape as `gateway build`'s (cmd/gateway.js:421-431) — one release
+ * has two halves and an operator reads both, so "already in ECR — build and push skipped" must not be
+ * two different sentences depending on which image it was.
+ *
+ * THE `next` LINE HAS TO NAME A COMMAND THAT EXISTS. It said `archie generation create --image <tag>`
+ * until b74b61445 removed generations, so the summary of a successful build pointed at a command whose
+ * only remaining answer is that there is nothing for it to do (§2.7).
+ */
+function renderBuild(r) {
+  const lines = [];
+  lines.push(`tag         ${r.tag}${r.derived ? '  (derived from declared inputs)' : '  (--tag)'}`);
+  if (r.inputDigest) lines.push(`inputs      ${r.inputFiles} files, sha256 ${r.inputDigest.slice(0, 16)}…`);
+  lines.push(`image       ${r.image}`);
+  if (r.ecr && r.ecr.digest) lines.push(`digest      ${r.ecr.digest}`);
+  lines.push(`platform    ${r.platform}  (not overridable — AgentCore microVMs are arm64)`);
+  let state = `${r.built ? 'built' : 'not built'}, ${r.pushed ? 'pushed' : 'not pushed'}`;
+  if (r.skipped) state = 'already in ECR — build and push skipped';
+  else if (r.dryRun) state = 'nothing built, nothing pushed (dry run)';
+  lines.push(`state       ${state}`);
+  lines.push(`next        archie fleet stage --tag ${r.tag}, or \`archie fleet deploy\` for the whole half`);
+  lines.push('note        an image in ECR has NO deployment effect until `archie image publish` moves '
+    + 'the fleet onto its tag');
+  return lines.join('\n');
 }
 
 // ── tag create ────────────────────────────────────────────────────────────────────────────
 
 
 
-// ── tag verify ────────────────────────────────────────────────────────────────────────────
+// ── fleet verify ──────────────────────────────────────────────────────────────────────────
 
 /**
  * Assert every bound runtime IS what this deployment derives — §2.10. Read-only. Exit 7 on mismatch.
@@ -1036,6 +1114,14 @@ module.exports = {
   // `archie access-point gc` run the runtime reaper (`lib/registry.js:156-166`).
   'fleet deploy': fleetDeploy,
   'fleet drift': fleetDrift,
+  // `build` and `verify` came here from cmd/tag.js with the tag noun and their KEYS did not come with
+  // them, so both commands were declared in lib/registry.js and dead at the entry point — the registry
+  // answered "declared but cmd/fleet.js exports no …". Under their full keys ONLY, deliberately: a bare
+  // `build` would also satisfy `load()`'s verb fallback, which is what made the omission invisible to a
+  // test that asserted the command loads. The wiring test enumerates every command whose module is
+  // 'fleet', so this object is now the one place that can be wrong, and it fails loudly when it is.
+  'fleet build': build,
+  'fleet verify': verify,
 
   // Internals: for this file's tests and for `archie deploy` (cmd/deploy.js), which composes the
   // agent half through the same plumbing rather than re-running the steps itself.
