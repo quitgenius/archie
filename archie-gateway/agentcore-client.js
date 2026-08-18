@@ -135,6 +135,8 @@ function baseConfig() {
     // in 052, trust admits role/agentcore/*) so the derived-role → assume → read chain completes
     // in-account (§9.7(a): real prod cross-account read is the prod canary). Passed to runtimeEnv.
     readersAccount: process.env.AGENTCORE_READERS_ACCOUNT || '',
+    hindsightApiUrl: process.env.HINDSIGHT_API_URL || '',
+    hindsightOrgBankId: process.env.HINDSIGHT_ORG_BANK_ID || '',
     // Optional injectable overrides consumed elsewhere:
     //   extraEnv        — extra runtime env vars merged into runtimeEnv()
     //   efsRootFor(name)→ path — override the AP root path (tests use run-tagged roots)
@@ -339,6 +341,12 @@ function createAgentCoreClient(overrides = {}) {
       NODE_TLS_REJECT_UNAUTHORIZED: config.nodeTlsReject,
       // §9 sandbox: point the runtime's AWS tools at the in-account stand-in readers (only when set).
       ...(config.readersAccount ? { AGENTCORE_READERS_ACCOUNT: config.readersAccount } : {}),
+      // Hindsight memory. Conditional for the same reason as above and it is LOAD-BEARING: BASE_PLUGINS
+      // gates both the plugin entry and `slots.memory` on a non-empty HINDSIGHT_API_URL, so passing an
+      // empty string would give the agent a memory slot pointing at a plugin it cannot use and a
+      // "hindsight not configured" warning on every boot. Absent means absent.
+      ...(config.hindsightApiUrl ? { HINDSIGHT_API_URL: config.hindsightApiUrl } : {}),
+      ...(config.hindsightOrgBankId ? { HINDSIGHT_ORG_BANK_ID: config.hindsightOrgBankId } : {}),
       ...(config.extraEnv || {}),
     };
   }

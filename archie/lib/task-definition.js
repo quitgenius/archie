@@ -101,6 +101,11 @@ const SSM_PARAMETERS = [
   { key: 'DATADOG_APP_KEY_SECRET', required: false },
   { key: 'CONNECTOR_ORG_API_KEY_SECRET', required: false },
   { key: 'METRICS_TABLE_NAME', required: false },
+  // Hindsight. Optional by design: absent parameter → absent env var → BASE_PLUGINS emits no
+  // hindsight entry and no `slots.memory` at all, which is the documented off state. Setting an
+  // empty string would NOT be equivalent in SSM (it cannot hold one) and is not needed.
+  { key: 'HINDSIGHT_API_URL', required: false },
+  { key: 'HINDSIGHT_ORG_BANK_ID', required: false },
 ];
 
 // ── §4.3, second category: handles to Terraform resources with no name to look them up by ────────
