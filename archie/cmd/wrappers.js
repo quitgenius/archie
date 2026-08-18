@@ -502,6 +502,37 @@ async function readStoredGrant(clients, table, agentId, deps) {
 }
 
 /**
+ * Drop any capability the Cedar policy owns from a caps list, reporting what went.
+ *
+ * Reads the fleet artifact directly rather than through grants.js: this is the CLI, so it has no
+ * dispatcher process to borrow a cache from, and the group-name shape (`pin.<capability>`) is the same
+ * contract policy-derive.js documents. Fail-open on any read problem — an empty set is the pre-policy
+ * behaviour, and an IAM repair must not be blocked by an unreadable artifact.
+ */
+async function stripPolicyManaged(caps, { clients, ctx, agentId, out }) {
+  let pinned = new Set();
+  try {
+    const schema = await import(`file://${require.resolve('../../archie-runner/config-resolver/schema.mjs')}`);
+    const { pinnedCapabilities } = require('../../archie-gateway/policy-derive');
+    const r = await clients.doc.send(new clients.docCmds.GetCommand({
+      TableName: ctx.resources.configTable, Key: schema.fleetPolicyKey(),
+    }));
+    pinned = pinnedCapabilities(r?.Item?.data ? JSON.parse(r.Item.data) : null);
+  } catch (e) {
+    out.verbose(`policy artifact unreadable (${e.message}) — not stripping policy-managed caps`);
+    return caps;
+  }
+  const kept = caps.filter((c) => !pinned.has(c));
+  const dropped = caps.filter((c) => pinned.has(c));
+  if (dropped.length) {
+    out.warn(`${agentId}: ignoring ${dropped.length} policy-managed cap(s) when deriving IAM — ${dropped.join(', ')}. `
+      + 'The Cedar policy decides these, so a grant row for them confers no tool access and must not '
+      + 'attach IAM either. Remove them from the row (App Home → Tools → Revoke) to tidy up.');
+  }
+  return kept;
+}
+
+/**
  * Rewrite the inline `grants` policy from a caps list. Shared by both commands.
  *
  * Never deletes: an empty caps list still writes the policy, because it is the agent's ONLY
@@ -509,9 +540,21 @@ async function readStoredGrant(clients, table, agentId, deps) {
  * agent's config read, breaking its next boot" (derived-role.js:192-198). The scope is assembled
  * inside putDerivedGrants from the agent id — never passed in pre-built.
  */
-async function writeRolePolicy({ ctx, clients, agentId, caps }, out, deps) {
+async function writeRolePolicy({ ctx, clients, agentId, caps: rawCaps }, out, deps) {
   const account = await resolveAccount(ctx, clients);
   const secretBase = applyConnectorSecretEnv(ctx, deps);
+
+  // R1: STRIP the capabilities the Cedar policy owns before deriving IAM from them.
+  //
+  // This is the writer where the pre-R1 behaviour was worst, because it is the one that grants real AWS
+  // access. A grant row for a policy-managed capability confers no TOOL access — the policy's forbid beats
+  // the grant-row permit — but this function would still attach the capability's cross-account
+  // sts:AssumeRole to the agent's role. So the failure mode was: no tool, no way to use it, and a live IAM
+  // trust path anyway. Stripping here is what makes "the row confers nothing" true of IAM as well.
+  //
+  // A row can hold one legitimately (written before the capability was pinned), so this reports rather
+  // than refuses — refusing would leave the role un-repairable for an agent whose row predates the pin.
+  const caps = await stripPolicyManaged(rawCaps, { clients, ctx, agentId, out });
   out.verbose(`role policy: agent=${agentId} caps=${caps.length ? caps.join(',') : '(none — the policy is still written, for the config read)'} credentialSecretBase=${secretBase}`);
   const { putDerivedGrants } = deps.modules.derivedRole();
   const r = await putDerivedGrants({

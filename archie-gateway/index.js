@@ -1437,11 +1437,15 @@ async function fetchToolPermissions(agentId) {
   if (!AGENT_CONFIG_TABLE || !agentId) return null;
   try {
     const doc = configDoc();
-    const [{ grant }, extraCaps] = await Promise.all([
+    const [{ grant }, extraCaps, pinned] = await Promise.all([
       grants.readGrant(doc, AGENT_CONFIG_TABLE, agentId),
       grants.extraCapsForAgent(doc, AGENT_CONFIG_TABLE, agentId, { log }),
+      // R1: the capabilities the Cedar policy owns. Passed so the tab can render them as
+      // policy-managed rather than as approvable — a working Approve button for one of these promises
+      // access no approval can give.
+      grants.loadPinnedCaps(doc, AGENT_CONFIG_TABLE),
     ]);
-    return { ...(await grants.describeCapabilities(grant, extraCaps)), extraCaps };
+    return { ...(await grants.describeCapabilities(grant, extraCaps, pinned)), extraCaps };
   } catch (err) {
     log.error({ err: err.message, agent: agentId }, 'could not read tool permissions');
     return null;

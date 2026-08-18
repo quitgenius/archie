@@ -79,4 +79,30 @@ function rowIsStale(row, artifact) {
   return false;
 }
 
-module.exports = { rowFromMemberships, rowIsStale };
+/**
+ * The capabilities the POLICY owns — i.e. the ones a grant row cannot affect either way.
+ *
+ * WHY EVERY GRANT WRITER NEEDS THIS (R1). For a pinned capability the policy is the whole authority:
+ * membership allows, non-membership denies, and the `forbid` beats the grant-row permit. So a grant row
+ * for one confers NOTHING. Left unchecked, the Slack Tools tab still offers the capability, Approve still
+ * succeeds, the row is still written, the derived-role hook still adds real sts:AssumeRole IAM — and the
+ * PEP still denies. Silent, and the worst failure in the set: the UI asserts access the agent does not
+ * have, while IAM exposure is real.
+ *
+ * So the writers refuse instead. Derived from the artifact's group names (`pin.<capability>`) rather than
+ * from a second list, because a hand-maintained list of pinned capabilities is exactly the kind of mirror
+ * that drifts — and drifting OPEN here means a capability silently becomes grantable again.
+ *
+ * A null/absent artifact returns an EMPTY set: before the first policy publish nothing is policy-managed,
+ * so every writer behaves as it did before. Fail-open is correct in that direction — the policy is not in
+ * force yet, so refusing a grant would block work for no reason.
+ */
+function pinnedCapabilities(artifact) {
+  const groups = artifact?.groups;
+  if (!groups || typeof groups !== 'object') return new Set();
+  const out = new Set();
+  for (const g of Object.keys(groups)) if (g.startsWith('pin.')) out.add(g.slice('pin.'.length));
+  return out;
+}
+
+module.exports = { rowFromMemberships, rowIsStale, pinnedCapabilities };

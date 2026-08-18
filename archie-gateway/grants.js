@@ -50,6 +50,36 @@ async function loadSkillPins() {
   return _pins;
 }
 
+// R1: the capabilities the POLICY owns, so no writer here can hand out one a grant row cannot affect.
+//
+// Short TTL rather than a permanent cache, because a `policy publish` can make a capability
+// policy-managed at any time and the UI must stop offering it without a dispatcher restart. 30s matches
+// the artifact cache in agentcore-client for the same reason.
+//
+// FAIL-OPEN ON A READ ERROR, unlike almost everything else in this layer, and deliberately: an empty set
+// means "nothing is policy-managed", which restores exactly today's behaviour. Failing closed here would
+// mean a DynamoDB blip makes every capability un-grantable — an outage in the grant UI — while the actual
+// enforcement (the PEP's forbid) is unaffected either way. The row would confer nothing regardless; this
+// check exists to stop the UI LYING about it, not to enforce.
+let _pinned = { set: new Set(), atMs: 0 };
+const PINNED_TTL_MS = 30_000;
+async function loadPinnedCaps(doc, table) {
+  if (!doc || !table) return new Set();
+  const now = Date.now();
+  if (now - _pinned.atMs < PINNED_TTL_MS) return _pinned.set;
+  try {
+    const schema = await loadSchema();
+    const { GetCommand } = require('@aws-sdk/lib-dynamodb');
+    const r = await doc.send(new GetCommand({ TableName: table, Key: schema.fleetPolicyKey() }));
+    const artifact = r?.Item?.data ? JSON.parse(r.Item.data) : null;
+    const { pinnedCapabilities } = require('./policy-derive');
+    _pinned = { set: pinnedCapabilities(artifact), atMs: now };
+  } catch {
+    _pinned = { set: new Set(), atMs: now };
+  }
+  return _pinned.set;
+}
+
 let _schema = null;
 async function loadSchema() {
   if (_schema) return _schema;
@@ -179,7 +209,7 @@ function setDerivedRoleHook(fn) { _derivedRoleHook = fn; }
  * @returns {{grantable: object, baseline: object}} keyed by capability:
  *   { policy, provider, summary, tools[], granted, sources[], manualSources[], derivedSources[] }
  */
-async function describeCapabilities(grant, extraCaps = []) {
+async function describeCapabilities(grant, extraCaps = [], pinned = new Set()) {
   const catalog = await toolCatalog();
   const stored = (grant && typeof grant === 'object' && !Array.isArray(grant.capabilities)) ? grant : {};
 
@@ -200,9 +230,19 @@ async function describeCapabilities(grant, extraCaps = []) {
     };
   };
 
+  // THREE BUCKETS, NOT TWO (R1). `policyManaged` is the capabilities the Cedar policy owns: membership
+  // allows, non-membership denies, and the forbid beats the grant-row permit — so a row confers NOTHING.
+  //
+  // With two buckets they landed in `grantable`, which rendered a working Approve button for a capability
+  // no approval can confer. Pressing it wrote a row, logged success, fired the derived-role hook adding
+  // real sts:AssumeRole IAM, and the PEP denied. The UI asserted access that did not exist while the IAM
+  // exposure was real — so this split is what makes the tab honest, and assertGrantable below is what
+  // makes the button refuse.
   const grantable = {};
   const baseline = {};
+  const policyManaged = {};
   for (const [cap, meta] of Object.entries(catalog.capabilities)) {
+    if (pinned.has(cap)) { policyManaged[cap] = describe(cap, meta); continue; }
     (meta.policy === 'allow' ? baseline : grantable)[cap] = describe(cap, meta);
   }
 
@@ -232,7 +272,7 @@ async function describeCapabilities(grant, extraCaps = []) {
     }
   }
 
-  return { grantable, baseline };
+  return { grantable, baseline, policyManaged };
 }
 
 async function _readGrantItem(doc, table, agentId) {
@@ -306,10 +346,22 @@ async function _notifyDerivedRole(agentId, oldCaps, newCaps, log) {
  * Only grant-required capabilities are accepted: a baseline cap is already allowed everywhere, so
  * "granting" it would write a row that changes nothing and then read back as revocable.
  */
-async function assertGrantable(cap, extraCaps = []) {
+async function assertGrantable(cap, extraCaps = [], pinned = new Set()) {
   if (!cap || typeof cap !== 'string') throw new Error('grants: capability required');
-  const { grantable, baseline } = await describeCapabilities({}, extraCaps);
+  const { grantable, baseline, policyManaged } = await describeCapabilities({}, extraCaps, pinned);
   if (baseline[cap]) throw new Error(`grants: "${cap}" is allowed by default — there is nothing to grant`);
+  // R1. THE CHEAPEST PLACE TO PUT THIS, because this throw already surfaces to the user: every write path
+  // that matters funnels through here, and the message becomes the Slack error rather than a silent no-op.
+  //
+  // Refusing is not cosmetic. Without it the row is written, success is logged, the derived-role hook adds
+  // real sts:AssumeRole IAM — and the PEP still denies, because the policy's forbid beats the grant-row
+  // permit. So the alternative to this throw is not "the grant works", it is "the grant appears to work,
+  // grants no access, and leaves IAM behind".
+  if (policyManaged[cap]) {
+    throw new Error(`grants: "${cap}" is managed by the Cedar policy, not by grants — approving it here `
+      + 'would confer nothing. Add the scope to its pin group in pins.<env>.json and run `archie policy '
+      + 'publish`.');
+  }
   if (!grantable[cap]) throw new Error(`grants: "${cap}" is not a known capability for this agent`);
   return grantable[cap];
 }
@@ -324,7 +376,7 @@ async function assertGrantable(cap, extraCaps = []) {
  * @returns {{capability, caps, sources, alreadyGranted, role}}
  */
 async function grantCapability(doc, table, agentId, cap, userId, { extraCaps = [], log } = {}) {
-  const meta = await assertGrantable(cap, extraCaps);
+  const meta = await assertGrantable(cap, extraCaps, await loadPinnedCaps(doc, table));
   const { key, grant } = await _readGrantItem(doc, table, agentId);
   const { grantedCaps } = await loadCaps();
   const oldCaps = grantedCaps(grant);
@@ -357,6 +409,11 @@ async function grantCapability(doc, table, agentId, cap, userId, { extraCaps = [
  * @returns {{capability, caps, removed, stillGranted, heldBy, role}}
  */
 async function revokeCapability(doc, table, agentId, cap, userId, { extraCaps = [], log } = {}) {
+  // NO PINNED SET HERE, and the asymmetry with grantCapability is deliberate (R1). Granting a
+  // policy-managed capability must refuse, because it promises access it cannot give. REVOKING one must
+  // still work: a row written before the capability was pinned confers nothing but is still sitting in the
+  // table, and refusing here would make those rows permanently un-deletable through the UI — visible,
+  // inert, and unremovable. Revoke is cleanup, and cleanup of an inert row is always safe.
   await assertGrantable(cap, extraCaps);
   const { key, grant } = await _readGrantItem(doc, table, agentId);
   const { grantedCaps } = await loadCaps();
@@ -419,6 +476,7 @@ module.exports = {
   revokeCapability,
   extraCapsForAgent,
   assertGrantable,
+  loadPinnedCaps,
   setDerivedRoleHook,
   toolCatalog,
   loadSkillPins,
