@@ -165,9 +165,11 @@ test('pruning keeps exactly what the policy overrides — no baseline, no plain 
 
 test('the row envelope is the §1.1 contract, and refuses to be built without its assertions', () => {
   const row = rowFor(PEER, PROD);
-  // `skills` is part of the envelope since D3: the runtime's skill filter needs the pinned skills this
-  // scope may hold, and it cannot evaluate policy to work them out.
-  assert.deepEqual(Object.keys(row), ['v', 'account', 'policyDigest', 'scope', 'verdicts', 'skills']);
+  // `skills` and `skillsGoverned` are part of the envelope since D3: the runtime filter needs BOTH the
+  // pinned skills this scope may hold and the full governed set, and it cannot evaluate policy to work
+  // either out. Taking the governed set from the row rather than importing skill-pins.mjs also keeps the
+  // policy the single source — and avoids a cross-tree import the flattened image layout breaks.
+  assert.deepEqual(Object.keys(row), ['v', 'account', 'policyDigest', 'scope', 'verdicts', 'skills', 'skillsGoverned']);
   assert.equal(row.v, ROW_VERSION);
   assert.equal(row.account, '361364274007');
   assert.equal(row.policyDigest, PROD.digest);

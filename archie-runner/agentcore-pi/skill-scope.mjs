@@ -52,3 +52,45 @@ export function scopeManifest(manifest, names) {
   for (const n of names) if (skills[n] != null) out.skills[n] = skills[n];
   return out;
 }
+
+/**
+ * Remove PINNED skills this scope may not hold (plan §7.2 / D3, the LLM-facing skill filter).
+ *
+ * WHY THIS EXISTS AT ALL. Tools have `applyToolFilter`; skills had no equivalent, so a denied skill's PROSE
+ * stayed in the prompt and the model kept being instructed to do something it could not do. The fix is to
+ * remove it from what the model is given, not to let it try and fail.
+ *
+ * @param installs      the agent's installs, already unioned with the always-on set
+ * @param allowedSkills the pinned skills this scope may hold — the POLICY row's `skills`. NULL means "no
+ *                      policy row", which must be a NO-OP: every scope is in that state until the first
+ *                      policy deploy reaches it, and filtering on absent data would strip 146 holders on
+ *                      their next turn, which is precisely the unrecoverable strip D3 orders against.
+ * @param governed      EVERY pinned skill id, from the row. Taken from the policy rather than imported
+ *                      from skill-pins.mjs for two reasons: the in-image layout flattens agentcore-pi/ to
+ *                      /app/ while config-resolver/ stays nested, so `../config-resolver/…` does not
+ *                      resolve there (caught by image-layout-test.mjs) — and more importantly the POLICY
+ *                      should be the single source of what it governs, not a second module the row could
+ *                      disagree with.
+ * @param manifest      the fleet skill manifest, for the always-on set
+ * @param onDeny        called once per removed skill — the OTEL leg. A silent strip is indistinguishable
+ *                      from an agent that never had the skill, which makes "why did it stop doing X"
+ *                      unanswerable.
+ */
+export function filterPinnedSkills(installs, allowedSkills, governed, manifest, onDeny = () => {}) {
+  if (!Array.isArray(allowedSkills) || !Array.isArray(governed)) return installs;
+  const allowed = new Set(allowedSkills);
+  const isGoverned = new Set(governed);
+  // ALWAYS-ON SKILLS ARE UNFILTERABLE, and this is a hard condition rather than a nicety: otel-debug is how
+  // an operator sees the fleet at all, so one bad allow-list must not be able to blind it. They are also not
+  // per-agent installs — they are fleet-wide pseudo-installs — so an allow-list has no business deciding
+  // them.
+  const alwaysOn = new Set(alwaysOnSkills());
+  const out = {};
+  for (const [id, v] of Object.entries(installs || {})) {
+    if (alwaysOn.has(id) || !isGoverned.has(id) || allowed.has(id)) { out[id] = v; continue; }
+    // UNPINNED SKILLS PASS UNTOUCHED. This filter governs pinned skills only; becoming a second install
+    // gate for the whole marketplace would deny every skill the policy simply says nothing about.
+    try { onDeny(id); } catch { /* telemetry never drops a skill decision */ }
+  }
+  return out;
+}

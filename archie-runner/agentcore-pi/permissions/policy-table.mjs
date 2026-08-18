@@ -113,6 +113,11 @@ export function loadPolicyTable(row, { scope, expectedAccount = null, onProblem 
     // nothing at all, leaving "policy in force at digest X" indistinguishable from "this image has no
     // policy code" (see pi-adapter loadPolicy).
     capabilities: Object.keys(verdicts).sort(),
+    // The PINNED skills this scope may hold, straight from the row. Consumed by readSkillState's filter,
+    // which intersects the agent's installs with it. Only pinned skills appear, so an ABSENT entry means
+    // "not governed" (allowed) rather than "denied" — see skill-pins.isPinned.
+    skills: Array.isArray(row.skills) ? [...row.skills].sort() : [],
+    skillsGoverned: Array.isArray(row.skillsGoverned) ? [...row.skillsGoverned].sort() : [],
     allowed: Object.keys(verdicts).filter((c) => verdicts[c] === 'allow').sort(),
     digest: typeof row.policyDigest === 'string' ? row.policyDigest : null,
     denyAll: false,

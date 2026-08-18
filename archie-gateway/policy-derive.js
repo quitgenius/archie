@@ -69,6 +69,9 @@ function rowFromMemberships(scope, artifact) {
       .filter((g) => g.startsWith('skill.') && (groups[g] || []).includes(scope))
       .map((g) => g.slice('skill.'.length))
       .sort(),
+    // Every pinned skill in this environment, so the runtime filter's `governed` set comes from the policy
+    // rather than from a module it could disagree with.
+    skillsGoverned: Object.keys(groups).filter((g) => g.startsWith('skill.')).map((g) => g.slice('skill.'.length)).sort(),
   };
 }
 

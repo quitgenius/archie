@@ -253,7 +253,7 @@ function rowFor(scope, sources, ctx = null) {
   for (const capability of context.domain) {
     if (all[capability] !== ambientVerdict(capability, sources)) verdicts[capability] = all[capability];
   }
-  return { v: ROW_VERSION, account, policyDigest, scope, verdicts, skills: skillsFor(scope, sources) };
+  return { v: ROW_VERSION, account, policyDigest, scope, verdicts, skills: skillsFor(scope, sources), skillsGoverned: governedSkills(sources) };
 }
 
 /**
@@ -268,6 +268,12 @@ function rowFor(scope, sources, ctx = null) {
  * would make the row grow with the marketplace and imply a gate that does not exist. The filter treats
  * "absent from this list" as "allowed" for unpinned skills — see skill-pins.isPinned.
  */
+/** EVERY pinned skill in this environment — the filter's `governed` set, so the policy is its only source. */
+function governedSkills(sources) {
+  return Object.keys((sources.pins || {}).groups || {})
+    .filter((g) => g.startsWith('skill.')).map((g) => g.slice('skill.'.length)).sort();
+}
+
 function skillsFor(scope, sources) {
   const groups = (sources.pins && sources.pins.groups) || {};
   const out = [];

@@ -28,7 +28,7 @@ import { planReplyMetrics } from './reply-usage.mjs';
 import { classifyTurn } from './turn-outcome.mjs';
 import { seedWorkspace } from './workspace-seed.mjs';
 import { syncSkills } from './skill-sync.mjs';
-import { skillFingerprint, scopeManifest, withAlwaysOn } from './skill-scope.mjs';
+import { skillFingerprint, scopeManifest, withAlwaysOn, filterPinnedSkills } from './skill-scope.mjs';
 // Pure + importable (pi-adapter self-boots on import, so anything needing a unit test lives outside
 // it — same reason skillFingerprint lives in skill-scope.mjs).
 import { configFingerprint } from './config-fingerprint.mjs';
@@ -989,13 +989,26 @@ async function reloadConfigFromDdb() {
   return loadConfig(await loadAgentConfig({ agentName: AGENT_NAME, force: true }));
 }
 
-async function readSkillState(io) {
+async function readSkillState(io, allowedSkills = null, governedSkills = null) {
   const [mkt, manifest] = await Promise.all([io.readAgentMarketplace(), io.readSkillManifest()]);
   const man = manifest || { skills: {} };
   // Union the fleet-wide always-on skills (e.g. otel-debug) into the agent's installs so every
   // agent — and every newly-spawned agent — materializes them, no per-agent MARKETPLACE write.
   const installs = withAlwaysOn((mkt && mkt.installs) || {}, man);
-  const { fp, names } = skillFingerprint(installs, man);
+  // THE SKILL FILTER (plan §7.2 / D3). Tools have applyToolFilter; skills had no equivalent, so a denied
+  // skill's PROSE stayed in the prompt and the model kept being instructed to do something it could not.
+  // This removes it from what the model is given at all.
+  //
+  // ABOVE skillFingerprint, and that placement is the whole reason it works: the fingerprint keys the /tmp
+  // materialisation, so filtering below it would leave a denied skill's files on disk and re-prune nothing
+  // when a policy change removed a holder.
+  const filtered = filterPinnedSkills(installs, allowedSkills, governedSkills, man, (skillId) => {
+    // LEGIBLE IN OTEL, which the plan makes a condition on this filter. A silent strip is
+    // indistinguishable from an agent that never had the skill, so "why did it stop doing X" would be
+    // unanswerable. Same msg/shape as a tool denial so one query covers both surfaces.
+    onPermissionSignal({ capability: `skill:${skillId}`, surface: 'skill', tool: skillId, reason: 'policy-denied', decision: 'deny' });
+  });
+  const { fp, names } = skillFingerprint(filtered, man);
   // `models` rides back with the skill read because it lives on the SAME item and the App Home
   // model picker writes it (marketplace.js setModel). It is deliberately NOT folded into the skill
   // fingerprint — that one keys the /tmp skill materialisation, and a model change must not force
@@ -1035,9 +1048,13 @@ async function getSession(key, seed = {}) {
   // the fingerprint flips → re-hydrate /tmp and/or re-resolve the config, then
   // REBUILD the session (SessionManager.open on the same JSONL preserves the conversation — Spike 1).
   const io = await ddbIO();
+  // THE POLICY ROW IS READ BEFORE THE SKILLS, because readSkillState's filter needs its `skills` list and
+  // the fingerprint is computed there — a policy change must move the fingerprint so /tmp is re-pruned.
+  // The same table is reused for the decider below rather than read twice.
+  const policyTable = await loadPolicy();
   let skill;
   try {
-    skill = await readSkillState(io);
+    skill = await readSkillState(io, policyTable ? policyTable.skills : null, policyTable ? policyTable.skillsGoverned : null);
   } catch (e) {
     // A fingerprint-read failure must not drop the turn: reuse the warm session if any, else
     // build against whatever skills are already on /tmp.
@@ -1129,7 +1146,7 @@ async function getSession(key, seed = {}) {
   // The compiled Cedar verdicts, in a mutable holder for exactly the reason `grants` is a mutable Set:
   // the decider and the filter close over this one reference and applyFilter refreshes it per turn, so a
   // pin edit lands on the next turn even on a warm session.
-  const policy = policyRef(await loadPolicy());
+  const policy = policyRef(policyTable);
   const decide = makeDecider({ grants, policy, onSignal: onPermissionSignal });
   // turnStartedAtMs: the clock the model is shown for THIS turn (clock-extension). Stamped
   // per turn by the handler; seeded here so a turn that somehow skips the refresh still gets
