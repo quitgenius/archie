@@ -872,6 +872,89 @@ function createAgentCoreClient(overrides = {}) {
     }
   }
 
+  // ── The compiled policy row (AGENT#<scope>/POLICY) ───────────────────────────────────────────────
+  //
+  // The dispatcher is one of TWO writers. `archie deploy` writes rows for the scopes it can enumerate,
+  // with the real Cedar engine. This writes rows for the ones it cannot: a scope MINTED at turn time,
+  // which no deploy has ever seen, and which with no row falls back to grant-only behaviour — making
+  // every pin on it silently inert (the ch-cr89fluhion failure, plan §2.1).
+  //
+  // NOT WRITE-ONCE, unlike seedNewWorkspace above, and the difference is the point. SEED is authored
+  // baseline that App Home may since have edited, so it is guarded by attribute_not_exists. This row is
+  // DERIVED — the artifact is its only authority — so it is overwritten whenever it is stale. Guarding
+  // it would freeze a minted scope's verdicts at mint time and let a policy edit never reach it.
+  //
+  // The artifact is cached in-process because this runs on the TURN PATH: a policy edit lands on the next
+  // turn after the TTL rather than instantly, which is the same freshness the CRON_RUNNER flag accepts
+  // for the same reason. Per-agent `lastPolicyDigest` then makes the steady state ZERO DynamoDB calls —
+  // the row is only read when the artifact's digest has moved since this process last wrote that agent.
+  let _policyArtifact = null;
+  let _policyArtifactAtMs = 0;
+  const POLICY_ARTIFACT_TTL_MS = 30_000;
+  const lastPolicyDigest = new Map();
+
+  async function policyArtifact({ logger } = {}) {
+    const now = Date.now();
+    if (_policyArtifact && now - _policyArtifactAtMs < POLICY_ARTIFACT_TTL_MS) return _policyArtifact;
+    const schema = await loadConfigSchema();
+    const { GetCommand } = require('@aws-sdk/lib-dynamodb');
+    const r = await docClient().send(new GetCommand({
+      TableName: config.agentConfigTable, Key: schema.fleetPolicyKey(),
+    }));
+    const body = r?.Item?.data ? JSON.parse(r.Item.data) : null;
+    // NULL IS A LEGITIMATE STATE, not an error: before the first `archie deploy` that publishes policy,
+    // no artifact exists and every scope should keep pre-policy behaviour. ensurePolicyRow does nothing
+    // in that case, so the layer stays additive (plan §1.1).
+    if (!body && logger?.debug) logger.debug('no fleet policy artifact — policy rows not managed yet');
+    _policyArtifact = body;
+    _policyArtifactAtMs = now;
+    return body;
+  }
+
+  /**
+   * Make sure this scope's POLICY row matches the current fleet artifact. Never fatal.
+   *
+   * Returns {written, reason} so the caller can log a real write without logging the no-ops.
+   */
+  async function ensurePolicyRow(agent, { logger } = {}) {
+    if (_faked || !config.agentConfigTable) return { written: false, reason: 'no-table' };
+    try {
+      const artifact = await policyArtifact({ logger });
+      if (!artifact) return { written: false, reason: 'no-artifact' };
+      // The cheap gate: this process already wrote this agent at this policy version.
+      if (lastPolicyDigest.get(agent) === artifact.policyDigest) return { written: false, reason: 'cached' };
+
+      const [schema, { rowFromMemberships, rowIsStale }] = [await loadConfigSchema(), require('./policy-derive')];
+      const { GetCommand, PutCommand } = require('@aws-sdk/lib-dynamodb');
+      const Key = schema.agentPolicyKey(agent);
+      const cur = await docClient().send(new GetCommand({ TableName: config.agentConfigTable, Key }));
+      const existing = cur?.Item?.data ? JSON.parse(cur.Item.data) : null;
+      if (!rowIsStale(existing, artifact)) {
+        lastPolicyDigest.set(agent, artifact.policyDigest);
+        return { written: false, reason: 'current' };
+      }
+      const row = rowFromMemberships(agent, artifact);
+      await docClient().send(new PutCommand({
+        TableName: config.agentConfigTable,
+        Item: { ...Key, data: JSON.stringify(row) },
+      }));
+      lastPolicyDigest.set(agent, artifact.policyDigest);
+      if (logger?.info) {
+        const allowed = Object.entries(row.verdicts).filter(([, v]) => v === 'allow').map(([c]) => c);
+        logger.info({ agent, policyDigest: row.policyDigest, allowed, entries: Object.keys(row.verdicts).length },
+          existing ? 'policy row refreshed (policy digest moved)' : 'policy row written for scope');
+      }
+      return { written: true, reason: existing ? 'refreshed' : 'created' };
+    } catch (e) {
+      // Never fail a turn over this. A missing or stale row means the runtime keeps its previous
+      // behaviour, which is safe in the pinned-DENY direction (an absent row denies nothing new) and
+      // merely late in the pinned-ALLOW direction. Loud, though — a persistent failure here means pins
+      // are not being applied.
+      if (logger?.warn) logger.warn({ agent, err: e?.message }, 'policy row ensure failed (non-fatal)');
+      return { written: false, reason: 'error', error: e?.message };
+    }
+  }
+
   /**
    * Pre-write a brand-new agent's MARKETPLACE slice — its default skills and Connector toolkits.
    *
@@ -1498,6 +1581,10 @@ function runExclusiveForSession(sessionId, fn, { metrics, agent, logger } = {}) 
     // and no expiry, so "which rows exist" IS the contract.
     runtimeRegistryForTest: registry,
     ensureAgentEnvironment,
+    // The compiled policy row for a scope. Called on the turn path by ensureCurrentRuntime so a MINTED
+    // scope — which no deploy can enumerate — gets its verdicts, and so a policy edit reaches every
+    // scope on its next turn rather than only the ones a deploy happened to see.
+    ensurePolicyRow,
     config,
     makeStreamBridge,
     findRuntimeByName,

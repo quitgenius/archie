@@ -150,6 +150,15 @@ const lastSpecSeen = new Map();   // for attributing WHY a generation rolled
 async function ensureCurrentRuntime(agent, { logger } = {}) {
   const image = await imageSource.resolveImage(agent);
   const arn = await agentCore.ensureRuntime(agent, { logger, image });
+  // The compiled policy row, on the same cadence as the runtime itself. HERE rather than inside
+  // ensureRuntime because it must run for EVERY turn, not only when a runtime is provisioned: this is
+  // both the mint-time write (a scope no deploy can enumerate) and the staleness backstop (a policy edit
+  // reaching a scope the deploy never saw). Steady state is zero DynamoDB calls — see ensurePolicyRow.
+  //
+  // NOT awaited before the invoke path?  It is — deliberately. The row must be in place before the turn
+  // reads it, or a freshly-pinned capability is denied for one turn and the operator sees a flap. It is
+  // contracted never to throw and is a no-op once cached, so the cost is a Map lookup.
+  await agentCore.ensurePolicyRow(agent, { logger });
   const keepName = agentCore.generationRuntimeName(agent, image);
   if (keepName !== lastGenerationSeen.get(agent)) {
     const prevName = lastGenerationSeen.get(agent);
