@@ -70,6 +70,10 @@ async function deploy(ctx, args, out, deps = {}) {
 
   const result = {
     preflight: null,
+    // The policy step's outcome. NOT just for --json: a release summary that omits policy cannot answer
+    // "what did this deploy change about what agents may do", which is the one question the layer exists
+    // to make answerable. `null` = not run; see render().
+    policy: null,
     fleet: null,
     gatewayBuild: null,
     gateway: null,
@@ -126,6 +130,7 @@ async function deploy(ctx, args, out, deps = {}) {
   if (values['skip-policy']) {
     out.warn('--skip-policy: the Cedar sources are NOT compiled, checked or published. Agents will be '
       + 'staged against whatever verdict rows are already stored, which may predate this release.');
+    result.policy = { skipped: 'flag' };
   } else {
     try {
       const policy = await runStep(steps.policyPublish, ctx, {
@@ -142,6 +147,7 @@ async function deploy(ctx, args, out, deps = {}) {
       // (failed checks, an undeclared decision change) is rethrown and stops the release.
       if (e && e.exitCode === EXIT.REFUSED && /no policy pins declare account/.test(e.message || '')) {
         out.warn(`policy      skipped — ${e.message}. No verdict rows are managed in this account.`);
+        result.policy = { skipped: 'no-pins', account: (e.message.match(/account (\d+)/) || [])[1] || null };
       } else {
         out.progress('agents      NOT TOUCHED — the policy step refused. Nothing was built, staged or rolled.');
         publish(ctx, out, result, render);
@@ -259,10 +265,33 @@ function emit(ctx, out, result, renderer) {
   return undefined;
 }
 
+/**
+ * The policy line of a release summary.
+ *
+ * WHY IT IS ITS OWN FUNCTION AND WHY EVERY STATE IS NAMED. A release report that omits policy cannot answer
+ * "did this deploy change what agents may do", which is the single question the layer exists to make
+ * answerable — and the states are NOT interchangeable. "unchanged" means the fleet is at the sources'
+ * digest; "SKIPPED" means nobody checked and the rows may predate this release. Collapsing them into a
+ * blank line, or into one word, loses exactly the distinction an operator needs after the fact.
+ */
+function renderPolicy(p) {
+  if (!p) return 'policy      not run';
+  if (p.skipped === 'flag') return 'policy      SKIPPED (--skip-policy) — verdict rows may predate this release';
+  if (p.skipped === 'no-pins') {
+    return `policy      none for this account${p.account ? ` (${p.account})` : ''} — no verdict rows are managed here`;
+  }
+  const digest = p.digest || (p.artifact && p.artifact.policyDigest) || '—';
+  const changed = Array.isArray(p.changes) ? p.changes.length : 0;
+  if (p.unchanged) return `policy      unchanged (${digest})`;
+  return `policy      ${digest}  ${p.rows || 0} row(s)`
+    + (changed ? `  ${changed} decision(s) CHANGED` : '  no decisions changed');
+}
+
 function render(r) {
   const lines = [];
   if (r.preflight) lines.push(`preflight   checks 1-3 pass (account ${r.preflight.account})`);
   else lines.push('preflight   SKIPPED');
+  lines.push(renderPolicy(r.policy));
   if (r.fleet) {
     lines.push(`agents      ${r.fleet.imageTag || '—'} (${r.fleet.mode})`
       + `${r.fleet.stage && r.fleet.stage.coverage !== undefined ? `  staged ${r.fleet.stage.coverage}/${r.fleet.stage.agents}` : ''}`);

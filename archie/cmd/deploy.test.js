@@ -167,7 +167,11 @@ test('an account with NO pins file is skipped, not blocked', async () => {
   const { r, out } = await run({}, { steps: s.steps, digestFor: digestFor(RUNNING_TAG) });
   assert.match(out.warnings.join('\n'), /policy {6}skipped/);
   assert.ok(s.names().includes('fleetDeploy'), 'the release continues');
-  assert.equal(r.policy, undefined);
+  // RECORDED, not absent. The summary must be able to distinguish "no policy is managed in this account"
+  // from "policy ran and changed nothing" — the second means the fleet is at the sources' digest, the first
+  // means nothing is enforced here at all, and a blank line reads as the reassuring one.
+  assert.deepEqual(r.policy, { skipped: 'no-pins', account: '543510375323' });
+  assert.match(deployCmd.render(r), /policy {6}none for this account \(543510375323\)/);
 });
 
 test('--accept-policy-change is threaded through, not swallowed', async () => {
@@ -184,6 +188,20 @@ test('--skip-policy skips it and says what that costs', async () => {
   const { out } = await run({ 'skip-policy': true }, { steps: s.steps, digestFor: digestFor(RUNNING_TAG) });
   assert.ok(!s.names().includes('policyPublish'));
   assert.match(out.warnings.join('\n'), /NOT compiled, checked or published/);
+});
+
+test('the release summary reports policy in every state, distinguishably', () => {
+  // `archie deploy` is the complete picture of a release, so its summary must answer "did this change what
+  // agents may do". The states are not interchangeable: "unchanged" means the fleet IS at the sources'
+  // digest, "SKIPPED" means nobody checked and the rows may predate the release. A blank line, or one word
+  // for both, reads as the reassuring one.
+  const of = (policy) => deployCmd.render({ preflight: { account: '203366135563' }, policy });
+  assert.match(of(null), /policy {6}not run/);
+  assert.match(of({ skipped: 'flag' }), /SKIPPED \(--skip-policy\).*predate this release/);
+  assert.match(of({ skipped: 'no-pins', account: '543510375323' }), /none for this account \(543510375323\)/);
+  assert.match(of({ unchanged: true, digest: 'sha256:aaa' }), /policy {6}unchanged \(sha256:aaa\)/);
+  assert.match(of({ digest: 'sha256:bbb', rows: 3, changes: [] }), /sha256:bbb {2}3 row\(s\) {2}no decisions changed/);
+  assert.match(of({ digest: 'sha256:bbb', rows: 3, changes: [{}, {}] }), /3 row\(s\) {2}2 decision\(s\) CHANGED/);
 });
 
 // ── 2. blast radius ──────────────────────────────────────────────────────────────────────────────
