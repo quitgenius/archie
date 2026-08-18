@@ -34,6 +34,7 @@
     "@aws-sdk/client-sts": "^3",
     "@aws-sdk/client-xray": "^3",
     "@aws-sdk/credential-provider-node": "^3",
-    "@aws-sdk/lib-dynamodb": "^3"
+    "@aws-sdk/lib-dynamodb": "^3",
+    "@cedar-policy/cedar-wasm": "^4.12.0"
   }
 }
