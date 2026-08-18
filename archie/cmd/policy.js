@@ -19,6 +19,7 @@ const { CliError, EXIT, usage, refused, preflight } = require('../lib/exit');
 const { clientsFor, resolveAccount } = require('../lib/spec');
 const { loadPolicySources, availableEnvs } = require('../lib/policy-sources');
 const { plan } = require('../lib/policy-publish');
+const { runSourceChecks, capabilityUniverse, diffDecisions } = require('../lib/policy-checks');
 const { scanBindings } = require('../lib/bindings');
 const { collectFromDdb } = require('../../archie-gateway/routing-build');
 
@@ -83,7 +84,28 @@ async function enumerateScopes(aws, ctx) {
   return { routing, minted, all: [...new Set([...routing, ...served])].sort() };
 }
 
+/**
+ * The verdict rows currently stored, keyed by scope. A scope with no row maps to null — which
+ * diffDecisions reads as "pre-policy behaviour", so the first publish correctly reports every pinned
+ * decision as a change rather than as nothing.
+ */
+async function readLiveRows(aws, ctx, scopes) {
+  const schema = await import(`file://${require.resolve('../../archie-runner/config-resolver/schema.mjs')}`);
+  const doc = aws.doc();
+  const { GetCommand } = aws.docCmds;
+  const out = {};
+  // Serial GetItems rather than BatchGet: the scope count is in the low hundreds, this is off the turn
+  // path, and BatchGet's partial-response handling is a source of silently-missing keys — which here
+  // would read as "no row" and manufacture a spurious change.
+  for (const scope of scopes) {
+    const r = await doc.send(new GetCommand({ TableName: ctx.resources.configTable, Key: schema.agentPolicyKey(scope) }));
+    out[scope] = r?.Item?.data ? JSON.parse(r.Item.data) : null;
+  }
+  return out;
+}
+
 async function publish(ctx, args, out, deps = {}) {
+  const values = (args && args.values) || {};
   const aws = clientsFor(ctx, deps);
   const table = ctx.resources.configTable;
   const account = await resolveAccount(ctx, aws);
@@ -97,10 +119,37 @@ async function publish(ctx, args, out, deps = {}) {
     });
   }
 
-  // THE GATE. plan() runs assertDerivationMatchesCedar over every scope, so a policy the dispatcher
-  // cannot derive by membership alone fails HERE rather than shipping and being silently mis-derived for
-  // every minted scope. Do not catch this to make a deploy pass — see policy-publish.js.
+  // CHECKS 1–4 on the sources, before anything is computed or written. Every one of these guards a
+  // SILENT failure — Cedar fails closed, so a typo here is a policy that quietly denies rather than one
+  // that errors. Check 4 validates group members against `all`, which is what catches an id from another
+  // environment (the pins.prod.json failure): shape alone passes those.
+  const caps = await capabilityUniverse(sources);
+  const findings = runSourceChecks(sources, { caps, knownScopes: all });
+  for (const f of findings) out.progress(`check ${f.check}  ${f.fatal ? 'FAIL' : 'warn'}  ${f.message}${f.detail ? `\n            ${f.detail}` : ''}`);
+  const fatal = findings.filter((f) => f.fatal);
+  if (fatal.length) {
+    throw refused(`${fatal.length} policy check(s) failed`, {
+      detail: 'nothing was written. Fix the sources — these are the checks that turn a silently-denying '
+        + 'policy into a stopped deploy.',
+    });
+  }
+
+  // THE GATE (check 6). plan() runs assertDerivationMatchesCedar over every scope, so a policy the
+  // dispatcher cannot derive by membership alone fails HERE rather than shipping and being silently
+  // mis-derived for every minted scope. Do not catch this to make a deploy pass — see policy-publish.js.
   const { artifact, rows, checked } = plan(all, sources);
+
+  // CHECK 7 — does this change any DECISION? A policy diff is not a text diff: reordering statements or
+  // renaming a group can be a large textual change with zero decision changes, while a one-character edit
+  // to a group id can revoke a capability from every holder. Only a materialised comparison tells them
+  // apart, and it is the actual reason to want an engine here.
+  const live = await readLiveRows(aws, ctx, all);
+  const { changes } = diffDecisions(rows, live);
+  const decisionLines = changes.length
+    ? [`decisions changed: ${new Set(changes.map((c) => c.scope)).size} scope(s), ${changes.length} (scope, capability) pair(s)`,
+      ...changes.slice(0, 12).map((c) => `            ${c.scope}  ${c.capability}  ${c.from ?? '(no row)'} → ${c.to}`),
+      ...(changes.length > 12 ? [`            … ${changes.length - 12} more`] : [])]
+    : ['decisions changed: none — this publish is a no-op for every scope'];
 
   const allowsFor = (row) => Object.entries(row.verdicts).filter(([, v]) => v === 'allow').map(([c]) => c);
   const withPins = rows.filter((r) => allowsFor(r).length);
@@ -112,13 +161,26 @@ async function publish(ctx, args, out, deps = {}) {
     `verified  ${checked} scope(s) — membership derivation matches Cedar`,
     `pinned    ${withPins.length} scope(s) hold at least one pinned capability:`,
     ...withPins.map((r) => `            ${r.scope}  ${allowsFor(r).join(', ')}`),
+    ...decisionLines,
   ];
 
   if (ctx.dryRun) {
     out.progress(`would write ${POLICY_PK} / ${FLEET_SK} + ${rows.length} AGENT#<scope>/POLICY row(s)`);
-    answer(out, ctx, { env: sources.env, account, artifact, rows, written: false, dryRun: true },
+    answer(out, ctx, { env: sources.env, account, artifact, rows, changes, written: false, dryRun: true },
       [...head, `written   nothing (dry run) — ${rows.length} row(s) + the fleet artifact would be written`].join('\n'));
     return undefined;
+  }
+
+  // CHECK 7's REFUSAL. Computing the diff is only worth it if someone READS it: a policy edit that
+  // revokes a capability from eight scopes must not be indistinguishable, at the moment of publishing,
+  // from a comment-only edit. Placed after the dry-run branch on purpose — `--dry-run` is how you look
+  // before deciding, so it must never refuse.
+  if (changes.length && !values['accept-policy-change']) {
+    answer(out, ctx, { env: sources.env, account, changes, written: false, refused: true }, head.join('\n'));
+    throw refused(`${changes.length} decision(s) would change for ${new Set(changes.map((c) => c.scope)).size} scope(s)`, {
+      detail: 're-run with --accept-policy-change to publish. Read the list above first: each changed '
+        + 'decision grants or revokes a capability for a real scope on its next turn.',
+    });
   }
 
   const at = nowIso(deps);
