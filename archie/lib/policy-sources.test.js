@@ -3,7 +3,7 @@
 // The policy document as an INPUT — that both environments load, that the annotation convention is
 // read the way the files are written, and that the digest moves when and only when a source changes.
 //
-// These run against the REAL files in archie-cedar-spike/policy/, not fixtures, deliberately: the
+// These run against the REAL files in docker/policy/, not fixtures, deliberately: the
 // shipped policy is the artifact, and a fixture would let the real one rot (policy/README.md:174-176
 // says exactly that — "there is no permanent runner for these files yet, so they will rot until that
 // exists"). This is the start of that runner.

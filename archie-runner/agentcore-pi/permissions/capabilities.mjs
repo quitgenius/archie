@@ -20,7 +20,7 @@ const HINDSIGHT_WRITE_TOOLS = new Set(
   Object.entries(CUSTOM_TOOLS).filter(([, cap]) => cap === 'hindsight.write').map(([name]) => name),
 );
 
-// THE CEDAR POLICY OWNS THIS SET. `capGroups.baseline` in archie-cedar-spike/policy/semantics.json is the
+// THE CEDAR POLICY OWNS THIS SET. `capGroups.baseline` in docker/policy/semantics.json is the
 // declaration of what is "generally available"; this map is its runtime mirror, and `archie deploy` REFUSES
 // when the two disagree in either direction (check 8, archie/lib/policy-checks.js checkBaseline). So editing
 // one without the other is not a drift that shows up later — it is a deploy that does not happen.

@@ -64,6 +64,30 @@ const LINT_ROOT_INPUTS = [
   { path: 'eslint.config.mjs', context: '.' },
 ];
 
+// THE CEDAR POLICY SOURCES (R8). Declared inputs of BOTH images, and neither COPYs them — which is not a
+// contradiction: a declared input is "content that decides what this image IS", and these decide the
+// baseline capability set that `permissions/baseline.generated.mjs` carries into both.
+//
+// WHY THEY MUST BE HERE, and it is a correctness argument rather than tidiness. Generating code from a
+// source that is NOT a declared input is unsafe: an edit to semantics.json would change no tag, the build
+// would be skipped as "already in ECR", and the stale generated file would ship under a tag that claims to
+// contain the new policy. Declaring the source is what makes that impossible — an edit moves the tag, the
+// build runs, and codegen re-runs with it.
+//
+// Two smaller things it also fixes: `--pure` now refuses on an uncommitted policy edit (it did not, so a
+// release could claim reproducibility while the policy on disk differed from HEAD), and the dirty-tree
+// warning can name a modified policy file.
+//
+// `context: '.'` because the AGENT's build context is docker/archie-runner/ and this sits above it. Same
+// mechanism LINT_ROOT_INPUTS uses for the repo-root lint config, and for the same reason: hashed as input,
+// never resolved against the narrower context.
+//
+// Cost of being wrong here: a policy edit rolls both halves. Noisy, not unsafe — and a policy edit SHOULD
+// roll the agent, because the generated baseline it carries has changed.
+const POLICY_INPUTS = [
+  { path: 'policy', dir: true, context: '.' },
+];
+
 /**
  * The declared input sets, as data — one per image, because they DIFFER and the difference is the
  * feature (plan §5). Every path is relative to docker/; `dir: true` means "walk it".
@@ -81,6 +105,7 @@ const IMAGES = {
     context: '.',
     inputs: [
       ...LINT_ROOT_INPUTS,
+      ...POLICY_INPUTS,
 
       // Dockerfile:18,57. `package-lock.json*` is written with a trailing `*` so the build survives
       // its absence; it is present today, hence optional rather than missing-is-an-error.
@@ -173,6 +198,7 @@ const IMAGES = {
     context: 'archie-runner',
     inputs: [
       ...LINT_ROOT_INPUTS,
+      ...POLICY_INPUTS,
 
       // Dockerfile:30,34-37,84-100,107-108 — sources, package.json, openclaw-compat/, permissions/,
       // and spike/ (lint stage only, but a lint failure there fails this build).

@@ -22,7 +22,7 @@
 // Reimplementing on the client would silently turn "search documents" into "list documents".
 //
 // All four are reads. Retain/delete/update are NOT here and must not be added without
-// `hindsight.write`, which is policy-pinned (see archie-cedar-spike/policy/semantics.cedar B1).
+// `hindsight.write`, which is policy-pinned (see docker/policy/semantics.cedar B1).
 
 import { piAi } from './pi-runtime.mjs';
 import { describeFetchError } from './fetch-error.mjs';

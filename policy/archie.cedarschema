@@ -1,0 +1,60 @@
+// Archie authorization schema — the type declarations every policy is validated against.
+//
+// Mint this FIRST. Without a schema, `validate` can only check syntax, and a policy that tests a
+// misspelled capability is well-typed and silently never matches — the failure mode this whole layer
+// exists to remove. With it, a typo is a build error.
+//
+// Verified against @cedar-policy/cedar-wasm 4.12.0.
+
+namespace Archie {
+  // ── Principals ──────────────────────────────────────────────────────────────
+  // A SCOPE is the unit authority attaches to: a Slack channel or a DM, NOT an agent. One agent
+  // reachable in three channels is three scopes, and `GRANT#<scope>/SCOPE#*` is keyed this way.
+  entity Scope in [ScopeGroup];
+
+  // A named set of scopes, supplied per environment as entity data (pins.<env>.json) rather than as
+  // policy text. This is the load-bearing choice: a policy TEMPLATE fails OPEN when a binding is
+  // forgotten (zero links instantiate no policy), while an empty or absent group makes every
+  // membership test false and therefore DENIES. Measured three ways in ../README.md §1-4.
+  //
+  // Pins and context-sharing groups are the same construct: a group of one is a pin, a group of
+  // none is "nobody, ever".
+  entity ScopeGroup;
+
+  // ── Resources ───────────────────────────────────────────────────────────────
+  // A CAPABILITY is the resource — the logical permission a tool call resolves to, via
+  // capabilityOf(toolName, input). That resolution is what keeps this domain finite: unbounded
+  // runtime arguments collapse to one of a small closed set of tokens BEFORE any decision, so the
+  // decision table can be materialised at deploy time instead of evaluated per call.
+  //
+  // `name` is NOT decoration. The grant-row permit reads `resource.name`, so every Capability entity
+  // MUST carry it. Omit it and the condition errors, the permit never applies, and the request denies
+  // for a reason that has nothing to do with policy — you would "confirm" a pin that is doing nothing.
+  entity Capability in [CapGroup] { name: String };
+
+  // A named set of capabilities: `baseline`, and later the connector slug groups.
+  entity CapGroup;
+
+  // ── Actions ─────────────────────────────────────────────────────────────────
+  // One action. "May this scope use this capability, this turn." Everything else the system asks is
+  // a projection of this question, not a second one.
+  action "use" appliesTo {
+    principal: [Scope],
+    resource: [Capability],
+    context: {
+      // The scope's effective grants for THIS turn, read from GRANT#<scope>/SCOPE#* per turn so a
+      // grant lands without a restart. This is the bridge to layer 1 — the only dynamic input.
+      grants: Set<String>,
+
+      // What initiated the turn. Declared as an enumerated entity type, not a String, so
+      // `context.trigger == Archie::Trigger::"crob"` is a VALIDATION ERROR rather than a condition
+      // that quietly never matches. Optional: no v1 policy reads it, and requiring it would force
+      // every call site to supply a value it does not yet have.
+      trigger?: Trigger,
+    }
+  };
+
+  // Enumerated entity type. Measured: with a plain String attribute a typo'd value produces 0
+  // validation errors; declared this way the same typo produces 1. See ../README.md §6.
+  entity Trigger enum ["slack", "cron", "api"];
+}

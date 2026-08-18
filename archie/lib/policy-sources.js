@@ -2,7 +2,7 @@
 
 // The policy document, read and fingerprinted — the input side of the policy layer (plan §1.1, §2).
 //
-// FOUR FILES, AND THE SPLIT IS LOAD-BEARING (archie-cedar-spike/policy/README.md, the table at the
+// FOUR FILES, AND THE SPLIT IS LOAD-BEARING (policy/README.md, the table at the
 // top). Three are SHARED and always included — `archie.cedarschema`, `semantics.cedar`,
 // `semantics.json` — and exactly one, `pins.<env>.json`, is selected per environment. The operator
 // edits the selected file and nothing else. semantics.cedar:8-13 records why: semantics duplicated
@@ -27,20 +27,31 @@ const { usage, preflight } = require('./exit');
 const DOCKER = path.resolve(__dirname, '..', '..');
 
 /**
- * WHERE THE POLICY SOURCES LIVE TODAY, and this is NOT settled — one constant, so moving them is one
- * edit.
+ * WHERE THE POLICY SOURCES LIVE — `docker/policy/`, and the location is now load-bearing (R8).
  *
- * They sit beside the spike (`archie-cedar-spike/policy/`) because that is where they were authored
- * and where they still are: the spike README's "Status" says adoption means moving them under
- * `agentcore-pi/permissions/`, but that instruction predates plan §2's revision. §2 moved the
- * COMPILED ROW out of the image entirely (to `AGENT#<scope>/POLICY` in DynamoDB) and states the
- * sources "stay in git and never enter the image" — so the argument for putting them inside an
- * image's COPY set has gone, and choosing their final home is a decision for whoever wires
- * `archie deploy --capabilities`, not for this loader to make by defaulting.
+ * They were authored beside the Cedar spike (`archie-cedar-spike/policy/`) and stayed there while their
+ * final home was undecided. Moved under `docker/` on 2026-08-18 for one concrete reason: `lib/digest.js`
+ * resolves every declared input relative to `docker/`, so anything above it CANNOT be an image input.
+ * While the sources sat outside:
  *
- * Every function here takes `dir`, so nothing depends on this default being the final answer.
+ *   * `--pure` passed with an uncommitted policy edit, so a release that claimed to be reproducible
+ *     was not — the one promise that flag exists to make;
+ *   * the dirty-tree warning could not mention a modified policy file; and
+ *   * generating anything FROM these sources into an image would have been unsafe, because an edit here
+ *     changed no image tag, so a stale generated file would ship silently under an unchanged tag.
+ *
+ * Teaching digest.js a second root was the alternative and is worse: its path vocabulary is
+ * `docker/`-relative throughout, including the `git status --show-prefix` mapping in modifiedInputs(),
+ * where the code already warns that two vocabularies mean "every modified file is silently discarded as
+ * not declared". One root, one vocabulary.
+ *
+ * They still do NOT enter either image — plan §2 keeps the sources in git and ships only the compiled
+ * row (to `AGENT#<scope>/POLICY`) plus the generated baseline. Being a declared INPUT is not the same as
+ * being COPYed, and policy-engine.test.js still asserts cedar-wasm reaches neither image.
+ *
+ * Every function here takes `dir`, so tests and future callers are not bound to this default.
  */
-const POLICY_DIR = path.resolve(DOCKER, '..', '..', '..', 'archie-cedar-spike', 'policy');
+const POLICY_DIR = path.resolve(DOCKER, 'policy');
 
 const SCHEMA_FILE = 'archie.cedarschema';
 const SEMANTICS_FILE = 'semantics.cedar';
