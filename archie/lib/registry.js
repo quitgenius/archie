@@ -47,6 +47,11 @@ const COMMANDS = {
   // item, `CONFIG#image / FLEET`, decides what the fleet runs, and the dispatcher reads that item on
   // the next turn. See lib/image-pointer.js for why the generation model was removed.
   'image publish': { options: {}, module: 'image', task: 'W2-B', needsAws: true, positional: 'tag', summary: 'move the fleet to a tag (THE only command that moves traffic)' },
+  // The policy layer. `publish` is the ONLY write; it takes no tag and no --env, because the pins file is
+  // selected by the caller's ACCOUNT — publishing one environment's pins into another silently revokes
+  // every capability the target's real scopes hold, and a flag would make that typeable (cmd/policy.js).
+  'policy publish': { options: {}, module: 'policy', task: 'W6-B', needsAws: true, summary: 'compile the Cedar sources and write the fleet artifact + per-scope verdict rows' },
+  'policy show': { options: {}, module: 'policy', task: 'W6-B', needsAws: true, summary: 'which policy digest the fleet is running, and whether it matches the sources on disk' },
   'image taint': { options: { reason:{type:'string'} }, module: 'image', task: 'W2-B', needsAws: true, positional: 'tag', summary: 'mark a tag permanently unpublishable; no untaint, no force' },
   'image show': { options: {}, module: 'image', task: 'W2-B', needsAws: true, positional: 'tag', summary: 'one tag: state, health, and every agent bound to it (defaults to live)' },
   'image list': { options: { limit:{type:'string'} }, module: 'image', task: 'W2-B', needsAws: true, summary: 'tags with bindings: coverage, health, which is live, which are rollback targets' },
