@@ -9,6 +9,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pca } from './pi-runtime.mjs';
 import { buildMemoryTools } from './memory-tool.mjs';
+import { buildKnowledgeTools } from './knowledge-tools.mjs';
 import { buildCronTools } from './cron-tool.mjs';
 import { buildOtelTools } from './otel-tool.mjs';
 import { buildDatadogTools } from './datadog-tool.mjs';
@@ -87,8 +88,14 @@ export function buildBuiltinTools(allow, cwd) {
 export function buildCustomTools(allow, cwd, ctx = {}) {
   // buildOtelTools takes no allow-set: the OTEL self-observability tools are fleet-wide +
   // always-on (every agent can introspect its own telemetry), gated only by OTEL_TOOLS_DISABLED.
+  //
+  // buildKnowledgeTools likewise takes no allow-set — sandbox, 2026-08-18: "I want all agents to have the
+  // hindsight read tools available". It is gated on CONFIG instead (`ctx.hindsight`): with no apiUrl or
+  // bankId it returns [], because four tools that can only throw are worse than none. pi-adapter passes
+  // the org-bank config it already resolves in initHindsight.
   return [
-    ...buildMemoryTools(allow, cwd), ...buildCronTools(allow, ctx), ...buildOtelTools(),
+    ...buildMemoryTools(allow, cwd), ...buildKnowledgeTools(ctx.hindsight || {}),
+    ...buildCronTools(allow, ctx), ...buildOtelTools(),
     ...buildDatadogTools(allow),
     // §7.3/7.4 ported AWS skills (grant-gated; each assumes a cross-account reader in-process).
     ...buildCloudwatchLogsTools(allow), ...buildPerson79b333SecretsTools(allow), ...buildAirflowTools(allow), ...buildAwsReadonlyTools(allow),

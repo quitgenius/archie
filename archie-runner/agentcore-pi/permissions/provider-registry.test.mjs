@@ -25,8 +25,12 @@ test('synthetic providers are DERIVED from the tools; baseline ones are mandator
     assert.equal(REG[cap].tools.has(tool), true, `${cap} provides ${tool}`);
     assert.equal(REG[cap].mandatory, isBaseline(cap), `${cap} mandatory==baseline`);
   }
-  // memory/cron/otel are the mandatory baseline synthetics
-  for (const c of ['memory', 'cron', 'otel']) assert.equal(REG[c].mandatory, true, c);
+  // memory/cron/otel/hindsight.read are the mandatory baseline synthetics. EXPLICIT, not derived: the
+  // assertion above (mandatory === isBaseline) is a tautology — it compares the implementation to itself
+  // and can never fail — so these lists are the only real guard on provider lifecycle. hindsight.read is
+  // here because sandbox asked for it to be unremovable (2026-08-18): a refactor that drops it from the
+  // baseline would silently make the knowledge provider optional, and this is what catches that.
+  for (const c of ['memory', 'cron', 'otel', 'hindsight.read']) assert.equal(REG[c].mandatory, true, c);
   // the grant-gated AWS ones are optional
   for (const c of ['datadog', 'cloudwatch-logs', 'aws-person79b333-secrets', 'airflow', 'aws-readonly']) {
     assert.equal(REG[c].mandatory, false, c);

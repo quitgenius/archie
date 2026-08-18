@@ -17,6 +17,7 @@
 // happens per session in pi-adapter with that agent's real allow-set, never through here.
 
 import { buildMemoryTools } from './memory-tool.mjs';
+import { buildKnowledgeTools } from './knowledge-tools.mjs';
 import { buildCronTools } from './cron-tool.mjs';
 import { buildOtelTools } from './otel-tool.mjs';
 import { buildDatadogTools } from './datadog-tool.mjs';
@@ -38,6 +39,9 @@ export function allCustomTools(cwd = '/tmp') {
   const allow = permissiveAllowSet();
   return [
     ...buildMemoryTools(allow, cwd),
+    // Config-gated rather than allow-gated (see buildKnowledgeTools): pass a stand-in apiUrl/bankId so
+    // the closure check sees all four. At runtime pi-adapter supplies the real org bank.
+    ...buildKnowledgeTools({ apiUrl: 'https://hindsight.invalid', bankId: 'closure-check' }),
     ...buildCronTools(allow),
     ...buildOtelTools(),
     ...buildDatadogTools(allow),

@@ -622,6 +622,11 @@ function buildCompatForSession(key, turnCtx) {
 // Build the Pi-native Hindsight recall extension once at boot (config-static). Org-bank
 // recall only (matches the @hindsight leg; agent-bank recall/retain is a later enhancement).
 // Reuses the real @vectorize-io/hindsight-client. No-op unless configured (apiUrl+orgBankId).
+// The org-bank config the agent_knowledge_* tools need, resolved once by initHindsight and read per
+// session by buildCustomTools. Empty until then, and empty forever on an unconfigured agent — which is
+// what makes buildKnowledgeTools return no tools rather than four that throw.
+let HINDSIGHT_TOOL_CFG = {};
+
 async function initHindsight() {
   const hs = PLUGIN_MANIFEST.hindsight;
   if (!hs) return;
@@ -646,6 +651,14 @@ async function initHindsight() {
     // move this to the per-session decider.
     const hindsightCan = makeCan(makeDecider({ grants: new Set(), onSignal: onPermissionSignal }), { agent: AGENT_NAME });
     HINDSIGHT_EXT_FACTORY = createHindsightExtension(recall, { orgBankId, orgOnly: true, preamble: c.recallPromptPreamble, logger: console, can: hindsightCan });
+    // The knowledge TOOLS are org-bank-scoped, mirroring the plugin's factory (index.ts:2887-2898):
+    // under orgOnly the bank is orgBankId and the url/token switch to the org ones when set. Unlike the
+    // recall HOOK, which merges org + agent results, a tool reads exactly one bank.
+    HINDSIGHT_TOOL_CFG = {
+      apiUrl: c.orgHindsightApiUrl || apiUrl,
+      apiToken: c.orgHindsightApiToken || c.hindsightApiToken || process.env.HINDSIGHT_API_TOKEN,
+      bankId: orgBankId,
+    };
     console.log(JSON.stringify({ level: 'info', component: 'pi-adapter', msg: 'hindsight recall enabled (Pi-native)', apiUrl, orgBankId }));
   } catch (e) {
     console.error(JSON.stringify({ level: 'warn', component: 'pi-adapter', msg: 'hindsight init failed', err: e?.message || String(e) }));
@@ -1014,7 +1027,7 @@ async function getSession(key, seed = {}) {
   // §12c: the LOGICAL key from the payload, NOT `key` (= AgentCore's sanitised runtimeSessionId).
   // Falls back to null rather than to `key`: a sanitised id would look like a session key while
   // being unparseable, which is worse than absent — the ladder can fall through cleanly on null.
-  const memoryTools = buildCustomTools(ALLOW, CWD, { sessionKey: seed.sessionKey ?? null });
+  const memoryTools = buildCustomTools(ALLOW, CWD, { sessionKey: seed.sessionKey ?? null, hindsight: HINDSIGHT_TOOL_CFG });
 
   // Per-turn mutable ctx (runId/sender), updated by the /invocations handler; read by the
   // compat hooks (connector externalUserId injection). SEEDED here (not just null) because the

@@ -54,6 +54,15 @@ export const CUSTOM_TOOLS = {
   memory_search: 'memory',
   memory_get: 'memory',
 
+  // knowledge-tools.mjs — the READ-ONLY Hindsight surface, ported from the Pelago hindsight fork's
+  // OpenClaw plugin (READ_ONLY_TOOL_NAMES). All four are reads and all ride baseline `hindsight.read`,
+  // so every agent has them with no grant. Writes (retain/delete/update) are deliberately absent —
+  // adding one needs `hindsight.write`, which is policy-pinned.
+  agent_knowledge_recall: 'hindsight.read',
+  agent_knowledge_list_documents: 'hindsight.read',
+  agent_knowledge_get_document: 'hindsight.read',
+  agent_knowledge_search_documents: 'hindsight.read',
+
   // cron-tool.mjs — baseline
   cron: 'cron',
 
@@ -118,6 +127,11 @@ export const PLUGIN_PROVIDERS = {
 export const PROVIDER_NAMES = new Set([
   'core',
   'memory', 'cron', 'otel', 'otel.fleet', 'datadog', 'cloudwatch-logs', 'aws-person79b333-secrets', 'airflow', 'aws-readonly', 'sandbox-probe',
+  // `hindsight.read` is a SYNTHETIC provider (the four agent_knowledge_* tools) and sits alongside the
+  // `hindsight` PLUGIN provider, which covers the same capability from the hook side (recall injection).
+  // Two providers for one capability is not a conflict here: they are different tool surfaces, and the
+  // registry's job is closure — every capability having a provider — not exclusivity.
+  'hindsight.read',
   'connector', 'demo-cache', 'mcp-auth', 'hindsight',
 ]);
 
