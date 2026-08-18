@@ -28,7 +28,10 @@ const COMMANDS = {
   // archie's own Slack app: live rolls measure ~118s of two overlapping Socket Mode connections and
   // zero downtime. A help line promising an outage that does not happen is how an operator learns to
   // discount the ones that do.
-  deploy: { options: { hotfix:{type:'boolean', 'skip-gc':{type:'boolean'}}, keep:{type:'string'}, 'skip-preflight':{type:'boolean'}, pure:{type:'boolean'}, 'agent-tag':{type:'string'}, 'gateway-tag':{type:'string'} }, top: true, module: 'deploy', task: 'W2-C', needsAws: true,
+  // `skip-gc` was NESTED INSIDE hotfix's descriptor here (and in `fleet deploy` below), so it was not a
+  // registered option at all — parseArgs runs strict, and cmd/fleet.js:233 reads a flag the parser would
+  // have rejected. Fixed 2026-08-18 in both places; a misplaced brace, not a decision.
+  deploy: { options: { hotfix:{type:'boolean'}, 'skip-gc':{type:'boolean'}, keep:{type:'string'}, 'skip-preflight':{type:'boolean'}, 'skip-policy':{type:'boolean'}, 'accept-policy-change':{type:'boolean'}, pure:{type:'boolean'}, 'agent-tag':{type:'string'}, 'gateway-tag':{type:'string'} }, top: true, module: 'deploy', task: 'W2-C', needsAws: true,
     summary: 'preflight, the agent half, then the gateway (rolling: an overlap, no outage; stop-then-start: a real gap)' },
   preflight: { options: { checks:{type:'string'}, skip:{type:'string'} }, top: true, module: 'preflight', task: 'W1-A', needsAws: true,
     summary: 'verify the target account has the infrastructure; never creates anything' },
@@ -67,7 +70,7 @@ const COMMANDS = {
   'fleet stage': { options: { tag:{type:'string'}, agents:{type:'string'}, concurrency:{type:'string'}, 'healthcheck-budget':{type:'string'} }, module: 'stage', task: 'W1-D', needsAws: true, summary: 'provision + healthcheck + bind every agent onto a tag' },
   'fleet healthcheck': { options: { tag:{type:'string'}, agent:{type:'string'}, budget:{type:'string'}, prompt:{type:'string'}, 'taint-on-failure':{type:'boolean'}, 'no-taint-on-failure':{type:'boolean'} }, module: 'healthcheck', task: 'W2-A', needsAws: true, summary: 'one real invoke against one agent; taints the TAG on failure' },
   'fleet verify': { options: { tag:{type:'string'}, agent:{type:'string'} }, module: 'fleet', task: 'W1-C', needsAws: true, summary: 'assert observed runtime config matches the spec this deployment derives' },
-  'fleet deploy': { options: { tag:{type:'string', 'skip-gc':{type:'boolean'}}, hotfix:{type:'boolean'}, canary:{type:'string'}, concurrency:{type:'string'}, keep:{type:'string'}, 'skip-build':{type:'boolean'}, pure:{type:'boolean'} }, module: 'fleet', task: 'W2-C', needsAws: true, summary: 'the agent half of a release, end to end (zero downtime)' },
+  'fleet deploy': { options: { tag:{type:'string'}, 'skip-gc':{type:'boolean'}, hotfix:{type:'boolean'}, canary:{type:'string'}, concurrency:{type:'string'}, keep:{type:'string'}, 'skip-build':{type:'boolean'}, pure:{type:'boolean'} }, module: 'fleet', task: 'W2-C', needsAws: true, summary: 'the agent half of a release, end to end (zero downtime)' },
   'fleet drift': { options: { fix:{type:'boolean'}, compare:{type:'string'} }, module: 'fleet', task: 'W2-C', needsAws: true, summary: 'derived spec vs what is running; an efsRoot change BLOCKS' },
   'fleet reconcile': { options: { daemon:{type:'boolean'}, concurrency:{type:'string'}, interval:{type:'string'} }, module: 'fleet', task: null, phase: 2, needsAws: true, summary: 'drain the provisioning queue and sweep for missing bindings' },
 

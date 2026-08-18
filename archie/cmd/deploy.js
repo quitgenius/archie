@@ -35,6 +35,7 @@ const { ROLLING } = require('../lib/task-definition');
 const fleetCmd = require('./fleet');
 const gatewayCmd = require('./gateway');
 const preflightCmd = require('./preflight');
+const policyCmd = require('./policy');
 
 const { runStep } = fleetCmd;
 
@@ -43,6 +44,7 @@ function stepsFor(deps = {}) {
   const s = deps.steps || {};
   return {
     assertBaseline: s.assertBaseline || preflightCmd.assertBaseline,
+    policyPublish: s.policyPublish || policyCmd['policy publish'],
     fleetDeploy: s.fleetDeploy || fleetCmd['fleet deploy'],
     gatewayBuild: s.gatewayBuild || gatewayCmd.build,
     gatewayDeploy: s.gatewayDeploy || gatewayCmd.deploy,
@@ -107,6 +109,45 @@ async function deploy(ctx, args, out, deps = {}) {
     const baseline = await steps.assertBaseline(ctx, { ...deps, out });
     result.preflight = { account: baseline.account, checks: (baseline.results || []).map((r) => ({ n: r.n, status: r.status })) };
     out.progress(`preflight   checks 1-2 pass (account ${baseline.account})`);
+  }
+
+  // ── 1.5 policy (plan §3, "step 0.5") ───────────────────────────────────────────────────────────
+  //
+  // BEFORE THE AGENT HALF, because the compiled verdict rows are PROVISION INPUTS: staging an agent onto a
+  // tag and then changing what it may do is two releases pretending to be one, and the window between them
+  // is a runtime serving turns under the old policy.
+  //
+  // Costs nothing when policy is unchanged — `policy publish` returns without writing when the stored rows
+  // already match the sources' digest, so this adds one GetItem per scope to a release that does not touch
+  // policy.
+  //
+  // Also called as a LIBRARY rather than by shelling out, for the same reason as preflight above: a deploy
+  // that spawned `archie policy publish` could pass it a flag that skipped the checks.
+  if (values['skip-policy']) {
+    out.warn('--skip-policy: the Cedar sources are NOT compiled, checked or published. Agents will be '
+      + 'staged against whatever verdict rows are already stored, which may predate this release.');
+  } else {
+    try {
+      const policy = await runStep(steps.policyPublish, ctx, {
+        positionals: [],
+        // Threaded through: a release that CHANGES a decision must be declared, exactly as a standalone
+        // publish must. Silently accepting on a deploy would make `archie deploy` the way to bypass check 7.
+        values: { 'accept-policy-change': values['accept-policy-change'] },
+      }, out, deps);
+      result.policy = policy.result || null;
+    } catch (e) {
+      // NO POLICY FOR THIS ACCOUNT IS NOT A FAILURE. A fresh sandbox has no pins.<env>.json declaring it,
+      // and the layer is additive — no artifact means every scope keeps pre-policy behaviour. Blocking a
+      // deploy on it would make policy a prerequisite for standing up an environment. Anything else
+      // (failed checks, an undeclared decision change) is rethrown and stops the release.
+      if (e && e.exitCode === EXIT.REFUSED && /no policy pins declare account/.test(e.message || '')) {
+        out.warn(`policy      skipped — ${e.message}. No verdict rows are managed in this account.`);
+      } else {
+        out.progress('agents      NOT TOUCHED — the policy step refused. Nothing was built, staged or rolled.');
+        publish(ctx, out, result, render);
+        throw e;
+      }
+    }
   }
 
   // ── 2. the agent half ──────────────────────────────────────────────────────────────────────────

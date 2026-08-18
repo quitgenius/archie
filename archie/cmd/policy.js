@@ -164,10 +164,26 @@ async function publish(ctx, args, out, deps = {}) {
     ...decisionLines,
   ];
 
+  // NOTHING TO DO. The plan requires this step to cost nothing when policy is unchanged, because it runs on
+  // EVERY `archie deploy` — at prod scale "write every row anyway" is ~220 PutItems per release to store
+  // bytes that already match. Both conditions are needed: the digest proves the sources have not moved, and
+  // zero changes proves no scope's decisions differ from what is stored. Digest alone would skip a deploy
+  // that must repair a row somebody edited by hand.
+  //
+  // COMPUTED BEFORE THE DRY-RUN BRANCH so `--dry-run` can say it truthfully. Reporting "would write 3 rows"
+  // when a real run writes nothing is exactly the kind of overstatement that makes people stop reading dry
+  // runs.
+  const liveDigest = Object.values(live).find(Boolean)?.policyDigest ?? null;
+  const unchanged = !changes.length && liveDigest === artifact.policyDigest && rows.every((r) => live[r.scope]);
+
   if (ctx.dryRun) {
-    out.progress(`would write ${POLICY_PK} / ${FLEET_SK} + ${rows.length} AGENT#<scope>/POLICY row(s)`);
-    answer(out, ctx, { env: sources.env, account, artifact, rows, changes, written: false, dryRun: true },
-      [...head, `written   nothing (dry run) — ${rows.length} row(s) + the fleet artifact would be written`].join('\n'));
+    out.progress(unchanged
+      ? `nothing to write — every row already matches ${artifact.policyDigest}`
+      : `would write ${POLICY_PK} / ${FLEET_SK} + ${rows.length} AGENT#<scope>/POLICY row(s)`);
+    answer(out, ctx, { env: sources.env, account, artifact, rows, changes, written: false, unchanged, dryRun: true },
+      [...head, unchanged
+        ? `written   nothing (dry run) — and nothing WOULD be written; already at ${artifact.policyDigest}`
+        : `written   nothing (dry run) — ${rows.length} row(s) + the fleet artifact would be written`].join('\n'));
     return undefined;
   }
 
@@ -181,6 +197,12 @@ async function publish(ctx, args, out, deps = {}) {
       detail: 're-run with --accept-policy-change to publish. Read the list above first: each changed '
         + 'decision grants or revokes a capability for a real scope on its next turn.',
     });
+  }
+
+  if (unchanged) {
+    answer(out, ctx, { env: sources.env, account, digest: artifact.policyDigest, rows: 0, written: false, unchanged: true },
+      [...head, `written   nothing — every row already matches ${artifact.policyDigest}`].join('\n'));
+    return undefined;
   }
 
   const at = nowIso(deps);

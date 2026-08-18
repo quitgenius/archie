@@ -74,6 +74,13 @@ function fakeSteps(over = {}) {
     assertBaseline: over.assertBaseline
       ? async (...a) => { calls.push({ name: 'assertBaseline' }); return over.assertBaseline(...a); }
       : async () => { calls.push({ name: 'assertBaseline' }); return { account: '203366135563', results: [{ n: 1, status: 'pass' }] }; },
+    // Stubbed like every other step, and it MUST be: without it stepsFor falls back to the real
+    // `policy publish`, which reads DynamoDB — the whole suite then fails on "Could not load credentials",
+    // which is how this was found. Default is the unchanged/no-op result a release that does not touch
+    // policy produces.
+    policyPublish: wrap('policyPublish', over.policyPublish || (async () => ({
+      env: 'sandbox', digest: 'sha256:policy', rows: 0, written: false, unchanged: true,
+    }))),
     fleetDeploy: wrap('fleetDeploy', over.fleetDeploy || (async () => ({
       generationId: 'gen-abc', mode: 'staged', stage: { coverage: 208, agents: 208 },
     }))),
@@ -100,7 +107,7 @@ const run = (values = {}, deps = {}, ctxOver = {}) => {
 test('preflight, then the agents, then the gateway', async () => {
   const s = fakeSteps();
   const { r } = await run({}, { steps: s.steps, digestFor: digestFor(NEW_TAG) });
-  assert.deepEqual(s.names(), ['assertBaseline', 'fleetDeploy', 'gatewayStatus', 'gatewayBuild', 'gatewayDeploy'],
+  assert.deepEqual(s.names(), ['assertBaseline', 'policyPublish', 'fleetDeploy', 'gatewayStatus', 'gatewayBuild', 'gatewayDeploy'],
     'agents first: a new gateway may reference a generation that must already be stageable (§2.27)');
   assert.equal(r.gatewayRolled, true);
   assert.equal(r.outageSeconds, 94, 'the gap is the one this run OBSERVED, not the one in the document');
@@ -122,6 +129,63 @@ test('a failing preflight stops before anything is built', async () => {
   assert.deepEqual(s.names(), ['assertBaseline']);
 });
 
+// ── 1.5 the policy step (plan §3) ────────────────────────────────────────────────────────────────
+
+test('policy runs BEFORE the agent half — the verdict rows are provision inputs', async () => {
+  // Order, not just presence. Staging agents onto a tag and THEN changing what they may do is two
+  // releases pretending to be one, with a window where runtimes serve turns under the old policy.
+  const s = fakeSteps();
+  await run({}, { steps: s.steps, digestFor: digestFor(RUNNING_TAG) });
+  const names = s.names();
+  assert.ok(names.indexOf('policyPublish') < names.indexOf('fleetDeploy'));
+});
+
+test('a REFUSED policy step stops the release before anything is built', async () => {
+  // Check 7 refusing (an undeclared decision change) or checks 1-4 failing must cost nothing: no image, no
+  // staging, no rollout. Otherwise the checks are advisory.
+  const s = fakeSteps({
+    policyPublish: async () => { throw Object.assign(new Error('1 decision(s) would change'), { exitCode: EXIT.REFUSED }); },
+  });
+  const out = fakeOut();
+  await assert.rejects(
+    () => deployCmd.deploy(ctxFor(), { positionals: [], values: {} }, out, { steps: s.steps, digestFor: digestFor(NEW_TAG) }),
+    (e) => e.exitCode === EXIT.REFUSED,
+  );
+  assert.deepEqual(s.names(), ['assertBaseline', 'policyPublish'], 'nothing after it ran');
+  assert.match(out.progressLines.join('\n'), /agents {6}NOT TOUCHED/);
+});
+
+test('an account with NO pins file is skipped, not blocked', async () => {
+  // A fresh sandbox has no pins.<env>.json declaring it, and the layer is additive — no artifact means
+  // every scope keeps pre-policy behaviour. Blocking here would make policy a prerequisite for standing up
+  // an environment. Distinguished from a real refusal by the message, so a failed CHECK still stops.
+  const s = fakeSteps({
+    policyPublish: async () => {
+      throw Object.assign(new Error('no policy pins declare account 543510375323'), { exitCode: EXIT.REFUSED });
+    },
+  });
+  const { r, out } = await run({}, { steps: s.steps, digestFor: digestFor(RUNNING_TAG) });
+  assert.match(out.warnings.join('\n'), /policy {6}skipped/);
+  assert.ok(s.names().includes('fleetDeploy'), 'the release continues');
+  assert.equal(r.policy, undefined);
+});
+
+test('--accept-policy-change is threaded through, not swallowed', async () => {
+  // Otherwise `archie deploy` becomes the way to bypass check 7: a release that changes a decision would
+  // publish it without anyone declaring the change.
+  const s = fakeSteps();
+  await run({ 'accept-policy-change': true }, { steps: s.steps, digestFor: digestFor(RUNNING_TAG) });
+  const call = s.calls.find((c) => c.name === 'policyPublish');
+  assert.equal(call.values['accept-policy-change'], true);
+});
+
+test('--skip-policy skips it and says what that costs', async () => {
+  const s = fakeSteps();
+  const { out } = await run({ 'skip-policy': true }, { steps: s.steps, digestFor: digestFor(RUNNING_TAG) });
+  assert.ok(!s.names().includes('policyPublish'));
+  assert.match(out.warnings.join('\n'), /NOT compiled, checked or published/);
+});
+
 // ── 2. blast radius ──────────────────────────────────────────────────────────────────────────────
 
 test('EXIT 4 from the agent half means the gateway was NEVER TOUCHED', async () => {
@@ -133,7 +197,7 @@ test('EXIT 4 from the agent half means the gateway was NEVER TOUCHED', async () 
     () => deployCmd.deploy(ctxFor(), { positionals: [], values: {} }, out, { steps: s.steps, digestFor: digestFor(NEW_TAG) }),
     (e) => e.exitCode === EXIT.TAINTED, 'the failing sub-step\'s code, unchanged (§2.27)',
   );
-  assert.deepEqual(s.names(), ['assertBaseline', 'fleetDeploy'],
+  assert.deepEqual(s.names(), ['assertBaseline', 'policyPublish', 'fleetDeploy'],
     'no gatewayStatus, no gatewayBuild, no gatewayDeploy — and therefore no ~94s outage');
   assert.match(out.progressLines.join('\n'), /gateway {5}NOT TOUCHED/);
 });
@@ -154,7 +218,7 @@ test('every agent-half exit code propagates unchanged', async () => {
 test('an unchanged gateway digest skips the gateway half ENTIRELY — no build, no roll, no outage', async () => {
   const s = fakeSteps({ runningTag: RUNNING_TAG });
   const { r, out } = await run({}, { steps: s.steps, digestFor: digestFor(RUNNING_TAG) });
-  assert.deepEqual(s.names(), ['assertBaseline', 'fleetDeploy', 'gatewayStatus']);
+  assert.deepEqual(s.names(), ['assertBaseline', 'policyPublish', 'fleetDeploy', 'gatewayStatus']);
   assert.equal(r.gatewaySkipped, true);
   assert.equal(r.gatewayRolled, false);
   assert.equal(r.outageSeconds, null);
