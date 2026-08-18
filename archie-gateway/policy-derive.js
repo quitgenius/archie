@@ -49,6 +49,9 @@ function rowFromMemberships(scope, artifact) {
     // `pin.<capability>` is the group naming contract (pins.<env>.json). A group not in that shape is a
     // data error, not something to skip: skipping would drop a capability from the row and turn a typo
     // into "not overridden", i.e. grantable.
+    // `skill.<id>` groups are the SKILL axis, handled below rather than as verdicts — a skill is not a
+    // capability and giving it a verdict would put it through the PEP, which gates tool calls.
+    if (group.startsWith('skill.')) continue;
     if (!group.startsWith('pin.')) throw new Error(`rowFromMemberships: unexpected group name ${group}`);
     const capability = group.slice('pin.'.length);
     verdicts[capability] = (Array.isArray(members) ? members : []).includes(scope) ? ALLOW : DENY;
@@ -59,6 +62,13 @@ function rowFromMemberships(scope, artifact) {
     policyDigest: artifact.policyDigest,
     scope,
     verdicts,
+    // The PINNED skills this scope may hold. Same membership derivation as the verdicts, from the same
+    // artifact — `skill.<id>` groups rather than `pin.<capability>` ones. Only pinned skills appear; an
+    // unpinned skill is not governed, and listing every skill would imply a gate that does not exist.
+    skills: Object.keys(groups)
+      .filter((g) => g.startsWith('skill.') && (groups[g] || []).includes(scope))
+      .map((g) => g.slice('skill.'.length))
+      .sort(),
   };
 }
 

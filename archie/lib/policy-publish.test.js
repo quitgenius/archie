@@ -21,9 +21,14 @@ test('the artifact carries memberships, a digest and the account — not verdict
   const a = artifactFor(SOURCES);
   assert.equal(a.policyDigest, SOURCES.digest);
   assert.equal(a.account, SOURCES.pins.account);
-  assert.equal(Object.keys(a.groups).length, 12, '12 pinned capabilities');
+  // 18 groups now: 12 `pin.<capability>` + 6 `skill.<id>` (seeded D3, 2026-08-18). Split by class rather
+  // than asserting one total, because the two are read by different consumers — the verdicts come from the
+  // pins, the row's `skills` list from the skill groups — and a change in either count should be legible.
+  const byClass = (p) => Object.keys(a.groups).filter((g) => g.startsWith(p));
+  assert.equal(byClass('pin.').length, 12, '12 pinned capabilities');
+  assert.equal(byClass('skill.').length, 6, '6 pinned skills');
   assert.ok(!('verdicts' in a), 'verdicts cannot be precomputed for scopes that do not exist yet');
-  for (const g of Object.keys(a.groups)) assert.match(g, /^pin\./, 'every group is pin.<capability>');
+  for (const g of Object.keys(a.groups)) assert.match(g, /^(pin|skill)\./, 'every group is pin.<capability> or skill.<id>');
   // Annotation keys are documentation and must not reach the fleet.
   assert.ok(!Object.keys(a.groups).some((k) => k.startsWith('$')), 'no $-annotations in the artifact');
 });

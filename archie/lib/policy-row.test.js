@@ -116,8 +116,13 @@ test('every scope carries exactly 12 entries, and the allows are exactly the mem
     for (const [scope, row] of rowsFor(scopes, sources)) {
       assert.deepEqual(Object.keys(row.verdicts).sort(), PINNED, `${sources.env} ${scope}`);
       const scopeAllows = Object.values(row.verdicts).filter((v) => v === VERDICT.ALLOW).length;
-      // One `allow` per group the scope is in, and nothing else — membership ⟺ access, exactly.
-      assert.equal(scopeAllows, (index.get(scope) || []).length, `${sources.env} ${scope}`);
+      // One `allow` per PIN group the scope is in, and nothing else — membership ⟺ access, exactly. The
+      // `skill.<id>` groups it may also belong to produce no verdict at all: they land in `row.skills`,
+      // because a skill is prose the model is given rather than a tool the PEP gates (D3, 2026-08-18).
+      const pinGroups = (index.get(scope) || []).filter((g) => g.startsWith('pin.'));
+      assert.equal(scopeAllows, pinGroups.length, `${sources.env} ${scope}`);
+      const skillGroups = (index.get(scope) || []).filter((g) => g.startsWith('skill.')).map((g) => g.slice(6));
+      assert.deepEqual(row.skills, skillGroups.sort(), `${sources.env} ${scope} skills`);
       allows += scopeAllows;
     }
     assert.equal(allows, sources.env === 'prod' ? 21 : 9);
@@ -160,7 +165,9 @@ test('pruning keeps exactly what the policy overrides — no baseline, no plain 
 
 test('the row envelope is the §1.1 contract, and refuses to be built without its assertions', () => {
   const row = rowFor(PEER, PROD);
-  assert.deepEqual(Object.keys(row), ['v', 'account', 'policyDigest', 'scope', 'verdicts']);
+  // `skills` is part of the envelope since D3: the runtime's skill filter needs the pinned skills this
+  // scope may hold, and it cannot evaluate policy to work them out.
+  assert.deepEqual(Object.keys(row), ['v', 'account', 'policyDigest', 'scope', 'verdicts', 'skills']);
   assert.equal(row.v, ROW_VERSION);
   assert.equal(row.account, '361364274007');
   assert.equal(row.policyDigest, PROD.digest);

@@ -253,7 +253,29 @@ function rowFor(scope, sources, ctx = null) {
   for (const capability of context.domain) {
     if (all[capability] !== ambientVerdict(capability, sources)) verdicts[capability] = all[capability];
   }
-  return { v: ROW_VERSION, account, policyDigest, scope, verdicts };
+  return { v: ROW_VERSION, account, policyDigest, scope, verdicts, skills: skillsFor(scope, sources) };
+}
+
+/**
+ * The PINNED skills this scope may hold — membership of `skill.<id>` in pins.<env>.json.
+ *
+ * NOT A CEDAR EVALUATION, and that is deliberate: Cedar here governs capabilities, and a skill is a
+ * different axis (prose the model is given, not a tool it may call). So this is the same membership
+ * derivation the verdicts use, expressed directly. It ships in the row because the runtime's skill filter
+ * needs it and cannot evaluate policy.
+ *
+ * ONLY PINNED SKILLS APPEAR. An unpinned skill is not governed at all, so listing every skill an agent has
+ * would make the row grow with the marketplace and imply a gate that does not exist. The filter treats
+ * "absent from this list" as "allowed" for unpinned skills — see skill-pins.isPinned.
+ */
+function skillsFor(scope, sources) {
+  const groups = (sources.pins && sources.pins.groups) || {};
+  const out = [];
+  for (const g of Object.keys(groups)) {
+    if (!g.startsWith('skill.')) continue;
+    if ((groups[g] || []).includes(scope)) out.push(g.slice('skill.'.length));
+  }
+  return out.sort();
 }
 
 /**

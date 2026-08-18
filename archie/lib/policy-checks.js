@@ -158,6 +158,13 @@ function checkBindings(sources, cedar = require('@cedar-policy/cedar-wasm/nodejs
     }
   }
   for (const g of [...inPins].sort()) {
+    // `skill.*` groups are EXEMPT, and the exemption is narrow on purpose. Cedar here governs
+    // CAPABILITIES; a skill is a different axis — prose the model is given, not a tool it may call — so
+    // these groups are compiled into the row's `skills` list by the same membership derivation as the
+    // verdicts and consumed by the runtime's skill filter, never by a Cedar statement. Without the
+    // exemption every seeded skill group reads as a dead group, which would train someone to delete the
+    // memberships that stop 146 holders losing their skills.
+    if (g.startsWith('skill.')) continue;
     if (!referenced.has(g)) {
       out.push(finding(3, `pins.${sources.env}.json defines "${g}" but no statement references it`, {
         detail: 'a dead group: its members hold nothing. Either a typo in the semantics, or a pin that was '

@@ -51,8 +51,8 @@ test('$-prefixed keys are annotation, and the filter is on the PREFIX not the ty
   const sandbox = loadPolicySources({ env: 'sandbox' });
 
   // 12 groups in each: 5 zero-holder pins + 7 seeded, one per pinned capability.
-  assert.equal(realKeys(prod.pins.groups).length, 12);
-  assert.equal(realKeys(sandbox.pins.groups).length, 12);
+  assert.equal(realKeys(prod.pins.groups).length, 18);
+  assert.equal(realKeys(sandbox.pins.groups).length, 18);
   assert.ok(!realKeys(prod.pins.groups).some((k) => k.startsWith('$')));
 
   // THE CASE A TYPE-BASED FILTER GETS WRONG. `$pin.aws-readonly` is a bare STRING in prod and an

@@ -20,7 +20,11 @@ const { EXIT } = require('./exit');
 const PROD = loadPolicySources({ env: 'prod' });
 const SANDBOX = loadPolicySources({ env: 'sandbox' });
 
-/** A prod scope in exactly one group — agent-kehypz's DM, pins.prod.json:86-87. */
+/**
+ * agent-kehypz's DM. In `pin.aws-readonly` and, since the skill lists were seeded (D3, 2026-08-18), also in
+ * `skill.demo-crm` — so it is now the useful case for BOTH group classes landing on one Scope
+ * entity's parents rather than "a scope in exactly one group", which it used to be.
+ */
 const MEMBER = 'dm-udbugah9aty';
 /** agent-k4wmx6's DM, in six of the seven seeded groups — pins.prod.json records this as correct. */
 const PEER = 'dm-umrsp7355u7';
@@ -94,12 +98,21 @@ test('a capGroup member with no capability entity refuses loudly', () => {
   assert.equal(codeOf(() => capGroupParents(broken)), EXIT.PREFLIGHT);
 });
 
-test('the ScopeGroup vocabulary is the 12 pins, in both environments', () => {
-  const expected = [
+test('the ScopeGroup vocabulary is the 12 pins PLUS the 6 skill groups, in both environments', () => {
+  // Two classes now (D3, 2026-08-18): `pin.<capability>` groups, which Cedar statements reference, and
+  // `skill.<id>` groups, which no statement references — they are compiled into the row's `skills` list and
+  // consumed by the runtime's skill filter. Both are ScopeGroups because both are per-environment scope
+  // membership; the difference is who reads them, and check 3 exempts the skill prefix for that reason.
+  const pins = [
     'pin.airflow', 'pin.aws-person79b333-secrets', 'pin.aws-readonly', 'pin.cloudwatch-logs',
     'pin.datadog', 'pin.demo_diagram_app', 'pin.hindsight.write', 'pin.demo_notes_app', 'pin.otel.fleet',
     'pin.demo_cache', 'pin.sandbox-probe', 'pin.demo_mail_app',
   ];
+  const skills = [
+    'skill.comms-approval', 'skill.demo-crm', 'skill.sales-reengagement-briefing',
+    'skill.skill-builder', 'skill.support-member-update', 'skill.demo-sensitive-skill',
+  ];
+  const expected = [...pins, ...skills].sort();
   assert.deepEqual(scopeGroupNames(PROD), expected);
   assert.deepEqual(scopeGroupNames(SANDBOX), expected);
   assert.deepEqual(scopeGroupEntities(PROD).map((e) => e.uid.id), expected);
@@ -108,29 +121,49 @@ test('the ScopeGroup vocabulary is the 12 pins, in both environments', () => {
 
 test('membership is the Scope entity\'s parents, and an unnamed scope simply has none', () => {
   const index = membershipIndex(PROD);
-  // 21 memberships over 14 distinct scopes. agent-k4wmx6 legitimately appears in six groups.
-  assert.equal([...index.values()].reduce((n, g) => n + g.length, 0), 21);
-  assert.equal(index.size, 14);
-  assert.deepEqual(groupsFor(MEMBER, PROD), ['pin.aws-readonly']);
-  assert.equal(groupsFor(PEER, PROD).length, 6);
+  // COUNTS INCLUDE THE SEEDED SKILL GROUPS (D3, 2026-08-18): 21 capability pins + 145 skill memberships.
+  // Before seeding this was 21 over many scopes; the skill lists are what stop 146 holders losing a skill on
+  // their next turn once the filter ships, so their size IS the point rather than incidental.
+  const pinOnly = (g) => g.startsWith('pin.');
+  const pinMemberships = [...index.values()].reduce((n, g) => n + g.filter(pinOnly).length, 0);
+  assert.equal(pinMemberships, 21, 'the capability pins are unchanged by the skill seeding');
+  assert.equal([...index.values()].reduce((n, g) => n + g.length, 0), 21 + 145);
+  assert.deepEqual(groupsFor(MEMBER, PROD).filter(pinOnly), ['pin.aws-readonly']);
+  assert.equal(groupsFor(PEER, PROD).filter(pinOnly).length, 6);
 
-  assert.deepEqual(scopeEntity(MEMBER, PROD).parents, [uid(TYPE.scopeGroup, 'pin.aws-readonly')]);
-  // NOT an error and NOT a missing entry — the ordinary case for 199 of prod's many scopes.
+  // BOTH classes, on one entity, in the order groupsFor returns them. Cedar does not distinguish them —
+  // membership is membership — which is exactly why the SKILL axis had to stay out of the verdicts rather
+  // than out of the entity set.
+  assert.deepEqual(scopeEntity(MEMBER, PROD).parents,
+    [uid(TYPE.scopeGroup, 'pin.aws-readonly'), uid(TYPE.scopeGroup, 'skill.demo-crm')]);
+  // NOT an error and NOT a missing entry — the ordinary case for a scope in no group at all. Note that is
+  // now a much smaller share of prod than it was: the seeded skill lists put many scopes in
+  // skill.demo-crm alone, so the membership index covers 137 of many scopes rather than 14.
   assert.deepEqual(scopeEntity(UNSEEN, PROD), { uid: uid(TYPE.scope, UNSEEN), attrs: {}, parents: [] });
 
   // The sandbox differs sharply and legitimately: 9 memberships over 3 scopes, five of them the
   // zero-holder pins aimed at one channel (pins.sandbox.json:55-59) that prod deliberately keeps empty.
   const sandboxIndex = membershipIndex(SANDBOX);
-  assert.equal([...sandboxIndex.values()].reduce((n, g) => n + g.length, 0), 9);
+  const sandboxPins = [...sandboxIndex.values()].reduce((n, g) => n + g.filter(pinOnly).length, 0);
+  assert.equal(sandboxPins, 9);
+  // +1: ch-c66pp782t9k holds skill-builder, the sandbox's single pinned-skill holder and the one scope the
+  // filter would otherwise strip on its next turn.
+  assert.equal([...sandboxIndex.values()].reduce((n, g) => n + g.length, 0), 10);
   assert.equal(sandboxIndex.size, 3);
-  assert.equal(groupsFor('ch-cr89fluhion', SANDBOX).length, 5);
+  assert.equal(membershipIndex(PROD).size, 137, 'prod: 14 pin-only scopes + the seeded skill holders');
+  assert.equal(groupsFor('ch-cr89fluhion', SANDBOX).filter(pinOnly).length, 5);
+  assert.deepEqual(groupsFor('ch-c66pp782t9k', SANDBOX).filter((g) => !pinOnly(g)), ['skill.skill-builder']);
 
   assert.equal(codeOf(() => groupsFor('', PROD)), EXIT.USAGE);
 });
 
 test('entitiesFor is the shared set plus exactly one principal', () => {
   const shared = sharedEntities(PROD);
-  assert.equal(shared.length, 31 + 2 + 12);
+  // 31 capabilities + 2 CapGroups + 18 ScopeGroups (12 pin + 6 skill, seeded 2026-08-18). The skill groups
+  // get entities like any other ScopeGroup even though no Cedar statement references them: the entity set is
+  // vocabulary, and omitting them would make a Scope's `parents` name a group that does not exist — which
+  // spike README §5 records as a dangling parent that still ALLOWS, i.e. fails OPEN.
+  assert.equal(shared.length, 31 + 2 + 18);
   const all = entitiesFor(MEMBER, PROD);
   assert.equal(all.length, shared.length + 1);
   assert.equal(all[all.length - 1].uid.id, MEMBER);
