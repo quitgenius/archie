@@ -184,6 +184,48 @@ test('check 8: a forbid reaching an UNREMOVABLE capability is fatal — the rule
   assert.deepEqual(checkBaseline(ok, caps).filter((f) => f.fatal), [], 'an ordinary forbid is not obstructed');
 });
 
+// ── check 9: the policy against the LIVE fleet ───────────────────────────────────────────────────────
+
+test('check 9: a live holder outside its allow-list is a STRIP, and fatal', () => {
+  // The rot this exists for: pins.<env>.json is hand-authored and nothing refreshes it, so a skill installed
+  // in sandra since it was written reaches the fleet through hydration and the policy never learns. Once the
+  // filter is live that holder loses the skill on its next turn — silently, because a skill's absence from
+  // the prompt has no failure surface.
+  const { checkSkillHolders } = require('./policy-checks');
+  const governed = ['demo-crm', 'skill-builder'];
+  const holders = { 'skill-builder': ['ch-c66pp782t9k', 'dm-unknown-newcomer'] };
+  const fatal = checkSkillHolders(SANDBOX, holders, governed).filter((f) => f.fatal);
+  assert.equal(fatal.length, 1);
+  assert.match(fatal[0].message, /1 live holder\(s\) of 'skill-builder' are not in skill\.skill-builder/);
+  assert.match(fatal[0].detail, /dm-unknown-newcomer/, 'names WHO loses the skill');
+});
+
+test('check 9: the seeded holder passes — the sandbox\'s real state', () => {
+  // ch-c66pp782t9k holds skill-builder live and is in pins.sandbox.json's skill.skill-builder, which is what
+  // makes shipping the filter a no-op for the only scope it could affect today.
+  const { checkSkillHolders } = require('./policy-checks');
+  const fatal = checkSkillHolders(SANDBOX, { 'skill-builder': ['ch-c66pp782t9k'] }, ['skill-builder']).filter((f) => f.fatal);
+  assert.deepEqual(fatal, []);
+});
+
+test('check 9: an allow-list entry that holds nothing is a WARNING, not a strip', () => {
+  // Harmless — it permits something nobody does — and it is the normal state right after an uninstall. Fatal
+  // here would make routine uninstalls block releases.
+  const { checkSkillHolders } = require('./policy-checks');
+  const findings = checkSkillHolders(SANDBOX, { 'skill-builder': [] }, ['skill-builder']);
+  assert.deepEqual(findings.filter((f) => f.fatal), []);
+  assert.ok(findings.some((f) => !f.fatal && /do not hold 'skill-builder'/.test(f.message)));
+});
+
+test('check 9: a skill with no group at all still checks its holders', () => {
+  // `governed` is passed separately so a pinned skill whose group was deleted outright does not become
+  // unchecked — deleting the group is the most complete way to strip everyone.
+  const { checkSkillHolders } = require('./policy-checks');
+  const bare = { ...SANDBOX, pins: { ...SANDBOX.pins, groups: {} } };
+  const fatal = checkSkillHolders(bare, { 'skill-builder': ['ch-c66pp782t9k'] }, ['skill-builder']).filter((f) => f.fatal);
+  assert.equal(fatal.length, 1, 'no group means nobody is allowed, so every holder is a strip');
+});
+
 test('the shipped sources pass every check, in both environments', async () => {
   for (const s of [SANDBOX, PROD]) {
     const caps = await capabilityUniverse(s);

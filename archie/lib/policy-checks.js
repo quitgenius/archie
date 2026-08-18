@@ -340,6 +340,54 @@ function checkBaseline(sources, caps, cedar = require('@cedar-policy/cedar-wasm/
 }
 
 /**
+ * CHECK 9 — does every LIVE holder of a pinned skill appear in that skill's allow-list?
+ *
+ * THE ROT THIS CATCHES. `pins.<env>.json` is hand-authored and nothing refreshes it: its skill groups were
+ * derived from sandra once, by hand. So a new install of a pinned skill in sandra reaches the fleet through
+ * hydration and the policy never learns about it — and once the LLM-facing filter is live, that agent loses
+ * the skill on its NEXT TURN, silently, because a skill's absence from the prompt has no failure surface.
+ * extract.mjs's inventory reports the same facts but is report-only and runs somewhere the environment is
+ * unknown; this runs where it IS known and can stop the release.
+ *
+ * SCOPE-KEYED ON BOTH SIDES, which is what makes the comparison valid — the R12 lesson applied. `holders`
+ * comes from live `AGENT#<scope>/MARKETPLACE` items, so it speaks scope ids, and so do the pins. Passing an
+ * agent-name-keyed map here would report every holder as missing.
+ *
+ * @param holders {skillId: [scopeId]} live holders of PINNED skills only
+ * @param governed the pinned skill ids (so a skill with no group at all is still checked)
+ */
+function checkSkillHolders(sources, holders, governed) {
+  const out = [];
+  const groups = (sources.pins || {}).groups || {};
+  for (const skill of governed) {
+    const allowed = new Set(groups[`skill.${skill}`] || []);
+    const missing = (holders[skill] || []).filter((s) => !allowed.has(s)).sort();
+    if (missing.length) {
+      out.push(finding(9, `${missing.length} live holder(s) of '${skill}' are not in skill.${skill}`, {
+        detail: `${missing.slice(0, 6).join(', ')}${missing.length > 6 ? `, … (+${missing.length - 6})` : ''}`
+          + ' — each loses the skill on its next turn once the filter is live, with no error anywhere. Either '
+          + `add them to skill.${skill} in pins.${sources.env}.json, or accept the strip deliberately.`,
+      }));
+    }
+  }
+  // The reverse is a WARNING: a scope in an allow-list that does not hold the skill is harmless (it permits
+  // something nobody is doing) and is the normal state right after someone uninstalls.
+  for (const g of Object.keys(groups)) {
+    if (!g.startsWith('skill.')) continue;
+    const skill = g.slice('skill.'.length);
+    const live = new Set(holders[skill] || []);
+    const stale = (groups[g] || []).filter((s) => !live.has(s));
+    if (stale.length) {
+      out.push(finding(9, `${stale.length} scope(s) in ${g} do not hold '${skill}'`, {
+        fatal: false, detail: 'harmless — it permits something nobody does — but it is how an allow-list '
+          + 'drifts into meaninglessness. Usually an uninstall.',
+      }));
+    }
+  }
+  return out;
+}
+
+/**
  * CHECK 7 — does this policy change any DECISION, for any scope?
  *
  * The check that earns the engine. A policy diff is not a text diff: reordering statements, renaming a
@@ -447,6 +495,7 @@ function readMcpPrefixes(dir) {
 }
 
 module.exports = {
-  checkValidates, checkCompleteness, checkBindings, checkMembership, checkBaseline, immutableCaps, diffDecisions,
+  checkValidates, checkCompleteness, checkBindings, checkMembership, checkBaseline, checkSkillHolders,
+  immutableCaps, diffDecisions,
   runSourceChecks, capabilityUniverse, verdictsFor, realKeys, capGroupNames,
 };

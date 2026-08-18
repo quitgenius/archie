@@ -19,7 +19,7 @@ const { CliError, EXIT, usage, refused, preflight } = require('../lib/exit');
 const { clientsFor, resolveAccount } = require('../lib/spec');
 const { loadPolicySources, availableEnvs } = require('../lib/policy-sources');
 const { plan } = require('../lib/policy-publish');
-const { runSourceChecks, capabilityUniverse, diffDecisions } = require('../lib/policy-checks');
+const { runSourceChecks, capabilityUniverse, diffDecisions, checkSkillHolders } = require('../lib/policy-checks');
 const codegen = require('../lib/policy-codegen');
 const { scanBindings } = require('../lib/bindings');
 const { collectFromDdb } = require('../../archie-gateway/routing-build');
@@ -105,6 +105,44 @@ async function readLiveRows(aws, ctx, scopes) {
   return out;
 }
 
+/**
+ * Live holders of PINNED skills, keyed by skill, scope-keyed on the values.
+ *
+ * Reads `AGENT#<scope>/MARKETPLACE` items — the same items the runtime reads — so this compares the policy
+ * against what the fleet ACTUALLY has rather than against items/, which is an extract of sandra and can
+ * describe a different fleet entirely (measured: items/marketplace held 153 production agents while
+ * items/routing held 3 sandbox ones).
+ *
+ * Both install shapes are handled for the same reason skill-pins.pinnedHoldings does: sandra nests an object
+ * per skill, our items key by id, and a reader that handled one would silently report no holders.
+ */
+async function liveSkillHolders(aws, ctx, governed) {
+  const schema = await import(`file://${require.resolve('../../archie-runner/config-resolver/schema.mjs')}`);
+  const doc = aws.doc();
+  const { ScanCommand } = aws.docCmds;
+  const governedSet = new Set(governed);
+  const holders = {};
+  let key;
+  do {
+    // eslint-disable-next-line no-await-in-loop
+    const r = await doc.send(new ScanCommand({
+      TableName: ctx.resources.configTable,
+      FilterExpression: 'sk = :sk',
+      ExpressionAttributeValues: { ':sk': 'MARKETPLACE' },
+      ExclusiveStartKey: key,
+    }));
+    for (const item of r.Items || []) {
+      const scope = String(item.pk || '').replace(/^AGENT#/, '');
+      let installs = {};
+      try { installs = (JSON.parse(item.data || '{}') || {}).installs || {}; } catch { continue; }
+      const ids = Array.isArray(installs) ? installs : Object.keys(installs);
+      for (const id of ids) if (governedSet.has(id)) (holders[id] = holders[id] || []).push(scope);
+    }
+    key = r.LastEvaluatedKey;
+  } while (key);
+  return holders;
+}
+
 async function publish(ctx, args, out, deps = {}) {
   const values = (args && args.values) || {};
   const aws = clientsFor(ctx, deps);
@@ -133,6 +171,20 @@ async function publish(ctx, args, out, deps = {}) {
       detail: 'nothing was written. Fix the sources — these are the checks that turn a silently-denying '
         + 'policy into a stopped deploy.',
     });
+  }
+
+  // CHECK 9 — the policy against the LIVE fleet, not against the sources. `pins.<env>.json` is
+  // hand-authored and nothing refreshes it, so a skill installed in sandra since it was written reaches the
+  // fleet through hydration and the policy never learns about it. Once the filter is live that holder loses
+  // the skill on its next turn, silently. This is the only check that can see that, because it is the only
+  // one that reads what the fleet actually has.
+  const governedSkills = Object.keys(sources.pins.groups || {})
+    .filter((g) => g.startsWith('skill.')).map((g) => g.slice('skill.'.length));
+  let skillFindings = [];
+  if (governedSkills.length) {
+    const holders = deps.skillHolders || await liveSkillHolders(aws, ctx, governedSkills);
+    skillFindings = checkSkillHolders(sources, holders, governedSkills);
+    for (const f of skillFindings) out.progress(`check ${f.check}  ${f.fatal ? 'STRIP' : 'warn'}  ${f.message}${f.detail ? `\n            ${f.detail}` : ''}`);
   }
 
   // THE GATE (check 6). plan() runs assertDerivationMatchesCedar over every scope, so a policy the
@@ -192,11 +244,18 @@ async function publish(ctx, args, out, deps = {}) {
   // revokes a capability from eight scopes must not be indistinguishable, at the moment of publishing,
   // from a comment-only edit. Placed after the dry-run branch on purpose — `--dry-run` is how you look
   // before deciding, so it must never refuse.
-  if (changes.length && !values['accept-policy-change']) {
+  // FOLDED INTO CHECK 7'S ACCEPTANCE rather than given its own flag: a silent skill strip IS a decision
+  // change, and one flag that means "I have read what this release changes about what agents may do" is
+  // better than two an operator has to learn the difference between.
+  const strips = skillFindings.filter((f) => f.fatal);
+  if ((changes.length || strips.length) && !values['accept-policy-change']) {
     answer(out, ctx, { env: sources.env, account, changes, written: false, refused: true }, head.join('\n'));
-    throw refused(`${changes.length} decision(s) would change for ${new Set(changes.map((c) => c.scope)).size} scope(s)`, {
-      detail: 're-run with --accept-policy-change to publish. Read the list above first: each changed '
-        + 'decision grants or revokes a capability for a real scope on its next turn.',
+    throw refused(`${changes.length} decision(s) would change for ${new Set(changes.map((c) => c.scope)).size} scope(s)`
+      + (strips.length ? `, and ${strips.length} pinned skill(s) would be STRIPPED from live holders` : ''), {
+      detail: 're-run with --accept-policy-change to publish, having read the list above. A changed decision '
+        + 'grants or revokes a CAPABILITY for a real scope on its next turn; a STRIP removes a pinned SKILL '
+        + 'from a live holder, which has no failure surface at all — the prose simply stops being in the '
+        + 'prompt and the agent quietly stops doing something it used to do.',
     });
   }
 
