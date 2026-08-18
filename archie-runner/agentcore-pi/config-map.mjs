@@ -13,6 +13,7 @@ import path from 'node:path';
 import { pca } from './pi-runtime.mjs';
 import { buildMemoryTools } from './memory-tool.mjs';
 import { buildKnowledgeTools } from './knowledge-tools.mjs';
+import { buildKnowledgeWriteTools } from './knowledge-write-tools.mjs';
 import { buildCronTools } from './cron-tool.mjs';
 import { buildOtelTools } from './otel-tool.mjs';
 import { buildDatadogTools } from './datadog-tool.mjs';
@@ -99,6 +100,11 @@ export function buildCustomTools(allow, cwd, ctx = {}) {
   // the org-bank config it already resolves in initHindsight.
   return [
     ...buildMemoryTools(allow, cwd), ...buildKnowledgeTools(ctx.hindsight || {}),
+    // The write-side knowledge tools. Config-gated like the reads (no apiUrl/bankId → []), but NOT
+    // baseline: every one declares `capability: 'hindsight.write'`, which is policy-pinned, so
+    // applyToolFilter drops them from the model's surface for any scope whose verdict is not `allow` and
+    // the tool_call PEP denies a call that arrives anyway.
+    ...buildKnowledgeWriteTools(ctx.hindsight || {}),
     ...buildCronTools(allow, ctx), ...buildOtelTools(),
     ...buildDatadogTools(allow),
     // §7.3/7.4 ported AWS skills (grant-gated; each assumes a cross-account reader in-process).

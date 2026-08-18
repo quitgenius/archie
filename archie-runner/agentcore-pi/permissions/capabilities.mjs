@@ -9,6 +9,17 @@
 // Enforcement is ON from day one — the migration seeds grants from config (see config-resolver/
 // caps-from-config.mjs), so legitimate usage is pre-granted; a deny at runtime is a real block.
 
+// The only import here, and it is safe for the reason provider-registry.mjs relies on: tool-declarations
+// is itself import-free, so pulling it in does not drag the Pi harness into a module the DISPATCHER also
+// loads (grants.js:150). Derived rather than re-listed — a second hand-written list of write tool names is
+// exactly the mirror that drifts, and drifting here means a write tool silently classified as a baseline
+// read.
+import { CUSTOM_TOOLS } from '../tool-declarations.mjs';
+
+const HINDSIGHT_WRITE_TOOLS = new Set(
+  Object.entries(CUSTOM_TOOLS).filter(([, cap]) => cap === 'hindsight.write').map(([name]) => name),
+);
+
 export const CAPABILITY_DEFAULTS = {
   'fs.read': 'allow',
   memory: 'allow',
@@ -62,20 +73,22 @@ export function makeCapabilityResolver({ mcpPrefixes = [], toolCaps = {} } = {})
     // tools, and connector_* plugin helpers.
     if (n.startsWith('CONNECTOR_') || n.startsWith('mcp_connector') || n.startsWith('connector_')) return 'connector';
     if (n.startsWith('demo_cache')) return 'demo_cache';
-    // HINDSIGHT KNOWLEDGE TOOLS → hindsight.read, which is baseline, so these are ambient for every
-    // agent with no grant and no config signal. All three are reads: recall, search, fetch-by-id.
-    // `hindsight.write` is NOT reachable this way — retain is a hook, not a tool, and the write
-    // capability is policy-pinned.
+    // HINDSIGHT KNOWLEDGE TOOLS. The prefix is SPLIT ACROSS TWO CAPABILITIES and the write side must be
+    // listed FIRST, because a single `agent_knowledge_*` → hindsight.read rule would classify
+    // agent_x0y8qlge, delete_page and ingest as BASELINE — ambient for every agent in the fleet, with the policy pin
+    // bypassed entirely. That is the most dangerous possible failure of this function, so the write names
+    // are enumerated explicitly rather than pattern-matched: a new write tool that someone forgets to add
+    // here falls through to `hindsight.read` and is silently ambient, whereas a new READ tool that is
+    // missed merely lands on hindsight.read, which is where it belongs anyway. The asymmetry decides the
+    // order.
     //
-    // DEFENSIVE UNDER PI, and worth saying so rather than implying it fixes a live denial. The three
-    // names are in ALWAYS_ALLOW (config-resolver/boot-config.mjs:155) so every agent carries the
-    // TOKENS, but archie's hindsight is the native hooks-only extension (hindsight-extension.mjs;
-    // PLUGIN_PROVIDERS.hindsight is kind:'plugin-hooks') and BASE_PLUGINS' load.paths carries only
-    // mcp-auth, connector-session and slack-reply — so no tool by these names is built under Pi and
-    // nothing currently reaches this branch. It exists so that if a hindsight tool provider is ever
-    // added (or an OpenClaw compat path used), these resolve correctly instead of falling to
-    // 'unknown' → deny. boot-config.mjs:154's claim that "hindsight IS loaded and does provide them"
-    // describes OpenClaw, not archie.
+    // The four read tools (recall + the three document tools) ARE built under Pi now
+    // (knowledge-tools.mjs) and ride baseline hindsight.read per sandbox, 2026-08-18: "I want all agents to
+    // have the hindsight read tools available". The seven write-side tools (knowledge-write-tools.mjs)
+    // carry hindsight.write, which is policy-pinned — including list_pages/get_page/reflect, which are
+    // reads but which OpenClaw bundles with the writes; see that module's header for why the bundle is
+    // kept whole.
+    if (HINDSIGHT_WRITE_TOOLS.has(n)) return 'hindsight.write';
     if (n.startsWith('agent_knowledge_')) return 'hindsight.read';
     for (const { p, cap } of prefixCaps) if (n.startsWith(p)) return cap; // demo_query_app__…, demo_warehouse__…, demo_diagram_app__…
     return 'unknown'; // → policyFor('unknown') → '*' → deny (fail-closed)

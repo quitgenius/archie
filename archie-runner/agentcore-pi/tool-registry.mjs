@@ -18,6 +18,7 @@
 
 import { buildMemoryTools } from './memory-tool.mjs';
 import { buildKnowledgeTools } from './knowledge-tools.mjs';
+import { buildKnowledgeWriteTools } from './knowledge-write-tools.mjs';
 import { buildCronTools } from './cron-tool.mjs';
 import { buildOtelTools } from './otel-tool.mjs';
 import { buildDatadogTools } from './datadog-tool.mjs';
@@ -42,6 +43,9 @@ export function allCustomTools(cwd = '/tmp') {
     // Config-gated rather than allow-gated (see buildKnowledgeTools): pass a stand-in apiUrl/bankId so
     // the closure check sees all four. At runtime pi-adapter supplies the real org bank.
     ...buildKnowledgeTools({ apiUrl: 'https://hindsight.invalid', bankId: 'closure-check' }),
+    // Same invalid-but-present config: both knowledge factories are CONFIG-gated, so the closure check has
+    // to supply something or the tools are simply absent and the declarations look like drift.
+    ...buildKnowledgeWriteTools({ apiUrl: 'https://hindsight.invalid', bankId: 'closure-check' }),
     ...buildCronTools(allow),
     ...buildOtelTools(),
     ...buildDatadogTools(allow),

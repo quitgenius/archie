@@ -56,12 +56,27 @@ export const CUSTOM_TOOLS = {
 
   // knowledge-tools.mjs — the READ-ONLY Hindsight surface, ported from the Pelago hindsight fork's
   // OpenClaw plugin (READ_ONLY_TOOL_NAMES). All four are reads and all ride baseline `hindsight.read`,
-  // so every agent has them with no grant. Writes (retain/delete/update) are deliberately absent —
-  // adding one needs `hindsight.write`, which is policy-pinned.
+  // so every agent has them with no grant.
   agent_knowledge_recall: 'hindsight.read',
   agent_knowledge_list_documents: 'hindsight.read',
   agent_knowledge_get_document: 'hindsight.read',
   agent_knowledge_search_documents: 'hindsight.read',
+
+  // knowledge-write-tools.mjs — the rest of the SDK's set (TOOL_NAMES minus recall), all on
+  // `hindsight.write`, which is POLICY-PINNED: no grant row can confer it, only membership of
+  // pin.hindsight.write.
+  //
+  // THREE OF THESE ARE READS (list_pages, get_page, reflect) and still carry the write capability,
+  // because OpenClaw registers the whole set behind one flag and the read-only bundle deliberately omits
+  // the page surface. Splitting them would widen every agent in the fleet' access to consolidated pages, which is a
+  // bigger change than porting the writes — see knowledge-write-tools.mjs's header.
+  agent_knowledge_list_pages: 'hindsight.write',
+  agent_knowledge_get_page: 'hindsight.write',
+  agent_knowledge_agent_x0y8qlge: 'hindsight.write',
+  agent_knowledge_update_page: 'hindsight.write',
+  agent_knowledge_delete_page: 'hindsight.write',
+  agent_knowledge_reflect: 'hindsight.write',
+  agent_knowledge_ingest: 'hindsight.write',
 
   // cron-tool.mjs — baseline
   cron: 'cron',
@@ -132,6 +147,11 @@ export const PROVIDER_NAMES = new Set([
   // Two providers for one capability is not a conflict here: they are different tool surfaces, and the
   // registry's job is closure — every capability having a provider — not exclusivity.
   'hindsight.read',
+  // `hindsight.write` is the SDK's page/ingest/reflect surface (knowledge-write-tools.mjs). A synthetic
+  // provider like hindsight.read, and it needs to be here for the same reason: provider-registry's closure
+  // check requires every capability that has tools to have a provider, and a capability with tools and no
+  // provider is a tool the dispatcher cannot describe or grant against.
+  'hindsight.write',
   'connector', 'demo-cache', 'mcp-auth', 'hindsight',
 ]);
 
