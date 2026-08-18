@@ -17,7 +17,8 @@ import { selectAgent, resolveModelSpec, resolveAllowedTools, buildBuiltinTools, 
 import { buildCompatPlugins, prewarmCompatPlugins } from './openclaw-compat/plugin-host.mjs';
 import { createHindsightExtension } from './hindsight-extension.mjs';
 import { createClockExtension } from './clock-extension.mjs';
-import { makeCapabilityResolver, makeDecider, makeAllowCheck } from './permissions/capabilities.mjs';
+import { makeCapabilityResolver, makeDecider, makeAllowCheck, policyRef } from './permissions/capabilities.mjs';
+import { loadPolicyTable, policyTableRequired } from './permissions/policy-table.mjs';
 import { createPermissionsExtension, makeCan } from './permissions/permissions-extension.mjs';
 import { applyToolFilter } from './permissions/tool-filter.mjs';
 import { buildProviderRegistry, checkClosure } from './permissions/provider-registry.mjs';
@@ -119,6 +120,18 @@ async function refreshAwsEnvCreds() {
 
 const PORT = Number(process.env.AGENTCORE_ADAPTER_PORT || process.env.PORT || 8080);
 const AGENT_NAME = process.env.AGENT_NAME || 'pi-agent';
+// The account a POLICY row must claim to have been compiled for (§1.1), guarding a sandbox-compiled row
+// reaching a prod runtime or the reverse.
+//
+// UNSET TODAY, and that is a considered trade rather than an omission. §1.1 specifies asserting against
+// sts:GetCallerIdentity at boot; the cheaper form would be a new env var, but `runtimeEnv` is
+// fingerprinted into the runtime NAME (see schema.mjs agentPolicyKey), so adding one renames all ~220
+// runtimes — a full fleet re-provision to enable a defence-in-depth check. The primary guard is
+// deploy-side, where the materialiser knows its target account for free and check 4 validates every pin
+// against that environment's scope list. With this null, loadPolicyTable RECORDS the skip rather than
+// treating it as a pass. Setting it (accepting the one-time roll, or on the next roll for another
+// reason) turns the assertion on with no other change.
+const EXPECTED_ACCOUNT = process.env.AGENTCORE_ACCOUNT_ID || null;
 // OpenClaw stores sessions.json `sessionFile` as an ABSOLUTE path under its home
 // (observed: <OPENCLAW_HOME>/.openclaw/agents/<agent>/sessions/<file>). On a rollback to
 // the ECS gateway, OpenClaw opens the stored path as-is, so Pi writes the same absolute
@@ -155,6 +168,12 @@ function onPermissionSignal(sig) {
       _aws: { Timestamp: Date.now(), CloudWatchMetrics: [{ Namespace: 'AgentCore/Pi', Dimensions: [['Agent'], []],
         Metrics: denied ? [{ Name: 'ToolCall', Unit: 'Count' }, { Name: 'ToolDenied', Unit: 'Count' }] : [{ Name: 'ToolCall', Unit: 'Count' }] }] },
       Agent: AGENT_NAME, capability: sig.capability, decision: sig.decision,
+      // WHY, not just what. 'ambient' | 'granted' | 'ungranted' | 'pinned' | 'policy-denied' |
+      // 'policy-unusable'. Without it a policy pin and a missing grant are the same log line with
+      // opposite fixes, and 'policy-unusable' — a row that was written but failed validation, so the
+      // scope is denying everything — is otherwise indistinguishable from an agent nobody granted
+      // anything to. That one should page.
+      ...(sig.reason ? { reason: sig.reason } : {}),
       ...(sig.tool ? { tool: sig.tool } : {}), ...(sig.channel ? { channel: sig.channel } : {}), ...(sig.surface ? { surface: sig.surface } : {}),
       // The connector action the call executes (GMAIL_SEND_EMAIL, SLACK_SEND_MESSAGE, …). A PROPERTY,
       // never a Dimension: dimensions multiply the metric's cardinality by every slug in every
@@ -480,7 +499,11 @@ let MODEL;
 let ALLOW = new Set(); // resolved tool allow-set (config-driven); empty = bare (no tools)
 let PLUGIN_MANIFEST = { hindsight: null, compat: [], skipped: [] }; // config-driven plugin routing
 let SKILL_PATHS = []; // Pi skill roots — set by hydrateSkills to [SKILLS_DIR] (/tmp, per-agent installs)
-let HINDSIGHT_EXT_FACTORY = null; // built once at boot (config-static recall client)
+// The recall client is config-static and built once at boot; the EXTENSION around it is built per
+// session, because its capability gate must close over that session's live grants and verdict table
+// (R11 — see initHindsight). Null until initHindsight succeeds, and hindsight stays off if it does not.
+let HINDSIGHT_RECALL = null;
+let HINDSIGHT_EXT_OPTS = null;
 let MCP_PREFIXES = []; // this agent's connector.extraMcpServers[].toolPrefix (e.g. ['demo_query_app','demo_warehouse'])
 let PROVIDER_REGISTRY = null; // §8 provider manifest, memoized (tool set is agent-invariant)
 // §8.6: the capability resolver is built PER SESSION from the registered tools' declared caps
@@ -645,12 +668,19 @@ async function initHindsight() {
       maxTokens: c.orgRecallMaxTokens ?? c.recallMaxTokens, budget: c.orgRecallBudget ?? c.recallBudget,
       types: c.orgRecallTypes ?? c.recallTypes, timeoutMs: c.recallTimeoutMs, logger: console,
     });
-    // Gate hindsight by capability: read (context injection) = baseline-allow; write (agent_end
-    // retain) = default-deny. Boot-level can with empty grants is correct today (retain is a
-    // disabled stub and no channel is granted hindsight.write); per-channel hindsight.write would
-    // move this to the per-session decider.
-    const hindsightCan = makeCan(makeDecider({ grants: new Set(), onSignal: onPermissionSignal }), { agent: AGENT_NAME });
-    HINDSIGHT_EXT_FACTORY = createHindsightExtension(recall, { orgBankId, orgOnly: true, preamble: c.recallPromptPreamble, logger: console, can: hindsightCan });
+    // Gate hindsight by capability: read (context injection) = hindsight.read, baseline-allow; write
+    // (agent_end retain) = hindsight.write, default-deny and policy-pinned.
+    //
+    // R11 — THE `can` IS BUILT PER SESSION, NOT HERE, and this used to be the opposite. The old code
+    // built one decider at boot over `new Set()`, i.e. over grants that were empty by construction and
+    // never refreshed. Its comment called that "correct today", which held only while retain was a
+    // disabled stub: the moment hindsight.write becomes reachable, a boot-level decider can observe
+    // NEITHER a grant row NOR a policy verdict, so the gate would deny for every scope, forever, and
+    // look like a missing grant. This init runs once per runtime and has no channel, so there is no
+    // live permission state it could legitimately read — the deps are stashed and the extension is
+    // built in getSession, where `decide` closes over the live grants Set and policy holder.
+    HINDSIGHT_RECALL = recall;
+    HINDSIGHT_EXT_OPTS = { orgBankId, orgOnly: true, preamble: c.recallPromptPreamble, logger: console };
     // The knowledge TOOLS are org-bank-scoped, mirroring the plugin's factory (index.ts:2887-2898):
     // under orgOnly the bank is orgBankId and the url/token switch to the org ones when set. Unlike the
     // recall HOOK, which merges org + agent results, a tool reads exactly one bank.
@@ -774,6 +804,10 @@ async function ddbIO() {
       if (channel) add(await get(schema.agentGrantKey(AGENT_NAME, channel)));
       return caps;
     },
+    // The compiled Cedar verdict row for this scope (§1.1). Returns the raw body — validation is
+    // policy-table.mjs's job, deliberately kept out of the IO layer so it is unit-testable without a
+    // DynamoDB client. `null` here means the item does not exist, which is NOT the same as invalid.
+    readPolicy: async () => schema.readData(await get(schema.agentPolicyKey(AGENT_NAME))) || null,
     // The item resolve-boot builds this agent's config from. Read per turn purely to FINGERPRINT it
     // (see readConfigState) — the resolution itself stays in resolve-boot.
     //
@@ -815,6 +849,37 @@ async function loadGrants(channel) {
     console.error(JSON.stringify({ level: 'warn', component: 'pi-adapter', msg: 'grant load failed — baseline-only (fail-closed)', channel, err: e.message }));
     return new Set();
   }
+}
+
+// Load and validate this scope's compiled verdict table (§1.1). Read on the SAME cadence as grants,
+// because a pin edit must take effect as fast as a grant does.
+//
+// FAILURE DIRECTIONS, which are not symmetric and must not be made so:
+//   * read THREW (DDB outage) → deny-all. Same posture as loadGrants returning an empty Set: an outage
+//     in the store that holds the permissions must never widen what an agent may do. Stricter than
+//     grants, though, because a table is authoritative — an empty grant set still leaves baseline, a
+//     deny-all table leaves nothing, so an outage here is a hard stop and should be alarmed.
+//   * row ABSENT → null, meaning "behave exactly as before this layer existed". Every scope is in this
+//     state until the first policy deploy reaches it. Permissive by design, and the reason
+//     POLICY_TABLE_REQUIRED exists to close it once the fleet is materialised.
+async function loadPolicy() {
+  const onProblem = (why, detail) => console.error(JSON.stringify({
+    level: why === 'absent' ? 'info' : 'error', component: 'pi-adapter',
+    msg: 'policy_table', why, agent: AGENT_NAME, ...detail,
+  }));
+  let row;
+  try {
+    row = await (await ddbIO()).readPolicy();
+  } catch (e) {
+    onProblem('read-failed', { err: e.message });
+    return { verdictFor: () => 'deny', digest: null, denyAll: true, why: 'read-failed' };
+  }
+  const table = loadPolicyTable(row, { scope: AGENT_NAME, expectedAccount: EXPECTED_ACCOUNT, onProblem });
+  if (table === null && policyTableRequired()) {
+    onProblem('absent-but-required', {});
+    return { verdictFor: () => 'deny', digest: null, denyAll: true, why: 'absent-but-required' };
+  }
+  return table;
 }
 
 function ensureEfsReady() {
@@ -1044,12 +1109,16 @@ async function getSession(key, seed = {}) {
   // channelOf). Fall back to `key` for callers that pass the logical key directly (cron/tests).
   const channel = channelOf(seed.sessionKey || key);
   const grants = await loadGrants(channel);
-  const decide = makeDecider({ grants, onSignal: onPermissionSignal });
+  // The compiled Cedar verdicts, in a mutable holder for exactly the reason `grants` is a mutable Set:
+  // the decider and the filter close over this one reference and applyFilter refreshes it per turn, so a
+  // pin edit lands on the next turn even on a warm session.
+  const policy = policyRef(await loadPolicy());
+  const decide = makeDecider({ grants, policy, onSignal: onPermissionSignal });
   // turnStartedAtMs: the clock the model is shown for THIS turn (clock-extension). Stamped
   // per turn by the handler; seeded here so a turn that somehow skips the refresh still gets
   // a real time rather than none.
   const turnCtx = { runId: seed.runId ?? null, sender: seed.sender ?? null, trigger: seed.trigger ?? 'user', channel, agent: AGENT_NAME, turnStartedAtMs: Date.now() };
-  const allows = makeAllowCheck({ grants });
+  const allows = makeAllowCheck({ grants, policy });
   // LOGICAL key, not the sanitised runtime session id. `key` has been through agentcoreSessionId,
   // which replaces every non-[A-Za-z0-9_-] char with '-', so `slack:thread:D0…:172…` arrives as
   // `ac-slack-thread-D0…-172…`. connector-session-plugin's resolveEntityId keys entirely off the
@@ -1079,7 +1148,15 @@ async function getSession(key, seed = {}) {
   // PEP first: gate every tool_call by capability before the compat/hindsight extensions run.
   extensionFactories.push(createPermissionsExtension({ capabilityOf, decide, turnCtx }));
   if (compatExt) extensionFactories.push(compatExt);
-  if (HINDSIGHT_EXT_FACTORY) extensionFactories.push(HINDSIGHT_EXT_FACTORY);
+  // R11: build the hindsight extension HERE so its gate uses this session's decider — the same `decide`
+  // the tool_call hook uses, closing over the live grants Set and the mutable policy holder. So a
+  // hindsight.write pin (or a grant) takes effect on the next turn, and a recall denial appears in
+  // permission_decision with the same `reason` vocabulary as every other capability check.
+  if (HINDSIGHT_RECALL) {
+    extensionFactories.push(createHindsightExtension(HINDSIGHT_RECALL, {
+      ...HINDSIGHT_EXT_OPTS, can: makeCan(decide, { agent: AGENT_NAME, channel, surface: 'hindsight' }),
+    }));
+  }
   // Clock LAST: hindsight extracts its recall query from the last user message, so it must
   // read the human's text before we append the <current_time> block to it. Reads the
   // turn-stable timestamp off turnCtx (prompt-cache stability across tool-loop steps).
@@ -1103,6 +1180,14 @@ async function getSession(key, seed = {}) {
     } catch (e) {
       console.error(JSON.stringify({ level: 'warn', component: 'pi-adapter', msg: 'per-turn grant refresh failed — keeping last-known', channel, err: e?.message || String(e) }));
     }
+    // …and the verdict table on the same cadence, so a policy edit propagates as fast as a grant.
+    //
+    // NOT the keep-last-known treatment the grants get above, and the asymmetry is deliberate: on a
+    // transient error loadPolicy returns a deny-all table, so a store outage stops the agent rather than
+    // leaving it running on verdicts that may since have been revoked. Grants can afford to be sticky
+    // because they only ever ADD capability over baseline; the table is authoritative in both
+    // directions, so stale-but-permissive is the one state it must not hold.
+    policy.table = await loadPolicy();
     applyToolFilter(session, { capabilityOf, allows, turnCtx });
   };
   const entry = { session, turnCtx, skillFp: skill.fp, configFp: cfg.fp, sm, applyFilter }; // sm kept for P6 session-shape metrics (in-memory entries)

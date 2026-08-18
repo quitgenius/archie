@@ -82,23 +82,64 @@ export function makeCapabilityResolver({ mcpPrefixes = [], toolCaps = {} } = {})
   };
 }
 
+// THE ONE RESOLUTION RULE, shared by the filter and the decider so they cannot drift apart.
+//
+// `table` is the compiled Cedar verdict row (permissions/policy-table.mjs) or null when this scope has
+// none yet. With null this is byte-for-byte the pre-policy rule, which is what makes the layer additive
+// and the Phase 0 baseline meaningful.
+//
+// Order matters: the TABLE is consulted first and wins outright. A `deny` there beats a grant row — that
+// is what "policy-pinned" means, and it is the whole reason the row carries explicit denies instead of
+// leaving non-members absent (see policy-table.mjs).
+//
+// `reason` exists because "deny" alone is unactionable. A capability denied by a PIN and one merely
+// not granted are the same word in the log but opposite fixes — grant the second, edit the policy for
+// the first — and without this field the only way to tell them apart is to go and read the policy.
+/** @returns {{allowed: boolean, reason: string}} */
+function resolve(capability, grants, table) {
+  const v = table ? table.verdictFor(capability) : undefined;
+  if (v === 'allow') return { allowed: true, reason: 'pinned' };
+  if (v === 'deny') return { allowed: false, reason: table.denyAll ? 'policy-unusable' : 'policy-denied' };
+  if (v === 'grant') {
+    return grants.has(capability) ? { allowed: true, reason: 'granted' } : { allowed: false, reason: 'ungranted' };
+  }
+  // No verdict for this capability: today's rule. Either it is baseline (ambient for everyone) or it
+  // needs a grant row.
+  if (policyFor(capability) === 'allow') return { allowed: true, reason: 'ambient' };
+  return grants.has(capability) ? { allowed: true, reason: 'granted' } : { allowed: false, reason: 'ungranted' };
+}
+
+// A MUTABLE HOLDER for the verdict table, for the same reason `grants` is a live mutable Set: the
+// decider and the tool-filter both close over one reference at session build, and the handler refreshes
+// it per turn so a policy change takes effect on the NEXT turn with no session rebuild or restart —
+// including on a warm session, which reuses the same closure. Capturing the table BY VALUE here would
+// pin every warm session to whatever the policy said when it was created, and a revoked pin would keep
+// working for as long as the session stayed cached. Callers that never refresh (tests, one-shot checks)
+// can just pass `{ table }`.
+export const policyRef = (table = null) => ({ table });
+
 // Silent allow-check (no telemetry) for the tool-list FILTER — restricting which tools the model
-// sees must not emit per-tool ToolCall signals every turn (those count real calls). Same policy as
-// decide(): baseline-allow OR granted.
-export function makeAllowCheck({ grants }) {
-  return (capability) => policyFor(capability) === 'allow' || grants.has(capability);
+// sees must not emit per-tool ToolCall signals every turn (those count real calls). Same rule as
+// decide() via `resolve`, so a pinned-away capability disappears from the tool surface rather than
+// being offered and then refused mid-turn.
+export function makeAllowCheck({ grants, policy = policyRef() }) {
+  return (capability) => resolve(capability, grants, policy.table).allowed;
 }
 
 /**
  * The shared PEP decision, used by the tool_call hook AND the hindsight hooks.
  * @param grants   Set<string> — the channel's EFFECTIVE grants (baseline is applied here too)
+ * @param policy   {table} holder — the compiled verdict table, or {table:null} when this scope has none
  * @param onSignal (record) => void — telemetry sink (OTEL); never throws
  * @returns decide(capability, ctx) → boolean (allowed)
  */
-export function makeDecider({ grants, onSignal = () => {} }) {
+export function makeDecider({ grants, policy = policyRef(), onSignal = () => {} }) {
   return function decide(capability, ctx = {}) {
-    const allowed = policyFor(capability) === 'allow' || grants.has(capability);
-    try { onSignal({ ...ctx, capability, decision: allowed ? 'allow' : 'deny', baseline: isBaseline(capability) }); } catch { /* telemetry never fails a turn */ }
+    const { allowed, reason } = resolve(capability, grants, policy.table);
+    // `baseline` used to be computed here and was never emitted — onPermissionSignal dropped it, so it
+    // has been dead since it was written. `reason` replaces it and IS emitted; it strictly subsumes it
+    // (baseline ⟺ reason === 'ambient').
+    try { onSignal({ ...ctx, capability, decision: allowed ? 'allow' : 'deny', reason }); } catch { /* telemetry never fails a turn */ }
     return allowed;
   };
 }
