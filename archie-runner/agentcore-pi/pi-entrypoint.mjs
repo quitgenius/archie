@@ -5,7 +5,7 @@
 // AgentCore health-check restart loop.
 
 import { execFileSync } from 'node:child_process';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { collectInsecureHosts, installScopedTlsBypass } from './tls-scoped.mjs';
 
@@ -106,6 +106,36 @@ async function bootConfig() {
   log({ level: 'info', msg: 'openclaw.json resolved from DDB', path: CONFIG_JSON, table: process.env.AGENT_CONFIG_TABLE });
   phase('config_generated');
   // Skills + workspace seed happen in the adapter (ensureEfsReady) once EFS is mounted (§9).
+}
+
+/**
+ * Is `tool` in this agent's resolved allow-set, per the openclaw.json resolve-boot just wrote?
+ *
+ * MUST be called after resolveConfig(). Before it the file does not exist and this returns false,
+ * which is the safe direction for its one caller (skip a secret fetch) but would silently disable any
+ * future caller that reads it as "not allowed" rather than "not yet known".
+ *
+ * `agents.list` is a SINGLE-element list here — resolve-boot writes `list: [agent]` for this agent
+ * alone (resolve-boot.mjs:127) — so there is no agent selection to get wrong, unlike the adapter's
+ * selectAgent which handles the multi-agent config shape.
+ *
+ * Deliberately NOT importing config-map's resolveAllowedTools: that module pulls in the Pi runtime
+ * (`pca`), which would move a multi-megabyte import onto the pre-adapter boot path to answer a
+ * one-token question. Group expansion is not needed either — GROUPS holds only `group:*` keys
+ * (config-map.mjs:41-45), and every capability-bearing token like `datadog` is a leaf. A `group:`
+ * argument would therefore be wrong here, so it is rejected loudly rather than quietly missing.
+ */
+function agentAllowsTool(tool) {
+  if (String(tool).startsWith('group:')) throw new Error(`agentAllowsTool: expects a leaf tool token, got ${tool}`);
+  try {
+    const cfg = JSON.parse(readFileSync(CONFIG_JSON, 'utf8'));
+    const agent = (cfg?.agents?.list || [])[0];
+    return (agent?.tools?.alsoAllow || []).includes(tool);
+  } catch {
+    // No config, unreadable, or unparseable — the adapter is about to fail loudly on the same file, so
+    // do not add a second confusing error here. Answer "not allowed" and let it report.
+    return false;
+  }
 }
 
 
@@ -251,17 +281,36 @@ async function main() {
   // Datadog REST creds for the `datadog` tool (ported from the shell datadog-logs skill). Shared
   // org-wide demo-service creds (NOT per-agent, unlike connector). Resolve from Secrets Manager; without
   // them the tool degrades gracefully (returns a "not configured" result rather than failing).
+  //
+  // ONLY IF THIS AGENT IS ALLOWED THE TOOL. `DATADOG_*_KEY_SECRET` is set on every runtime because
+  // runtimeEnv is fleet-uniform, but the SECRET is readable only by a role whose agent holds the
+  // `datadog` capability — the derived role grants secretsmanager:GetSecretValue per capability. So on
+  // every other agent this fetch was a guaranteed AccessDenied, twice, on every cold boot: two
+  // warn-level lines describing a permission the agent is correctly not supposed to have. Verified on
+  // ch-cr89fluhion 2026-08-18.
+  //
+  // That is worse than noise. It trains a reader to skim boot warnings, and it hides the case that
+  // MATTERS — a granted agent that cannot read the secret, which is a real misconfiguration and which
+  // still logs here.
+  //
+  // WHY THE ALLOW-SET AND NOT THE GRANT ROW: gating on env (i.e. having the dispatcher omit the
+  // secret id for ungranted agents) would put a grant in `runtimeEnv`, which is fingerprinted into the
+  // runtime NAME — so adding a datadog grant would force a runtime roll, destroying the property that
+  // grants apply live on the next turn with no restart. The resolved allow-set is the same information
+  // one layer down, and it costs nothing: resolve-boot has already written it.
   const ddRegion = process.env.DATADOG_KEY_SECRET_REGION;
-  for (const [secretEnv, keyEnv, label] of [
-    ['DATADOG_API_KEY_SECRET', 'DATADOG_API_KEY', 'DATADOG_API_KEY'],
-    ['DATADOG_APP_KEY_SECRET', 'DATADOG_APP_KEY', 'DATADOG_APP_KEY'],
-  ]) {
-    const secretId = process.env[secretEnv];
-    if (secretId && !process.env[keyEnv]) {
-      try {
-        const v = await fetchSecret(secretId, ddRegion);
-        if (v) { process.env[keyEnv] = v; log({ level: 'info', msg: `${label} resolved from Secrets Manager`, fp: await fingerprint(v) }); }
-      } catch (e) { log({ level: 'warn', msg: `${label} fetch failed`, err: e.message }); }
+  if (agentAllowsTool('datadog')) {
+    for (const [secretEnv, keyEnv, label] of [
+      ['DATADOG_API_KEY_SECRET', 'DATADOG_API_KEY', 'DATADOG_API_KEY'],
+      ['DATADOG_APP_KEY_SECRET', 'DATADOG_APP_KEY', 'DATADOG_APP_KEY'],
+    ]) {
+      const secretId = process.env[secretEnv];
+      if (secretId && !process.env[keyEnv]) {
+        try {
+          const v = await fetchSecret(secretId, ddRegion);
+          if (v) { process.env[keyEnv] = v; log({ level: 'info', msg: `${label} resolved from Secrets Manager`, fp: await fingerprint(v) }); }
+        } catch (e) { log({ level: 'warn', msg: `${label} fetch failed`, err: e.message }); }
+      }
     }
   }
 
