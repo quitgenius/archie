@@ -385,18 +385,29 @@ async function seedCmd(ctx, args, out, deps = {}) {
   // ground-truth/<id>.json has the per-agent PLUGIN config (hindsight's enableKnowledgeTools). Both are
   // gitignored build output, so a stale or missing one narrows coverage — reported, never silently empty.
   const CR = require('node:path').dirname(require.resolve('../../archie-runner/config-resolver/rekey-to-scope.mjs'));
+  // `--agent <scope>` derives ONE scope's membership and leaves every other member of every group exactly
+  // as it was. Not a display filter: the derivation itself is restricted, and the merge is per-scope
+  // (mergeGroupsForAgent) — running the fleet-wide merge over a one-agent derivation would rewrite
+  // skill.demo-crm from 135 members to none and call it a clean diff.
+  const only = values.agent || null;
   const derived = await seed.deriveSkillGroups(sandra, pinnedSkills, {
     pinnedCaps,
+    only,
     itemsDir: require('node:path').join(CR, 'items'),
     groundTruthDir: require('node:path').join(CR, 'ground-truth'),
   });
-  const { merged, withheld } = seed.mergeGroups(sources.pins.groups, derived.groups);
+  const { merged, withheld } = only
+    ? { merged: seed.mergeGroupsForAgent(sources.pins.groups, derived.groups, only), withheld: [] }
+    : seed.mergeGroups(sources.pins.groups, derived.groups);
   const changes = seed.diffGroups(sources.pins.groups, merged);
   const cov = derived.coverage;
 
   const lines = [
     `env       ${env}  (pins.${env}.json)`,
     `sandra    ${sandra}`,
+    ...(only ? [`scope     ${only}  — ONLY this scope is derived; every other member of every group is left`
+      + ' untouched. pin.* still never loses a member (a manual grant has no config signal); skill.* can,'
+      + ' for this scope only.'] : []),
     `fleet     ${derived.routed} routed agent(s); ${cov.installs} in marketplace-installs, `
       + `${cov.codeSkills} with code-declared skills, ${cov.config} with config, ${cov.pluginSignals} with plugin signals`,
   ];

@@ -55,7 +55,7 @@ const COMMANDS = {
   // every capability the target's real scopes hold, and a flag would make that typeable (cmd/policy.js).
   'policy publish': { options: { 'accept-policy-change': { type: 'boolean' } }, module: 'policy', task: 'W6-B', needsAws: true, summary: 'compile the Cedar sources and write the fleet artifact + per-scope verdict rows' },
   'policy codegen': { options: { env:{type:'string'} }, module: 'policy', task: 'W6-B', needsAws: false, summary: 're-render the generated baseline module from the Cedar policy (commit the result)' },
-  'policy seed': { options: { env:{type:'string'}, sandra:{type:'string'}, file:{type:'string'} }, module: 'policy', task: 'W6-B', needsAws: false, dryRunDefault: true, summary: 'derive a pins file\'s SKILL allow-lists from a sandra checkout (deliberate seed/re-baseline, never automatic)' },
+  'policy seed': { options: { env:{type:'string'}, sandra:{type:'string'}, file:{type:'string'}, agent:{type:'string'} }, module: 'policy', task: 'W6-B', needsAws: false, dryRunDefault: true, summary: 'derive a pins file\'s SKILL allow-lists from a sandra checkout (deliberate seed/re-baseline, never automatic)' },
   'policy show': { options: {}, module: 'policy', task: 'W6-B', needsAws: true, summary: 'which policy digest the fleet is running, and whether it matches the sources on disk' },
   'image taint': { options: { reason:{type:'string'} }, module: 'image', task: 'W2-B', needsAws: true, positional: 'tag', summary: 'mark a tag permanently unpublishable; no untaint, no force' },
   'image show': { options: {}, module: 'image', task: 'W2-B', needsAws: true, positional: 'tag', summary: 'one tag: state, health, and every agent bound to it (defaults to live)' },
