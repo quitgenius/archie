@@ -121,15 +121,35 @@ test('the ScopeGroup vocabulary is the 12 pins PLUS the 6 skill groups, in both 
 
 test('membership is the Scope entity\'s parents, and an unnamed scope simply has none', () => {
   const index = membershipIndex(PROD);
-  // COUNTS INCLUDE THE SEEDED SKILL GROUPS (D3, 2026-08-18): 21 capability pins + 145 skill memberships.
-  // Before seeding this was 21 over many scopes; the skill lists are what stop 146 holders losing a skill on
-  // their next turn once the filter ships, so their size IS the point rather than incidental.
+  // 29 capability pins + 147 skill memberships.
+  //
+  // THIS COUNT WAS 21 + 145 AND BOTH WERE UNDER-COUNTS, which is the more useful thing for this test to
+  // record than the number itself. The derivation read `config/marketplace-installs.json` only, and sandra
+  // declares a pinned authority on THREE surfaces — that file, each agent's `skills: [...]` in
+  // openclaw.config.js, and the resolved per-agent plugin config. `person79b333`, `archie-data-engineer` and
+  // `agent-zxgm7w` are absent from the installs file entirely, so:
+  //
+  //   pin.aws-readonly        2 → 7   five prod scopes would have LOST aws-readonly on publish
+  //   pin.cloudwatch-logs     3 → 4   sona-support, via its datadog-logs skill
+  //   pin.aws-person79b333-secrets  0 → 1   person79b333
+  //   pin.hindsight.write     0 → 1   agent-zxgm7w (`enableKnowledgeTools`, plugin config)
+  //   skill.support-member-update / skill.demo-sensitive-skill  0 → 1 each  (agent-ykdenu)
+  //
+  // An under-counted pin group is SILENT — membership ⟺ access, so the only symptom is less access than
+  // intended — which is why the assertion below is paired with the per-group trace above rather than left as
+  // a bare total. The previous message on this line read "the capability pins are unchanged by the skill
+  // seeding": true of the code at the time, and the reason nobody looked.
   const pinOnly = (g) => g.startsWith('pin.');
   const pinMemberships = [...index.values()].reduce((n, g) => n + g.filter(pinOnly).length, 0);
-  assert.equal(pinMemberships, 21, 'the capability pins are unchanged by the skill seeding');
-  assert.equal([...index.values()].reduce((n, g) => n + g.length, 0), 21 + 145);
+  assert.equal(pinMemberships, 29, 'capability pins are derived from all three surfaces, additively');
+  assert.equal([...index.values()].reduce((n, g) => n + g.length, 0), 29 + 147);
   assert.deepEqual(groupsFor(MEMBER, PROD).filter(pinOnly), ['pin.aws-readonly']);
-  assert.equal(groupsFor(PEER, PROD).filter(pinOnly).length, 6);
+  // Peer holds SEVEN of the capability pins, not six: aws-readonly arrived with the code-declared skills
+  // surface (`skills: [… 'aws-readonly']` in his agent block), which nothing read before.
+  assert.deepEqual(groupsFor(PEER, PROD).filter(pinOnly), [
+    'pin.aws-readonly', 'pin.cloudwatch-logs', 'pin.datadog',
+    'pin.demo_diagram_app', 'pin.demo_notes_app', 'pin.demo_cache', 'pin.demo_mail_app',
+  ]);
 
   // BOTH classes, on one entity, in the order groupsFor returns them. Cedar does not distinguish them —
   // membership is membership — which is exactly why the SKILL axis had to stay out of the verdicts rather
@@ -138,7 +158,7 @@ test('membership is the Scope entity\'s parents, and an unnamed scope simply has
     [uid(TYPE.scopeGroup, 'pin.aws-readonly'), uid(TYPE.scopeGroup, 'skill.demo-crm')]);
   // NOT an error and NOT a missing entry — the ordinary case for a scope in no group at all. Note that is
   // now a much smaller share of prod than it was: the seeded skill lists put many scopes in
-  // skill.demo-crm alone, so the membership index covers 137 of many scopes rather than 14.
+  // skill.demo-crm alone, so the membership index covers 142 of many scopes rather than 14.
   assert.deepEqual(scopeEntity(UNSEEN, PROD), { uid: uid(TYPE.scope, UNSEEN), attrs: {}, parents: [] });
 
   // The sandbox differs sharply and legitimately: 9 memberships over 3 scopes, five of them the
@@ -152,7 +172,10 @@ test('membership is the Scope entity\'s parents, and an unnamed scope simply has
   // Deriving per-environment against that environment's own routing gets it right by construction.
   assert.equal([...sandboxIndex.values()].reduce((n, g) => n + g.length, 0), 11);
   assert.equal(sandboxIndex.size, 3);
-  assert.equal(membershipIndex(PROD).size, 137, 'prod: 14 pin-only scopes + the seeded skill holders');
+  // 142, from 137: the five scopes the code-declared-skills surface added to pin.aws-readonly, plus
+  // person79b333/agent-zxgm7w/sona-support/agent-ykdenu, less the overlap with scopes already
+  // named by a skill group. Every one of them is a scope that was in the file's fleet but in NO group.
+  assert.equal(membershipIndex(PROD).size, 142, 'prod: pin-only scopes + the seeded skill holders');
   assert.equal(groupsFor('ch-cr89fluhion', SANDBOX).filter(pinOnly).length, 5);
   for (const scope of ['ch-c66pp782t9k', 'dm-ux0mz5ckp2r']) {
     assert.deepEqual(groupsFor(scope, SANDBOX).filter((g) => !pinOnly(g)), ['skill.skill-builder'], scope);

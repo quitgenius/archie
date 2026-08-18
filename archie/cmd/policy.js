@@ -350,12 +350,13 @@ async function codegenCmd(ctx, args, out, deps = {}) {
 /**
  * `archie policy seed --env <env> --sandra <path>` — derive a pins file's SKILL allow-lists from sandra.
  *
- * NOT `config hydrate`, deliberately: automatic membership would make the pin vacuous, since the next
- * install of a pinned skill would approve itself. This is for the FIRST seed of an environment and for a
- * deliberate re-baseline, read as a diff. Continuous drift is check 9's job at publish time.
+ * THE EXPLICIT RE-BASELINE, alongside the automatic one. `config hydrate` runs the same derivation on every
+ * run (seed-policy-pins.mjs) and selects the pins file BY ACCOUNT via STS, which is the right selector there
+ * and the wrong one here: seeding PROD's pins from a laptop holding sandbox credentials is a legitimate
+ * thing to want, and `--env` is how you say it. Same library either way, so the two cannot disagree.
  *
- * Capability pins are never touched — `pin.aws-readonly` holds a scope only a live GRANT# row explains, and
- * the other groups encode review decisions rather than observations. See lib/policy-seed.js.
+ * Skill groups REPLACE, capability groups UNION — see lib/policy-seed.js for why the asymmetry, in short:
+ * a manual UI grant has no config signal by construction, so a replacing derivation would revoke it.
  */
 async function seedCmd(ctx, args, out, deps = {}) {
   const values = (args && args.values) || {};
@@ -369,49 +370,77 @@ async function seedCmd(ctx, args, out, deps = {}) {
     });
   }
   const sources = loadPolicySources({ env });
-  const pinnedSkills = seed.realKeys(sources.pins.groups)
-    .filter((g) => g.startsWith('skill.')).map((g) => g.slice('skill.'.length));
-  if (!pinnedSkills.length) {
-    throw refused(`pins.${env}.json declares no skill.* groups, so there is nothing to seed`, {
-      detail: 'the pinned SET is code (config-resolver/skill-pins.mjs), and this command only fills in '
-        + 'membership for groups that already exist — it will not invent a group and thereby a new pin.',
+  const declared = seed.realKeys(sources.pins.groups);
+  const pinnedSkills = declared.filter((g) => g.startsWith('skill.')).map((g) => g.slice('skill.'.length));
+  const pinnedCaps = declared.filter((g) => g.startsWith('pin.')).map((g) => g.slice('pin.'.length));
+  if (!pinnedSkills.length && !pinnedCaps.length) {
+    throw refused(`pins.${env}.json declares no skill.* or pin.* groups, so there is nothing to seed`, {
+      detail: 'the pinned SET is code (config-resolver/skill-pins.mjs and the Cedar policy), and this command '
+        + 'only fills in membership for groups that already exist — it will not invent a group and thereby a new pin.',
     });
   }
 
-  const derived = await seed.deriveSkillGroups(sandra, pinnedSkills);
-  const changes = seed.diffGroups(sources.pins.groups, derived.groups);
+  // The two derived artifacts extract.mjs leaves behind, which carry the surfaces sandra's files do not:
+  // items/agents/<id>.json has each agent's code-declared `skills` and its resolved tool config, and
+  // ground-truth/<id>.json has the per-agent PLUGIN config (hindsight's enableKnowledgeTools). Both are
+  // gitignored build output, so a stale or missing one narrows coverage — reported, never silently empty.
+  const CR = require('node:path').dirname(require.resolve('../../archie-runner/config-resolver/rekey-to-scope.mjs'));
+  const derived = await seed.deriveSkillGroups(sandra, pinnedSkills, {
+    pinnedCaps,
+    itemsDir: require('node:path').join(CR, 'items'),
+    groundTruthDir: require('node:path').join(CR, 'ground-truth'),
+  });
+  const { merged, withheld } = seed.mergeGroups(sources.pins.groups, derived.groups);
+  const changes = seed.diffGroups(sources.pins.groups, merged);
+  const cov = derived.coverage;
 
   const lines = [
     `env       ${env}  (pins.${env}.json)`,
     `sandra    ${sandra}`,
-    `fleet     ${derived.routed} routed agent(s); ${derived.installAgents} agent(s) in marketplace-installs`,
+    `fleet     ${derived.routed} routed agent(s); ${cov.installs} in marketplace-installs, `
+      + `${cov.codeSkills} with code-declared skills, ${cov.config} with config, ${cov.pluginSignals} with plugin signals`,
   ];
+  // A capability group derived from an unreadable surface is indistinguishable from an unheld one, and the
+  // union merge means silence here would read as "confirmed empty". Say which surface was missing instead.
+  if (pinnedCaps.length && !cov.config) {
+    lines.push('WARNING   items/agents is absent — NO capability pin was derived from agent config. '
+      + 'Run `archie config hydrate` (or extract.mjs) against this sandra tree first.');
+  }
+  if (pinnedCaps.length && !cov.pluginSignals) {
+    lines.push(`WARNING   ground-truth/ is absent — plugin-config capabilities (${seed.PLUGIN_CAP_SIGNALS.map((s) => s.cap).join(', ')}) `
+      + 'were NOT derived. capture-ground-truth.mjs produces it (once per agent, plugins on).');
+  }
   if (derived.unmappable.length) {
     // LOUD, because it means the two halves of this sandra tree describe different fleets, and a silent drop
     // seeds an allow-list missing real holders.
-    lines.push(`UNMAPPABLE ${derived.unmappable.length} agent(s) hold a pinned skill but have NO routing surface,`
-      + ' so no scope id — marketplace-installs and agents/ describe different fleets on this branch:');
-    for (const u of derived.unmappable.slice(0, 6)) lines.push(`            ${u.agent}  (${u.skills.join(', ')})`);
+    lines.push(`UNMAPPABLE ${derived.unmappable.length} agent(s) hold a pinned authority but have NO routing surface,`
+      + ' so no scope id:');
+    for (const u of derived.unmappable.slice(0, 6)) lines.push(`            ${u.agent}  (${u.groups.join(', ')})`);
     if (derived.unmappable.length > 6) lines.push(`            … +${derived.unmappable.length - 6} more`);
+  }
+  for (const w of withheld) {
+    lines.push(`KEPT      ${w.group}: ${w.members.length} member(s) no config surface explains (manual grant?) — `
+      + `${w.members.join(', ')}`);
   }
   if (!changes.length) lines.push('membership already matches this sandra tree — nothing to write');
   for (const c of changes) {
     lines.push(`${c.group}`);
     if (c.added.length) lines.push(`            + ${c.added.length}: ${c.added.slice(0, 8).join(', ')}${c.added.length > 8 ? ', …' : ''}`);
-    // REMOVALS ARE THE DANGEROUS HALF and are listed in full: each is a holder that loses the skill.
-    if (c.removed.length) lines.push(`            - ${c.removed.length} (LOSE THE SKILL): ${c.removed.join(', ')}`);
+    // REMOVALS ARE THE DANGEROUS HALF and are listed in full: each is a holder that loses access. Only
+    // `skill.*` can produce one, since `pin.*` is unioned.
+    if (c.removed.length) lines.push(`            - ${c.removed.length} (LOSES ACCESS): ${c.removed.join(', ')}`);
   }
 
   if (ctx.dryRun || !changes.length) {
-    answer(out, ctx, { env, sandra, changes, unmappable: derived.unmappable, written: false, dryRun: Boolean(ctx.dryRun) },
+    answer(out, ctx, { env, sandra, changes, withheld, unmappable: derived.unmappable, coverage: cov, written: false, dryRun: Boolean(ctx.dryRun) },
       [...lines, changes.length ? 'written   nothing (dry run) — re-run with --no-dry-run' : ''].filter(Boolean).join('\n'));
     return undefined;
   }
 
   const target = values.file || require('node:path').join(require('../lib/policy-sources').POLICY_DIR, `pins.${env}.json`);
-  const next = seed.applySkillGroups(sources.pins, derived.groups);
+  const next = seed.applySkillGroups(sources.pins, merged);
   require('node:fs').writeFileSync(target, `${JSON.stringify(next, null, 2)}\n`);
-  answer(out, ctx, { env, sandra, changes, unmappable: derived.unmappable, written: true, file: target },
+  answer(out, ctx, { env, sandra, changes, withheld, unmappable: derived.unmappable, coverage: cov, written: true, file: target },
     [...lines, `written   ${target} — review the diff and commit it`].filter(Boolean).join('\n'));
   return undefined;
 }

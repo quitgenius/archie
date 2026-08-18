@@ -12,8 +12,8 @@
 // Plan §2.1 derives it from `items/routing/*.json`, of which this tree holds three (all sandbox);
 // `_full-config.json` carries many bindings, which §2.1 explicitly rules out as a scope source. So the
 // fleet-wide claim is asserted through its two components instead, which together are equivalent:
-// every scope carries 12 entries whatever its membership, and the `allow` entries are exactly the 21
-// memberships, all of which are in the many scopes named by the file.
+// every scope carries 12 entries whatever its membership, and the `allow` entries are exactly the 29
+// memberships, all of which are in the scopes named by the file.
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
@@ -35,7 +35,7 @@ const PINNED = [
 ];
 
 const PEER_TWO = 'dm-udbugah9aty';       // pin.aws-readonly, and nothing else
-const PEER = 'dm-umrsp7355u7';        // six of the seven seeded groups
+const PEER = 'dm-umrsp7355u7';        // seven of the capability pins (aws-readonly joined 2026-08-18)
 const UNSEEN = 'ch-never-seen';       // a scope no bindings file has named
 const SANDBOX_CHANNEL = 'ch-cr89fluhion';   // sandbox's five zero-holder pins
 
@@ -125,14 +125,19 @@ test('every scope carries exactly 12 entries, and the allows are exactly the mem
       assert.deepEqual(row.skills, skillGroups.sort(), `${sources.env} ${scope} skills`);
       allows += scopeAllows;
     }
-    assert.equal(allows, sources.env === 'prod' ? 21 : 9);
+    // 29 on prod, up from 21 — see policy-entities.test.js for the per-group trace. The number moved because
+    // the derivation was reading one of sandra's three authority-declaring surfaces, NOT because the policy
+    // widened: all 29 already exercise their capability under OpenClaw today. The sandbox stays at 9, and
+    // that it did not move is itself the check that the union merge preserves members no config explains —
+    // seven of sandbox's nine are hand-placed test pins with no config signal at all.
+    assert.equal(allows, sources.env === 'prod' ? 29 : 9);
   }
 
-  // Which gives the fleet figure: 213 prod scopes × 12 = 2,556 entries, 21 `allow`, 2,535 `deny`.
-  // Plan §1.1 still quotes 220 / 2,640 / 22 — stale on both counts (prod is many scopes, and
-  // pins.prod.json was corrected on 2026-08-18 from 22 memberships to 21).
+  // Which gives the fleet figure: 213 prod scopes × 12 = 2,556 entries, 29 `allow`, 2,527 `deny`.
+  // Plan §1.1 still quotes 220 / 2,640 / 22 — stale on both counts (prod is many scopes, and pins.prod.json
+  // went 22 → 21 by hand on 2026-08-18, then 21 → 29 when the derivation learned to read all three surfaces).
   assert.equal(213 * PINNED.length, 2556);
-  assert.equal(2556 - 21, 2535);
+  assert.equal(2556 - 29, 2527);
 });
 
 test('the two environments differ only in membership, and sharply', () => {
