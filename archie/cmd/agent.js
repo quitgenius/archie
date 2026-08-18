@@ -53,7 +53,7 @@ const provisioning = require('../../archie-gateway/agentcore-provisioning');
 const derivedRole = require('../../archie-gateway/derived-role');
 const routingBuild = require('../../archie-gateway/routing-build');
 const { createRuntimeRegistry } = require('../../archie-gateway/runtime-registry');
-const { efsRootDir, generationRuntimeName } = require('../../archie-gateway/agentcore-client');
+const { efsRootDir, generationRuntimeName, isGenerationOf } = require('../../archie-gateway/agentcore-client');
 const { derivedSpecFor, imageUriFor } = require('../lib/spec');
 const { readFleetPointer, readTaint } = require('../lib/image-pointer');
 const { describeImage } = require('../lib/ecr');
@@ -1103,13 +1103,25 @@ async function teardown(ctx, args, out, deps) {
   // THE GUARDS COME FIRST, before a client is built or an account is resolved. A refusal an operator
   // can only see once their credentials load is a refusal that reads as a credentials problem — and
   // the whole value of "there is no all-agents default" is that it is the first thing you hit.
+  // `--agent <scope>` IS THE PREFERRED FORM, and it exists because `--name-re` makes the operator
+  // hand-write the thing most likely to be wrong. `isGenerationOf` is imported from the client rather
+  // than re-expressed as a regex here, so teardown and the GC cannot disagree about which runtimes
+  // belong to an agent — including the pre-generation bare name, which a naive
+  // `^oc_<agent>_[0-9a-f]{8}$` silently misses and thereby strands one runtime per agent.
+  const only = args.values.agent || null;
   const nameRe = compileRe(args.values['name-re'], '--name-re');
-  if (!nameRe) {
-    throw usage('teardown requires an explicit --name-re <regexp>', {
-      detail: 'There is deliberately no "all agents" default (§5.6). Match the runtime NAMES you mean — '
-        + '`archie runtime list` shows them.',
+  if (only && args.values['name-re']) {
+    throw usage('--agent and --name-re are mutually exclusive', {
+      detail: 'They are two ways to say the same thing and a disagreement between them has no safe reading. '
+        + 'Prefer --agent <scope>; reach for --name-re only for residue that carries no AGENT_NAME.',
     });
   }
+  if (!only && !nameRe) {
+    throw usage('teardown requires --agent <scope> (preferred) or an explicit --name-re <regexp>', {
+      detail: 'There is deliberately no "all agents" default (§5.6). `archie runtime list` shows the names.',
+    });
+  }
+  const matches = only ? ((name) => isGenerationOf(name, only)) : ((name) => nameRe.test(name));
   const skipRe = args.values['skip-re'] === undefined ? DEFAULT_SKIP_RE : compileRe(args.values['skip-re'], '--skip-re');
   if (!skipRe) throw usage('--skip-re cannot be empty — the skip pattern is a guard, not a preference (§5.6)');
 
@@ -1130,7 +1142,7 @@ async function teardown(ctx, args, out, deps) {
     for (const rt of r.agentRuntimes || []) {
       scanned += 1;
       const name = rt.agentRuntimeName || '';
-      if (!nameRe.test(name)) continue;
+      if (!matches(name)) continue;
       // AFTER the regex. See the header.
       if (skipRe.test(name)) { skipped.push(name); continue; }
       matched.push({ runtimeId: rt.agentRuntimeId, runtimeName: name });
@@ -1165,12 +1177,45 @@ async function teardown(ctx, args, out, deps) {
       + `not ${ctx.resources.configTable}) — reported, never touched`);
   }
 
+  // ONE AGENT AT A TIME IS THE DEFAULT (2026-08-18). A `--name-re` wide enough to span two agents
+  // is almost always a mistake rather than an intent, and the blast radius is per-agent: each extra
+  // agent loses its runtimes and its table items. `--agent` cannot trip this; `--name-re` has to opt in
+  // with `--multi-agent`, which makes "I meant all of these" an explicit statement rather than a regex
+  // side effect. Checked BEFORE any table scan, so the refusal costs nothing.
+  const spannedAgents = [...new Set(targets.map((t) => t.agent).filter(Boolean))].sort();
+  if (spannedAgents.length > 1 && !args.values['multi-agent']) {
+    throw refused(`--name-re matched runtimes for ${spannedAgents.length} agents: ${spannedAgents.join(', ')}`, {
+      detail: 'Teardown is per-agent by default. Re-run with --agent <scope> for one of them, or pass '
+        + '--multi-agent if you really mean all of them.',
+    });
+  }
+
+  // ACCESS POINTS ARE OPT-IN VIA `--access-points` (2026-08-18). Deleting one does not lose EFS
+  // data — the directory survives, and a re-provision recreates the AP at the same root from
+  // META.efsRoot — but it does BREAK THE NEXT BOOT of any agent whose workspace has content. A fresh AP
+  // sets `ap.selfCreated`, which makes the dispatcher pre-write the baked skeleton SEED; the next boot
+  // then takes workspace-seed's "loaded" branch and throws `seed guard FATAL` for any skeleton file the
+  // live workspace does not have. Teardown CANNOT check for that: EFS has no API to list a directory,
+  // so the tool has no way to tell an empty workspace from a 125 GB one.
+  //
+  // So the default is the reversible half (runtimes + recreatable table items) and detaching a live
+  // workspace is a separate, deliberate act. `access-point gc` is the command for reaping APs that have
+  // no live runtime, which is the safe case by construction.
+  const wantAps = Boolean(args.values['access-points']);
+
   // Access points: only the ones these runtimes actually mount, and only if tagged. Both filters are
   // required — the tag is what IAM permits deletion by, and ECS / agent-xx9aff / filebrowser access
   // points do not carry it (agent-teardown.js:33,77).
   const mounted = new Set(targets.map((t) => t.accessPointArn).filter(Boolean));
-  const onFs = (await describeAccessPoints(clients, config.efsFsId)).filter((ap) => mounted.has(ap.AccessPointArn));
+  const onFs = wantAps
+    ? (await describeAccessPoints(clients, config.efsFsId)).filter((ap) => mounted.has(ap.AccessPointArn))
+    : [];
   const aps = onFs.filter(tagged).map((ap) => ({ accessPointId: ap.AccessPointId, path: (ap.RootDirectory || {}).Path || null }));
+  if (!wantAps && mounted.size) {
+    out.progress(`${mounted.size} mounted access point(s) LEFT IN PLACE (no --access-points) — the workspaces `
+      + 'stay attached and the next provision reuses them. Deleting one breaks the next boot of an agent whose '
+      + 'workspace has content (fresh AP => skeleton SEED => seed guard FATAL).');
+  }
   const untagged = onFs.filter((ap) => !tagged(ap)).map((ap) => ap.AccessPointId);
   if (untagged.length) {
     out.warn(`${untagged.length} mounted access point(s) are not tagged ${AP_TAG_KEY}=${AP_TAG_VALUE} — left alone `
@@ -1185,7 +1230,15 @@ async function teardown(ctx, args, out, deps) {
   const agents = [...new Set(targets.map((t) => t.agent).filter(Boolean))].sort();
   const orphanRuntimes = targets.filter((t) => !t.agent).map((t) => t.runtimeName);
   if (orphanRuntimes.length) out.warn(`${orphanRuntimes.length} runtime(s) carry no AGENT_NAME — their runtimes and access points go, their table items stay`);
-  const keys = agents.length ? await agentItemKeys(clients, ctx.resources.configTable, agents) : [];
+  const { keys, preserved } = agents.length
+    ? await agentItemKeys(clients, ctx.resources.configTable, agents, { include: (f) => Boolean(args.values[f]) })
+    : { keys: [], preserved: [] };
+  if (preserved.length) {
+    const named = preserved.map((k) => `${k.sk} (${k.optInWith})`).join(', ');
+    out.progress(`${preserved.length} item(s) PRESERVED because hydration cannot put them back: ${named}. `
+      + 'CONNECTOR holds a project key Connector will not reissue; MARKETPLACE holds runtime-established '
+      + 'OAuth connectors. Opt in per item only when retiring the agent for good.');
+  }
 
   out.progress(`${scanned} runtime(s) scanned · ${targets.length} matched · ${skipped.length} skipped by the `
     + `pattern · ${foreign.length} foreign`);
@@ -1193,7 +1246,10 @@ async function teardown(ctx, args, out, deps) {
   for (const t of targets) out.verbose(`delete runtime ${t.runtimeName} (${t.agent || 'unknown agent'})`);
 
   const plan = {
-    nameRe: String(nameRe), skipRe: String(skipRe),
+    selector: only ? { agent: only } : { nameRe: String(nameRe) },
+    skipRe: String(skipRe),
+    preserved,
+    accessPointsRequested: wantAps,
     scanned,
     runtimes: targets.map((t) => ({ runtimeName: t.runtimeName, runtimeId: t.runtimeId, agent: t.agent, status: t.status })),
     skipped,
@@ -1277,10 +1333,59 @@ function accessPointArnOf(g) {
  * projected attribute name is ALIASED — `pk`/`sk` are not reserved words, but writing them bare here
  * and not elsewhere is how the habit erodes.
  */
-async function agentItemKeys(clients, table, agents) {
+/**
+ * Item keys a teardown may delete, and the ones it must not.
+ *
+ * WHAT `config hydrate` CANNOT PUT BACK is the whole question here, because "recreatable" is the only
+ * thing that makes deleting an item safe. Measured against the hydration path, not assumed:
+ *
+ *   AGENT#<a>/{CONFIG,META,SEED,MARKETPLACE}  migrate-to-ddb writes all four → recreatable
+ *   GRANT#<a>/SCOPE#*                         hydration recomputes it (clobbers, deliberately) → recreatable
+ *   RUNTIME#<a>/GEN#*                         `fleet stage` rewrites bindings → recreatable
+ *   AGENT#<a>/CRON                            `archie cron hydrate` folds it back from the agent's EFS
+ *                                             cron store, which teardown never touches → recreatable
+ *   AGENT#<a>/CONNECTOR                        **NOT RECREATABLE** — see below
+ *   AGENT#<a>/MARKETPLACE                     **PARTLY NOT RECREATABLE** — see below
+ *
+ * CONNECTOR IS EXCLUDED BY DEFAULT (2026-08-18). `config hydrate` is PUT-ONLY over the items it
+ * knows and never writes CONNECTOR, so hydration cannot restore it. Worse, the upstream cannot either:
+ * Connector has key regeneration disabled org-wide, no create-key route, and GET returns only the
+ * ORIGINAL MASKED key — so a project whose key we have lost can never be re-keyed through the API. That
+ * makes this one item's deletion permanent and un-fixable, in a command whose entire purpose is
+ * "delete the recreatable state". `--include-connector` opts in for an agent being retired for good.
+ *
+ * MARKETPLACE IS EXCLUDED BY DEFAULT for a subtler reason: the item is a UNION of config-sourced and
+ * runtime-established state. `installs` comes from sandra's marketplace-installs.json and hydration
+ * rewrites it — but `connectors` is the record of Connector OAuth flows a human clicked through, and
+ * hydration only carries connectors for an agent sandra's marketplace-installs.json actually names.
+ * Measured on ch-cr89fluhion (2026-08-18): 16 connectors — gmail, slack, demo-crm, googlecalendar and
+ * the rest — on a scope that is ABSENT from that file, so hydration would write nothing back and every
+ * one of them would have to be re-authorized by hand. Teardown cannot tell: it has no sandra checkout.
+ *
+ * WHY EXCLUDING BOTH COSTS NOTHING. `config hydrate` PUTs these items rather than merging, so deleting
+ * them first buys no cleanliness — hydration overwrites whatever it knows and leaves what it does not.
+ * The items worth deleting are the STALE ones hydration will never overwrite because they are keyed by an
+ * identity it no longer writes (e.g. `AGENT#agent-xx9aff/CRON`, a pre-rekey legacy key), and those
+ * are exactly the ones these exclusions do not protect.
+ *
+ * CONFIG#* IS NOT IN SCOPE AT ALL, and that is load-bearing rather than incidental: `CONFIG#image`
+ * holds the live fleet pointer and, more importantly, `TAINT#<digest>` records. A taint is permanent by
+ * design — there is no untaint and no force — so deleting one would make a known-bad image publishable
+ * again. This function keys only off the three per-agent prefixes, so it cannot reach them; stated here
+ * because a future author widening the scan is exactly how that protection would be lost.
+ */
+// sk → the flag that opts into deleting it. Data rather than an if-chain so the plan output, the warning
+// text and the guard cannot describe different sets.
+const UNRECREATABLE_SKS = new Map([
+  ['CONNECTOR', 'include-connector'],
+  ['MARKETPLACE', 'include-marketplace'],
+]);
+
+async function agentItemKeys(clients, table, agents, { include = () => false } = {}) {
   const prefixes = agents.flatMap((a) => [`AGENT#${a}`, `GRANT#${a}`, `RUNTIME#${a}`]);
   const wanted = new Set(prefixes);
   const keys = [];
+  const preserved = [];
   let ExclusiveStartKey;
   do {
     const r = await clients.doc.send(new clients.docCmds.ScanCommand({
@@ -1290,11 +1395,14 @@ async function agentItemKeys(clients, table, agents) {
       ExclusiveStartKey,
     }));
     for (const item of r.Items || []) {
-      if (typeof item.pk === 'string' && wanted.has(item.pk)) keys.push({ pk: item.pk, sk: item.sk });
+      if (typeof item.pk !== 'string' || !wanted.has(item.pk)) continue;
+      const flag = UNRECREATABLE_SKS.get(item.sk);
+      if (flag && !include(flag)) { preserved.push({ pk: item.pk, sk: item.sk, optInWith: `--${flag}` }); continue; }
+      keys.push({ pk: item.pk, sk: item.sk });
     }
     ExclusiveStartKey = r.LastEvaluatedKey;
   } while (ExclusiveStartKey);
-  return keys;
+  return { keys, preserved };
 }
 
 // ── exports ──────────────────────────────────────────────────────────────────────────────────────
