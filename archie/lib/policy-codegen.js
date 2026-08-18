@@ -8,11 +8,16 @@
 // the intent was: "Cedar is intended to become the single declaration of this set, with the JS map derived
 // from it." This is that derivation.
 //
-// WHY A COMMITTED GENERATED FILE, rather than generating during the docker build. The generated module
-// ships inside BOTH images (permissions/ is COPYed to each), and generating at build time would mean the
-// content of an image depended on a step no test could observe. Committed, it is an ordinary declared input:
-// it is linted, it is hashed into both tags, and `assertGenerated` below fails the offline gate the moment
-// it stops matching the policy. So the file in git is always the file in the image.
+// NOT COMMITTED — it is gitignored (repo .gitignore). It is derived, so a copy in git is review noise and
+// a merge conflict waiting to happen. It IS still hashed into both image digests, because it ships and the
+// tag must reflect what is in the image; being gitignored keeps it out of `git status --porcelain -uall`,
+// so `--pure` and the dirty-tree warning are unaffected.
+//
+// THE COST OF NOT COMMITTING IT, stated because it is the part that bites: a fresh clone does not have the
+// file, and `permissions/capabilities.mjs` imports it — so tests and builds fail with ERR_MODULE_NOT_FOUND
+// until something generates it. `ensure()` below exists for exactly that, and is called from the offline
+// gate and from both image builds. Anything that imports the runtime's permission model without going
+// through one of those needs to call it too.
 //
 // AND WHY THIS IS ONLY SAFE AFTER R8. Generating from a source that is not a declared image input means an
 // edit to the source changes no tag — the build is skipped as "already in ECR" and the stale generated file
@@ -53,8 +58,9 @@ function render(sources) {
   const line = (c) => `  ${/^[a-z][a-z0-9]*$/i.test(c) ? c : `'${c}'`}: 'allow',${immutable.includes(c) ? ' // UNREMOVABLE' : ''}`;
   return `// @generated from docker/policy/semantics.json — DO NOT EDIT BY HAND.
 //
-// Regenerate with \`archie policy codegen\`. \`npm run check\` fails if this file stops matching the policy,
-// and both image digests include docker/policy/, so a policy edit rolls the images that carry this.
+// GITIGNORED — regenerated, never committed. \`npm run check\` and both image builds regenerate it, so it is
+// always current; run \`archie policy codegen\` if you need it by hand. Both image digests include
+// docker/policy/ AND this file, so a policy edit rolls the images that carry it.
 //
 // THE CEDAR POLICY IS THE SINGLE DECLARATION of what is "generally available": capGroups.baseline in
 // semantics.json. This file exists because the runtime cannot evaluate Cedar — cedar-wasm never enters an
@@ -93,11 +99,23 @@ function write(sources, { file = GENERATED_ABS } = {}) {
 }
 
 /**
- * Throw unless the committed file matches what the policy implies.
+ * Make the generated file exist and match the policy. Idempotent; returns {path, changed}.
  *
- * THIS IS THE WHOLE SAFETY ARGUMENT for committing a generated file, so it runs in the offline gate rather
- * than only at deploy: the failure it prevents is someone editing semantics.json, not regenerating, and
- * shipping a baseline set that disagrees with the policy the same release publishes.
+ * THE ENTRY POINT EVERYTHING ELSE USES. Since the file is not committed, "is it stale?" and "is it there?"
+ * are the same question with the same answer — regenerate. Callers do not need to distinguish, and one that
+ * tried would be choosing between two ways of being broken.
+ */
+function ensure({ env = 'sandbox', dir, file = GENERATED_ABS } = {}) {
+  return write(loadPolicySources({ env, ...(dir ? { dir } : {}) }), { file });
+}
+
+/**
+ * Throw unless the file on disk matches what the policy implies.
+ *
+ * STILL WORTH HAVING even though the file is generated rather than committed, for one case: a build or a
+ * deploy that generated it EARLIER in the same run, then had the policy change under it — or a stale file
+ * left by a previous run against different sources. It is the assertion the deploy makes after codegen, so
+ * "the baseline the fleet enforces" and "the policy this release publishes" cannot differ.
  */
 function assertGenerated({ env = 'sandbox', dir, file = GENERATED_ABS } = {}) {
   // The BASELINE half of the policy is in the shared semantics, not the per-environment pins, so any env
@@ -108,7 +126,8 @@ function assertGenerated({ env = 'sandbox', dir, file = GENERATED_ABS } = {}) {
   const expected = render(sources);
   const actual = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : null;
   if (actual === null) {
-    throw new Error(`${GENERATED} is missing — run \`archie policy codegen\``);
+    throw new Error(`${GENERATED} is missing — it is generated (and gitignored), so run `
+      + '`archie policy codegen`. `npm run check` and both image builds do this for you.');
   }
   const strip = (t) => t.split('\n').filter((l) => !l.startsWith('// Policy digest at generation:') && !l.startsWith('export const POLICY_DIGEST')).join('\n');
   if (strip(actual) !== strip(expected)) {
@@ -120,5 +139,5 @@ function assertGenerated({ env = 'sandbox', dir, file = GENERATED_ABS } = {}) {
 }
 
 module.exports = {
-  render, write, assertGenerated, baselineFrom, GENERATED, GENERATED_ABS, realKeys,
+  render, write, ensure, assertGenerated, baselineFrom, GENERATED, GENERATED_ABS, realKeys,
 };

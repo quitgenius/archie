@@ -282,6 +282,13 @@ function purityGate(ctx, args, out) {
  * task definition on it.
  */
 async function build(ctx, args, out, deps = {}) {
+  // THE GENERATED BASELINE, BEFORE THE DIGEST IS TAKEN. baseline.generated.mjs is derived from
+  // docker/policy/semantics.json and gitignored, so it may be absent (fresh clone) or stale (policy edited
+  // since the last build). It SHIPS and it is a declared digest input, so generating it after the tag was
+  // computed would give an image whose contents do not match its tag — the one property the derived-tag
+  // design exists to guarantee. Idempotent, so this costs nothing when it is already current.
+  require('../lib/policy-codegen').ensure();
+
   const ecr = client.ecr(ctx, deps);
   const sts = client.sts(ctx, deps);
   const run = deps.run || defaultRun;

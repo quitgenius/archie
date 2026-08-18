@@ -68,6 +68,13 @@ async function deploy(ctx, args, out, deps = {}) {
   const steps = stepsFor(deps);
   const digest = deps.digestFor || digestFor;
 
+  // THE GENERATED BASELINE, BEFORE ANYTHING READS A DIGEST. baseline.generated.mjs is gitignored, so a
+  // fresh clone does not have it — and the GATEWAY declares it as an explicit file input, so digestFor()
+  // fails with `declared input missing` rather than anything that names the real problem. That happens in
+  // the --pure gate and the gateway skip decision, both of which run before the build hook that would
+  // otherwise generate it. Idempotent, so this costs nothing on a warm tree.
+  require('../lib/policy-codegen').ensure();
+
   const result = {
     preflight: null,
     // The policy step's outcome. NOT just for --json: a release summary that omits policy cannot answer

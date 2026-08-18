@@ -1,24 +1,26 @@
 'use strict';
 
-// The generated baseline module, and the check that makes committing a generated file safe.
+// The generated baseline module.
 //
-// The failure this exists to prevent: someone edits `capGroups.baseline` in semantics.json, does not
-// regenerate, and the release publishes a policy whose baseline set disagrees with the one the runtime is
-// actually enforcing. Nothing else would notice — the policy validates, the checks pass, the images build.
+// The file is GITIGNORED, so the risk is not a stale committed copy — it is ABSENCE. A fresh clone has no
+// baseline.generated.mjs, and permissions/capabilities.mjs imports it, so every suite that touches the
+// permission model fails with ERR_MODULE_NOT_FOUND. `ensure()` is what closes that, and it is called from
+// the offline gate, both image builds, and `deploy` (which reads a digest before either build runs).
 //
-// So the load-bearing test here is `assertGenerated` FAILING on a stale file. A staleness check that cannot
-// fail is worse than none, because the committed file reads as verified.
+// The staleness check still matters for one case: a run that generated the file earlier and then had the
+// policy change under it, or a stale file left by a previous run against different sources.
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
-const { render, write, assertGenerated, baselineFrom, GENERATED_ABS } = require('./policy-codegen');
+const { render, write, ensure, assertGenerated, baselineFrom, GENERATED_ABS } = require('./policy-codegen');
 const { loadPolicySources } = require('./policy-sources');
 
 const SANDBOX = loadPolicySources({ env: 'sandbox' });
 
-test('the committed file matches the policy', () => {
-  // The gate itself, run against the real tree — this is what `npm run check` relies on.
+test('the file on disk matches the policy', () => {
+  // The gate itself, run against the real tree. `npm run check` regenerates before any suite runs, so by
+  // the time this executes the file is current — this asserts the generator and the checker agree.
   assert.doesNotThrow(() => assertGenerated({ env: 'sandbox' }));
   assert.doesNotThrow(() => assertGenerated({ env: 'prod' }), 'the baseline set is env-independent');
 });
@@ -90,6 +92,21 @@ test('assertGenerated ignores the DIGEST line, which is env-dependent', () => {
 });
 
 test('write() is idempotent — regenerating an up-to-date file changes nothing', () => {
-  // So `archie policy codegen` is safe to run at any time and does not produce a spurious diff.
+  // So the hooks in the gate, both builds and deploy cost nothing on a warm tree, and can therefore run
+  // unconditionally rather than behind a staleness guard whose failure mode is the thing being avoided.
   assert.equal(write(SANDBOX).changed, false);
+});
+
+test('ensure() RECREATES the file when it is absent — the fresh-clone case', () => {
+  // The whole reason the file can be gitignored. Verified for real by deleting it: without generation a
+  // suite importing capabilities.mjs dies with ERR_MODULE_NOT_FOUND, naming baseline.generated.mjs.
+  const tmp = `${GENERATED_ABS}.ensure-test`;
+  fs.rmSync(tmp, { force: true });
+  const first = ensure({ env: 'sandbox', file: tmp });
+  try {
+    assert.equal(first.changed, true, 'created');
+    assert.ok(fs.existsSync(tmp));
+    assert.equal(ensure({ env: 'sandbox', file: tmp }).changed, false, 'and is then idempotent');
+    assert.equal(fs.readFileSync(tmp, 'utf8'), render(SANDBOX), 'byte-identical to render()');
+  } finally { fs.rmSync(tmp, { force: true }); }
 });
