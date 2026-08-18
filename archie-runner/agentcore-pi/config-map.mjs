@@ -65,7 +65,7 @@ export function resolveAllowedTools(agent) {
 }
 
 // Pi BUILT-IN tools for the allow-set (phase 1). memory_search/memory_get (FTS),
-// agent_knowledge_* (hindsight), connector/slack-reply/file-publish, pdf are provided
+// agent_knowledge_* (hindsight) and connector/slack-reply are provided
 // by the plugin shim / FTS tool in later phases — NOT here. Crucially: we pass ONLY
 // the resolved set, overriding Pi's default codingTools (a messaging agent must not
 // silently gain bash/write).
