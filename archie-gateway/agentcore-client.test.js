@@ -840,6 +840,36 @@ describe('session queue backlog alert', () => {
 // the agent cannot serve for that whole window. A new generation is created alongside the old one.
 const { imageFingerprint, isGenerationOf } = require('./agentcore-client');
 
+// The runtime asserts that its compiled Cedar verdict row (AGENT#<scope>/POLICY) was compiled for the
+// account it is running in, which only works while this key is actually delivered. Nothing else fails if
+// it disappears: policy-table.mjs treats a null as a SKIPPED assertion — deliberately, so the gap is
+// visible rather than looking like a check that passed — which means losing this key silently disables
+// the check across the whole fleet. That is what this test exists to prevent.
+describe('AGENTCORE_ACCOUNT reaches the runtime', () => {
+  it('runtimeSpecFor carries the account the POLICY row is read from', () => {
+    const spec = c.runtimeSpecFor('ch-cr89fluhion', TEST_IMAGE);
+    expect(spec.envs.AGENTCORE_ACCOUNT).toBe(c.config.account);
+    expect(spec.envs.AGENTCORE_ACCOUNT).toMatch(/^\d{12}$/);
+  });
+
+  it('is unconditional — a missing account must not silently mean "assertion off"', () => {
+    // Unlike AGENTCORE_READERS_ACCOUNT / HINDSIGHT_API_URL, which are absent-means-off by design, an
+    // absent account here is an assertion that quietly does not run.
+    const spec = c.runtimeSpecFor('dm-ux0mz5ckp2r', TEST_IMAGE);
+    expect(Object.keys(spec.envs)).toContain('AGENTCORE_ACCOUNT');
+  });
+
+  it('is inside the fingerprint, so it lands on a roll rather than mutating a live runtime', () => {
+    // Not a wish — a consequence of envs being hashed into the name. Stated as a test because the whole
+    // "set it on the next roll" plan depends on it being true, and if envs ever stopped being
+    // fingerprinted, existing runtimes would keep their old env with no name change to reveal it.
+    const withAccount = c.runtimeSpecFor('ch-cr89fluhion', TEST_IMAGE);
+    const without = { ...withAccount, envs: { ...withAccount.envs } };
+    delete without.envs.AGENTCORE_ACCOUNT;
+    expect(imageFingerprint(withAccount)).not.toBe(imageFingerprint(without));
+  });
+});
+
 describe('generation runtime names', () => {
   const IMG_A = '203366135563.dkr.ecr.us-east-1.amazonaws.com/clawdbot-agentcore:pi-obs-40';
   const IMG_B = '203366135563.dkr.ecr.us-east-1.amazonaws.com/clawdbot-agentcore:pi-obs-41';

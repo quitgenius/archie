@@ -123,15 +123,19 @@ const AGENT_NAME = process.env.AGENT_NAME || 'pi-agent';
 // The account a POLICY row must claim to have been compiled for (§1.1), guarding a sandbox-compiled row
 // reaching a prod runtime or the reverse.
 //
-// UNSET TODAY, and that is a considered trade rather than an omission. §1.1 specifies asserting against
-// sts:GetCallerIdentity at boot; the cheaper form would be a new env var, but `runtimeEnv` is
-// fingerprinted into the runtime NAME (see schema.mjs agentPolicyKey), so adding one renames all ~220
-// runtimes — a full fleet re-provision to enable a defence-in-depth check. The primary guard is
-// deploy-side, where the materialiser knows its target account for free and check 4 validates every pin
-// against that environment's scope list. With this null, loadPolicyTable RECORDS the skip rather than
-// treating it as a pass. Setting it (accepting the one-time roll, or on the next roll for another
-// reason) turns the assertion on with no other change.
-const EXPECTED_ACCOUNT = process.env.AGENTCORE_ACCOUNT_ID || null;
+// Set by runtimeEnv from the gateway's own `config.account` — the same value behind the derived role and
+// the DynamoDB scope statement, so it is by construction the account this row is read from. §1.1
+// specifies asserting against sts:GetCallerIdentity instead; the env var says the same thing without
+// putting an STS call on the boot path, and it is the writer's claim being checked here, not the
+// reader's identity.
+//
+// NULL ON A RUNTIME PROVISIONED BEFORE THIS KEY EXISTED, and that is the honest state rather than a
+// fallback: `envs` is fingerprinted into the runtime name, so the key only appears on runtimes created
+// after it was added, i.e. from the next roll onward. loadPolicyTable RECORDS a null as a skipped
+// assertion rather than a pass, so the gap is visible in the log instead of looking like a check that
+// ran. Do not default it to a literal account — a wrong guess would assert against the wrong value,
+// which is worse than not asserting.
+const EXPECTED_ACCOUNT = process.env.AGENTCORE_ACCOUNT || null;
 // OpenClaw stores sessions.json `sessionFile` as an ABSOLUTE path under its home
 // (observed: <OPENCLAW_HOME>/.openclaw/agents/<agent>/sessions/<file>). On a rollback to
 // the ECS gateway, OpenClaw opens the stored path as-is, so Pi writes the same absolute

@@ -341,6 +341,21 @@ function createAgentCoreClient(overrides = {}) {
       NODE_TLS_REJECT_UNAUTHORIZED: config.nodeTlsReject,
       // §9 sandbox: point the runtime's AWS tools at the in-account stand-in readers (only when set).
       ...(config.readersAccount ? { AGENTCORE_READERS_ACCOUNT: config.readersAccount } : {}),
+      // Which account this runtime believes it is in. The runtime asserts its compiled Cedar verdict row
+      // (AGENT#<scope>/POLICY) claims the same one, so a sandbox-compiled row cannot govern a prod
+      // runtime or the reverse — the class of mistake that put two sandbox scope ids into
+      // pins.prod.json. Same account used for the derived role and the DDB scope statement, so it is by
+      // construction the account the POLICY item is read from.
+      //
+      // UNCONDITIONAL, unlike the two above, because a MISSING value here is not "feature off" — it is
+      // an assertion that silently does not run. policy-table.mjs records the skip rather than counting
+      // it as a pass, and this is the only thing that stops that being the permanent state.
+      //
+      // Adding this key re-fingerprints every runtime (envs is hashed into the runtime NAME, see
+      // generationRuntimeName), so it lands on the next roll rather than costing one of its own — which
+      // is free, because a roll changes the name regardless. Existing runtimes keep asserting nothing
+      // until they roll; that is the pre-existing state, not a regression.
+      AGENTCORE_ACCOUNT: config.account,
       // Hindsight memory. Conditional for the same reason as above and it is LOAD-BEARING: BASE_PLUGINS
       // gates both the plugin entry and `slots.memory` on a non-empty HINDSIGHT_API_URL, so passing an
       // empty string would give the agent a memory slot pointing at a plugin it cannot use and a
