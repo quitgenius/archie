@@ -146,13 +146,17 @@ test('membership is the Scope entity\'s parents, and an unnamed scope simply has
   const sandboxIndex = membershipIndex(SANDBOX);
   const sandboxPins = [...sandboxIndex.values()].reduce((n, g) => n + g.filter(pinOnly).length, 0);
   assert.equal(sandboxPins, 9);
-  // +1: ch-c66pp782t9k holds skill-builder, the sandbox's single pinned-skill holder and the one scope the
-  // filter would otherwise strip on its next turn.
-  assert.equal([...sandboxIndex.values()].reduce((n, g) => n + g.length, 0), 10);
+  // +2 skill memberships: ch-c66pp782t9k AND dm-ux0mz5ckp2r both hold skill-builder in the sandbox config.
+  // The second was MISSED by hand-seeding and found by seed-policy-pins.mjs, because agent-xx9aff
+  // exists in both environments and the hand script assigned it to whichever routing matched first (prod).
+  // Deriving per-environment against that environment's own routing gets it right by construction.
+  assert.equal([...sandboxIndex.values()].reduce((n, g) => n + g.length, 0), 11);
   assert.equal(sandboxIndex.size, 3);
   assert.equal(membershipIndex(PROD).size, 137, 'prod: 14 pin-only scopes + the seeded skill holders');
   assert.equal(groupsFor('ch-cr89fluhion', SANDBOX).filter(pinOnly).length, 5);
-  assert.deepEqual(groupsFor('ch-c66pp782t9k', SANDBOX).filter((g) => !pinOnly(g)), ['skill.skill-builder']);
+  for (const scope of ['ch-c66pp782t9k', 'dm-ux0mz5ckp2r']) {
+    assert.deepEqual(groupsFor(scope, SANDBOX).filter((g) => !pinOnly(g)), ['skill.skill-builder'], scope);
+  }
 
   assert.equal(codeOf(() => groupsFor('', PROD)), EXIT.USAGE);
 });

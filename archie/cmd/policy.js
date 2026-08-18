@@ -21,6 +21,7 @@ const { loadPolicySources, availableEnvs } = require('../lib/policy-sources');
 const { plan } = require('../lib/policy-publish');
 const { runSourceChecks, capabilityUniverse, diffDecisions, checkSkillHolders } = require('../lib/policy-checks');
 const codegen = require('../lib/policy-codegen');
+const seed = require('../lib/policy-seed');
 const { scanBindings } = require('../lib/bindings');
 const { collectFromDdb } = require('../../archie-gateway/routing-build');
 
@@ -346,7 +347,77 @@ async function codegenCmd(ctx, args, out, deps = {}) {
   return undefined;
 }
 
+/**
+ * `archie policy seed --env <env> --sandra <path>` — derive a pins file's SKILL allow-lists from sandra.
+ *
+ * NOT `config hydrate`, deliberately: automatic membership would make the pin vacuous, since the next
+ * install of a pinned skill would approve itself. This is for the FIRST seed of an environment and for a
+ * deliberate re-baseline, read as a diff. Continuous drift is check 9's job at publish time.
+ *
+ * Capability pins are never touched — `pin.aws-readonly` holds a scope only a live GRANT# row explains, and
+ * the other groups encode review decisions rather than observations. See lib/policy-seed.js.
+ */
+async function seedCmd(ctx, args, out, deps = {}) {
+  const values = (args && args.values) || {};
+  const env = values.env;
+  const sandra = values.sandra;
+  if (!env) throw usage('--env <env> is required (which pins file to seed)');
+  if (!sandra) {
+    throw usage('--sandra <path> is required — the config repo checkout to derive from', {
+      detail: 'point it at the sandra directory INSIDE the repo, e.g. ~/example/sandra-openclaw-config/sandra. '
+        + 'The branch you have checked out there decides the fleet: main for prod.',
+    });
+  }
+  const sources = loadPolicySources({ env });
+  const pinnedSkills = seed.realKeys(sources.pins.groups)
+    .filter((g) => g.startsWith('skill.')).map((g) => g.slice('skill.'.length));
+  if (!pinnedSkills.length) {
+    throw refused(`pins.${env}.json declares no skill.* groups, so there is nothing to seed`, {
+      detail: 'the pinned SET is code (config-resolver/skill-pins.mjs), and this command only fills in '
+        + 'membership for groups that already exist — it will not invent a group and thereby a new pin.',
+    });
+  }
+
+  const derived = await seed.deriveSkillGroups(sandra, pinnedSkills);
+  const changes = seed.diffGroups(sources.pins.groups, derived.groups);
+
+  const lines = [
+    `env       ${env}  (pins.${env}.json)`,
+    `sandra    ${sandra}`,
+    `fleet     ${derived.routed} routed agent(s); ${derived.installAgents} agent(s) in marketplace-installs`,
+  ];
+  if (derived.unmappable.length) {
+    // LOUD, because it means the two halves of this sandra tree describe different fleets, and a silent drop
+    // seeds an allow-list missing real holders.
+    lines.push(`UNMAPPABLE ${derived.unmappable.length} agent(s) hold a pinned skill but have NO routing surface,`
+      + ' so no scope id — marketplace-installs and agents/ describe different fleets on this branch:');
+    for (const u of derived.unmappable.slice(0, 6)) lines.push(`            ${u.agent}  (${u.skills.join(', ')})`);
+    if (derived.unmappable.length > 6) lines.push(`            … +${derived.unmappable.length - 6} more`);
+  }
+  if (!changes.length) lines.push('membership already matches this sandra tree — nothing to write');
+  for (const c of changes) {
+    lines.push(`${c.group}`);
+    if (c.added.length) lines.push(`            + ${c.added.length}: ${c.added.slice(0, 8).join(', ')}${c.added.length > 8 ? ', …' : ''}`);
+    // REMOVALS ARE THE DANGEROUS HALF and are listed in full: each is a holder that loses the skill.
+    if (c.removed.length) lines.push(`            - ${c.removed.length} (LOSE THE SKILL): ${c.removed.join(', ')}`);
+  }
+
+  if (ctx.dryRun || !changes.length) {
+    answer(out, ctx, { env, sandra, changes, unmappable: derived.unmappable, written: false, dryRun: Boolean(ctx.dryRun) },
+      [...lines, changes.length ? 'written   nothing (dry run) — re-run with --no-dry-run' : ''].filter(Boolean).join('\n'));
+    return undefined;
+  }
+
+  const target = values.file || require('node:path').join(require('../lib/policy-sources').POLICY_DIR, `pins.${env}.json`);
+  const next = seed.applySkillGroups(sources.pins, derived.groups);
+  require('node:fs').writeFileSync(target, `${JSON.stringify(next, null, 2)}\n`);
+  answer(out, ctx, { env, sandra, changes, unmappable: derived.unmappable, written: true, file: target },
+    [...lines, `written   ${target} — review the diff and commit it`].filter(Boolean).join('\n'));
+  return undefined;
+}
+
 module.exports = {
-  publish, show, sourcesForAccount, enumerateScopes, codegen: codegenCmd,
+  publish, show, sourcesForAccount, enumerateScopes, codegen: codegenCmd, seed: seedCmd,
+  'policy seed': seedCmd,
   'policy publish': publish, 'policy show': show, 'policy codegen': codegenCmd,
 };
