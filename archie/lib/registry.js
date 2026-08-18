@@ -54,6 +54,7 @@ const COMMANDS = {
   // selected by the caller's ACCOUNT — publishing one environment's pins into another silently revokes
   // every capability the target's real scopes hold, and a flag would make that typeable (cmd/policy.js).
   'policy publish': { options: { 'accept-policy-change': { type: 'boolean' } }, module: 'policy', task: 'W6-B', needsAws: true, summary: 'compile the Cedar sources and write the fleet artifact + per-scope verdict rows' },
+  'policy codegen': { options: { env:{type:'string'} }, module: 'policy', task: 'W6-B', needsAws: false, summary: 're-render the generated baseline module from the Cedar policy (commit the result)' },
   'policy show': { options: {}, module: 'policy', task: 'W6-B', needsAws: true, summary: 'which policy digest the fleet is running, and whether it matches the sources on disk' },
   'image taint': { options: { reason:{type:'string'} }, module: 'image', task: 'W2-B', needsAws: true, positional: 'tag', summary: 'mark a tag permanently unpublishable; no untaint, no force' },
   'image show': { options: {}, module: 'image', task: 'W2-B', needsAws: true, positional: 'tag', summary: 'one tag: state, health, and every agent bound to it (defaults to live)' },

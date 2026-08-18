@@ -20,6 +20,7 @@ const { clientsFor, resolveAccount } = require('../lib/spec');
 const { loadPolicySources, availableEnvs } = require('../lib/policy-sources');
 const { plan } = require('../lib/policy-publish');
 const { runSourceChecks, capabilityUniverse, diffDecisions } = require('../lib/policy-checks');
+const codegen = require('../lib/policy-codegen');
 const { scanBindings } = require('../lib/bindings');
 const { collectFromDdb } = require('../../archie-gateway/routing-build');
 
@@ -264,7 +265,29 @@ async function show(ctx, args, out, deps = {}) {
   return undefined;
 }
 
+/**
+ * `archie policy codegen` — re-render the generated baseline module from the policy.
+ *
+ * Needs no AWS: the baseline set lives in the SHARED semantics, not the per-environment pins, so any env
+ * renders the same members. `--env` selects which pins file supplies the digest line only.
+ */
+async function codegenCmd(ctx, args, out, deps = {}) {
+  const values = (args && args.values) || {};
+  const env = values.env || 'sandbox';
+  const sources = deps.sources || loadPolicySources({ env });
+  if (ctx.dryRun) {
+    const same = (() => { try { codegen.assertGenerated({ env }); return true; } catch { return false; } })();
+    answer(out, ctx, { env, path: codegen.GENERATED, changed: !same, written: false, dryRun: true },
+      same ? `${codegen.GENERATED} is up to date` : `${codegen.GENERATED} WOULD change — run --no-dry-run`);
+    return undefined;
+  }
+  const r = codegen.write(sources);
+  answer(out, ctx, { env, path: codegen.GENERATED, changed: r.changed, written: r.changed },
+    r.changed ? `wrote ${codegen.GENERATED} (commit it)` : `${codegen.GENERATED} already matches the policy`);
+  return undefined;
+}
+
 module.exports = {
-  publish, show, sourcesForAccount, enumerateScopes,
-  'policy publish': publish, 'policy show': show,
+  publish, show, sourcesForAccount, enumerateScopes, codegen: codegenCmd,
+  'policy publish': publish, 'policy show': show, 'policy codegen': codegenCmd,
 };

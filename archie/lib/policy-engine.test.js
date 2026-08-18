@@ -73,9 +73,16 @@ test('neither Dockerfile COPYs the CLI or references cedar', () => {
   for (const rel of dockerfiles) {
     const p = path.join(DOCKER, rel);
     if (!fs.existsSync(p)) { offenders.push(`${rel} MISSING`); continue; }
-    const text = fs.readFileSync(p, 'utf-8');
-    if (/cedar/i.test(text)) offenders.push(`${rel} mentions cedar`);
-    for (const line of text.split('\n')) {
+    // INSTRUCTIONS ONLY, NOT COMMENTS. This grepped the whole file for /cedar/i, which made a Dockerfile
+    // COMMENT explaining that a COPYed module carries "the Cedar-owned baseline set" fail the containment
+    // check. Same mistake check 3 made in policy-checks.js: prose read as if it were the thing it
+    // describes. These files are heavily commented on purpose, and a guard that punishes an accurate
+    // comment gets satisfied by deleting the comment — the worst available outcome.
+    const instructions = fs.readFileSync(p, 'utf-8').split('\n').filter((l) => !/^\s*#/.test(l));
+    for (const line of instructions) {
+      // A cedar dependency can only arrive by being installed or copied. Naming it in a RUN/COPY/ADD is
+      // the thing to catch.
+      if (/^\s*(RUN|COPY|ADD)\b/.test(line) && /cedar/i.test(line)) offenders.push(`${rel} installs/copies cedar: ${line.trim()}`);
       if (/^\s*COPY\b/.test(line) && /(^|\s)archie\//.test(line)) offenders.push(`${rel}: ${line.trim()}`);
     }
   }

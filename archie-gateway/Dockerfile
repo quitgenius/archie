@@ -86,7 +86,10 @@ COPY --chown=dispatcher:dispatcher archie-runner/config-resolver/skill-iam-requi
 # provider-registry.mjs imports `../tool-declarations.mjs` and `./capabilities.mjs` relatively, so
 # these must keep their agentcore-pi/ + permissions/ nesting or those specifiers resolve to nothing.
 COPY --chown=dispatcher:dispatcher archie-runner/agentcore-pi/tool-declarations.mjs ./agentcore-pi/
-COPY --chown=dispatcher:dispatcher archie-runner/agentcore-pi/permissions/capabilities.mjs archie-runner/agentcore-pi/permissions/provider-registry.mjs ./agentcore-pi/permissions/
+# baseline.generated.mjs is imported BY capabilities.mjs (the Cedar-owned baseline set), so it is not
+# optional here: without it the dispatcher MODULE_NOT_FOUNDs on first use of the Tools tab. The agent
+# image copies permissions/ as a whole directory and so picks it up for free; this allowlist does not.
+COPY --chown=dispatcher:dispatcher archie-runner/agentcore-pi/permissions/capabilities.mjs archie-runner/agentcore-pi/permissions/provider-registry.mjs archie-runner/agentcore-pi/permissions/baseline.generated.mjs ./agentcore-pi/permissions/
 
 # ── BUILD-TIME GATES. Both run against the ASSEMBLED image, after every COPY. ─────────────────
 #

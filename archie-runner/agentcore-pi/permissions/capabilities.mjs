@@ -20,33 +20,32 @@ const HINDSIGHT_WRITE_TOOLS = new Set(
   Object.entries(CUSTOM_TOOLS).filter(([, cap]) => cap === 'hindsight.write').map(([name]) => name),
 );
 
-// THE CEDAR POLICY OWNS THIS SET. `capGroups.baseline` in docker/policy/semantics.json is the
-// declaration of what is "generally available"; this map is its runtime mirror, and `archie deploy` REFUSES
-// when the two disagree in either direction (check 8, archie/lib/policy-checks.js checkBaseline). So editing
-// one without the other is not a drift that shows up later — it is a deploy that does not happen.
+// THE CEDAR POLICY IS THE SINGLE DECLARATION of this set. `capGroups.baseline` in
+// docker/policy/semantics.json is the source; `baseline.generated.mjs` is rendered from it by
+// `archie policy codegen`, and `npm run check` fails the moment the two stop matching. There is no longer a
+// hand-written mirror to keep in step — the previous version of this comment defended one, and the trade it
+// described (codegen would add a build artifact whose staleness is a new silent failure mode) was resolved
+// by R8: docker/policy/ is now a declared input of both images, so a policy edit moves both tags and a
+// stale generated file cannot ship under a tag claiming to contain the new policy.
 //
-// A MIRROR RATHER THAN GENERATED CODE, and that is a considered trade. Generating this from the JSON would
-// make the policy the literal source, but it would put a generated module inside the image — and this file
-// must stay import-free because the DISPATCHER loads it too (archie-gateway/grants.js:150), so a codegen
-// step adds a build artifact whose staleness is a NEW silent failure mode. Enforcing equality at deploy
-// gives the same guarantee (the two cannot diverge) with nothing to go stale.
+// WHY A GENERATED CONSTANT AND NOT THE COMPILED ROW. The row (AGENT#<scope>/POLICY) would be the purer
+// source, but the baseline set must be answerable for a scope with NO row — every scope before its first
+// policy deploy, and any scope the writer missed. Sourcing it from the row would make an absent row mean
+// "deny everything", including `fs.read`: a normal rollout state would become a dead agent, and the
+// layer's additive property would be gone.
 //
-// TWO OF THESE ARE UNREMOVABLE, not merely baseline — sandbox, 2026-08-18: "make that baseline allow across all
-// agents with no way to get rid of it", for `otel` and `hindsight.read`. That property CANNOT be written as
-// a Cedar statement, because `forbid` beats every `permit`: a future forbid naming either one would override
-// even an unconditional permit, and the policy would still be perfectly valid. Check 8's third rule is
-// therefore the only thing enforcing it — it rejects any forbid that reaches them, whether by name or
-// through a CapGroup they belong to.
-export const CAPABILITY_DEFAULTS = {
-  'fs.read': 'allow',
-  memory: 'allow',
-  cron: 'allow',
-  otel: 'allow', // UNREMOVABLE — see above
-  connector: 'allow',
-  health: 'allow', // benign plugin/MCP-server health & introspection tools (not data/action)
-  'hindsight.read': 'allow', // UNREMOVABLE — see above
-  '*': 'deny',
-};
+// `'*': 'deny'` is NOT in the generated file, deliberately. It is not a capability — it is this module's
+// fallthrough, read by policyFor below — and putting it in the policy's baseline group would demand a
+// Capability entity named `*` and make check 2 permanently red.
+import { BASELINE, IMMUTABLE } from './baseline.generated.mjs';
+
+export const CAPABILITY_DEFAULTS = { ...BASELINE, '*': 'deny' };
+
+// Re-exported so the runtime can name them (the boot log does) without a second list. `otel` and
+// `hindsight.read` today — sandbox, 2026-08-18: "baseline allow across all agents with no way to get rid of
+// it". The property is enforced at DEPLOY (check 8 rejects any forbid that reaches them), because `forbid`
+// beats every `permit` and so it cannot be written as a Cedar statement.
+export const IMMUTABLE_CAPABILITIES = IMMUTABLE;
 
 export const policyFor = (cap) => CAPABILITY_DEFAULTS[cap] ?? CAPABILITY_DEFAULTS['*'];
 export const isBaseline = (cap) => policyFor(cap) === 'allow';

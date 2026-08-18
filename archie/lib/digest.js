@@ -179,6 +179,10 @@ const IMAGES = {
       // declaration rolls both halves, which is correct, and the digest makes it visible.
       { path: 'archie-runner/agentcore-pi/tool-declarations.mjs' },
       { path: 'archie-runner/agentcore-pi/permissions/capabilities.mjs' },
+      // Generated from docker/policy/semantics.json (policy-codegen.js) and imported by
+      // capabilities.mjs. An input in its own right, not only via the policy sources: the two move
+      // together, but a hand-edit of the generated file must also move the tag.
+      { path: 'archie-runner/agentcore-pi/permissions/baseline.generated.mjs' },
       { path: 'archie-runner/agentcore-pi/permissions/provider-registry.mjs' },
     ],
   },

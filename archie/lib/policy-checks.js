@@ -265,6 +265,19 @@ function checkBaseline(sources, caps, cedar = require('@cedar-policy/cedar-wasm/
     Object.entries(caps.CAPABILITY_DEFAULTS).filter(([k, v]) => k !== '*' && v === 'allow').map(([k]) => k),
   );
 
+  // THE STALENESS CHECK, which is what makes the set comparison below almost — but not entirely —
+  // tautological now that CAPABILITY_DEFAULTS is GENERATED from `declared`. It is not fully redundant: the
+  // generated file is committed, so a stale copy on disk would satisfy the comparison while disagreeing
+  // with the policy this deploy is about to publish. Run FIRST so the message names the actual fix.
+  try {
+    require('./policy-codegen').assertGenerated({ env: sources.env, dir: sources.dir });
+  } catch (e) {
+    out.push(finding(8, e.message, {
+      detail: 'the runtime\'s baseline set is generated from this policy; a stale copy means the fleet '
+        + 'enforces a different set from the one this release publishes.',
+    }));
+  }
+
   for (const cap of [...declared].sort()) {
     if (!inCode.has(cap)) {
       out.push(finding(8, `'${cap}' is baseline in the policy but NOT allow in CAPABILITY_DEFAULTS`, {
