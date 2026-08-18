@@ -95,13 +95,26 @@ function engine() {
 const policySetFor = (sources) => ({ staticPolicies: requireSemantics(sources) });
 
 /**
- * One authorization question, with the engine's failures treated as failures.
+ * One authorization question, with BOTH of the engine's error channels treated as failures.
  *
- * THIS IS THE ONE PLACE A SWALLOWED ERROR WOULD BE CATASTROPHIC. `isAuthorized` returns
- * `{ type: 'failure' }` for a malformed request, a bad entity set, or a condition that errored — and a
- * `catch`-to-`deny` here would turn any of those into a fleet-wide deny-all row set that looks
- * completely ordinary, because `deny` is the expected value for 2,535 of prod's 2,556 entries. The
- * failure must reach the operator before anything is written.
+ * THIS IS THE ONE PLACE A SWALLOWED ERROR WOULD BE CATASTROPHIC, because `deny` is the expected value
+ * for 2,535 of prod's 2,556 entries — so anything that quietly becomes a deny produces a row set that
+ * looks completely ordinary and revokes capabilities fleet-wide.
+ *
+ * THERE ARE TWO CHANNELS, AND THE SECOND ONE IS THE TRAP. Measured against 4.12.0:
+ *
+ *   · `{ type: 'failure' }` — the policy text or the request did not parse. Loud, unmissable.
+ *   · `{ type: 'success', response: { decision: 'deny', diagnostics: { errors: [...] } } }` — a
+ *     condition ERRORED at evaluation time. A missing `resource.name` gives exactly this: decision
+ *     `deny`, `reason: []`, and `entity "Archie::Capability::\"c\"" does not exist` buried in
+ *     `diagnostics.errors`. This is the failure archie.cedarschema:29-33 and spike README §5 both warn
+ *     about — "the permit never applies and the request denies for a reason that has nothing to do
+ *     with policy" — and it is a SUCCESSFUL call with an ordinary-looking answer. Reading only
+ *     `response.decision` would materialise it as a real deny and there would be nothing to notice.
+ *
+ * So a non-empty `diagnostics.errors` refuses too. It is not a permissible state for this policy: every
+ * capability in the domain has an entity carrying `name` (policy-entities.js), so any error here means
+ * the entity set and the policy have come apart.
  */
 function decisionFor({ scope, capability, grants, policies, entities }) {
   const answer = engine().isAuthorized({
@@ -115,6 +128,11 @@ function decisionFor({ scope, capability, grants, policies, entities }) {
   if (answer.type !== 'success') {
     throw preflight(`Cedar refused the request for ${scope} / ${capability}`,
       { detail: JSON.stringify(answer.errors) });
+  }
+  const errors = answer.response.diagnostics?.errors || [];
+  if (errors.length > 0) {
+    throw preflight(`Cedar evaluated ${scope} / ${capability} with errors — the decision is not trustworthy`,
+      { detail: errors.map((e) => `${e.policyId}: ${e.error?.message}`).join('; ') });
   }
   return answer.response.decision;   // 'allow' | 'deny'
 }
@@ -224,19 +242,18 @@ function verdictsFor(scope, sources, ctx = null) {
  * decider for an unpinned fleet.
  */
 function rowFor(scope, sources, ctx = null) {
+  // Asserted BEFORE the up-to-62 engine calls this costs (31 capabilities, two probes each): a row that
+  // cannot name its policy and its account is unshippable whatever its verdicts, so there is nothing to
+  // compute.
+  const account = requireAccount(sources);
+  const policyDigest = requireDigest(sources);
   const context = ctx || contextFor(sources);
   const all = verdictsFor(scope, sources, context);
   const verdicts = {};
   for (const capability of context.domain) {
     if (all[capability] !== ambientVerdict(capability, sources)) verdicts[capability] = all[capability];
   }
-  return {
-    v: ROW_VERSION,
-    account: requireAccount(sources),
-    policyDigest: requireDigest(sources),
-    scope,
-    verdicts,
-  };
+  return { v: ROW_VERSION, account, policyDigest, scope, verdicts };
 }
 
 /**

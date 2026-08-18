@@ -209,7 +209,8 @@ function scopeEntity(scope, sources, index = null) {
  * Everything except the principal — capabilities, capGroups, scopeGroups.
  *
  * Exported separately so a fleet-wide materialisation builds it once and concatenates one Scope entity
- * per scope, rather than rebuilding 43 entities 213 times.
+ * per scope, rather than rebuilding the same 45 entities (31 capabilities + 2 CapGroups + 12
+ * ScopeGroups) 213 times.
  */
 function sharedEntities(sources) {
   return [...capabilityEntities(sources), ...scopeGroupEntities(sources)];
