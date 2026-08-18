@@ -158,12 +158,42 @@ async function main() {
   // and then RESTORE global verification, so a self-signed cert on those two hosts no longer
   // blinds the whole runtime. Prod points at real ACM certs, so the allow-list is simply empty
   // there and full verification applies everywhere. Safe to run before any HTTPS call is made.
+  // INSTALLED UNCONDITIONALLY, and that is the fix for a live outage rather than a tidy-up.
+  //
+  // This used to run only `if (NODE_TLS_REJECT_UNAUTHORIZED === '0')`, i.e. only when the fleet was still
+  // asking for the process-wide bypass. But modules/archie/ssm.tf:126-131 documents the opposite contract
+  // and is right to: "the sandbox endpoint serves a self-signed cert, but tls-scoped.mjs already derives
+  // its insecure-host list from HINDSIGHT_API_URL itself, and pi-entrypoint installs the scoped
+  // tls.connect shim at boot. So setting this URL relaxes verification for THAT HOST ONLY and
+  // AGENTCORE_RUNTIME_TLS_REJECT stays '1'. … do not flip runtime_tls_reject to '0'."
+  //
+  // The shim was gated on the very flag that config correctly sets to '1'. So with
+  // runtime_tls_reject='1' — the documented, tightened, intended posture — NO shim was installed, full
+  // verification applied to a self-signed host, and every Hindsight call failed. Found 2026-08-18 on
+  // dm-ux0mz5ckp2r: `hindsight org recall error (bank default-org): recall failed: "fetch failed"` on every
+  // turn, so the agent had been running with no memory recall at all, silently, plus all four
+  // agent_knowledge_* read tools broken. The absence of the log line below was the only clue.
+  //
+  // Scoping does not depend on the flag: `collectInsecureHosts` derives the hosts from the URLs the
+  // runtime was given, and installScopedTlsBypass([]) is a no-op — so prod, with real ACM certs and no
+  // self-signed URLs, still installs nothing and verifies everywhere.
+  const insecureHosts = collectInsecureHosts(process.env);
+  const { hosts } = installScopedTlsBypass(insecureHosts, { logger: console });
   if (process.env.NODE_TLS_REJECT_UNAUTHORIZED === '0') {
-    const insecureHosts = collectInsecureHosts(process.env);
-    const { hosts } = installScopedTlsBypass(insecureHosts, { logger: console });
-    // Restore process-wide verification — from here on only the allow-listed hosts are relaxed.
+    // The legacy posture: the fleet asked for a process-wide bypass. Now that the scoped shim is in,
+    // remove it so everything except `hosts` is verified again.
     delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
     log({ level: 'info', msg: 'restored global TLS verification; relaxed only for allow-listed hosts', hosts });
+  } else {
+    // LOGGED EITHER WAY, including the empty case. Silence here is what made the outage invisible: with no
+    // line at all, "no self-signed hosts to scope" and "the shim never ran" look identical.
+    log({
+      level: 'info',
+      msg: hosts.length
+        ? 'scoped TLS relaxation installed for known self-signed hosts; everything else is verified'
+        : 'no scoped TLS relaxation needed — full certificate verification everywhere',
+      hosts,
+    });
   }
 
   // Config comes from DynamoDB; the workspace seed is deferred to the adapter.

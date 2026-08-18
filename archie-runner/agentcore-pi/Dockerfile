@@ -102,7 +102,7 @@ COPY agentcore-pi/pi-runtime.mjs agentcore-pi/pi-adapter.mjs agentcore-pi/config
      agentcore-pi/config-fingerprint.mjs agentcore-pi/agent-config.mjs \
      agentcore-pi/memory-tool.mjs agentcore-pi/session-store.mjs \
      agentcore-pi/hindsight-extension.mjs agentcore-pi/hindsight-client-recall.mjs \
-     agentcore-pi/knowledge-tools.mjs agentcore-pi/knowledge-write-tools.mjs \
+     agentcore-pi/knowledge-tools.mjs agentcore-pi/knowledge-write-tools.mjs agentcore-pi/fetch-error.mjs \
      agentcore-pi/clock-extension.mjs \
      agentcore-pi/otel-export.cjs agentcore-pi/pi-entrypoint.mjs agentcore-pi/sse-contract.mjs \
      agentcore-pi/bedrock-dispatch-mark.mjs \

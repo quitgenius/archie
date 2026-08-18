@@ -5,6 +5,11 @@
 // dep present; the client is pinned in the Pi image package.json (^0.6.2, matching the
 // plugin) and validated at image-build/deploy time.
 
+// STATIC, unlike the client above, and that does not weaken the lazy-load property described in the header:
+// what must stay dynamic is `@vectorize-io/hindsight-client`, so this module loads in a test with no dep
+// installed. fetch-error.mjs has no imports of its own, so it is free to load anywhere.
+import { describeFetchError } from './fetch-error.mjs';
+
 const DEFAULTS = { maxTokens: 1024, budget: 'mid', types: ['world'], timeoutMs: 10_000 };
 
 function withTimeout(promise, ms, label) {
@@ -34,11 +39,11 @@ export async function buildClientRecall(cfg = {}) {
     const [resp, orgResp] = await Promise.all([
       agentClient
         ? withTimeout(agentClient.recall(o.agentBankId, query, { maxTokens: o.maxTokens, budget: o.budget, types: o.types }), o.timeoutMs, 'agent')
-            .catch((e) => { logger.warn(`hindsight agent recall error (bank ${o.agentBankId}): ${e?.message || e}`); return null; })
+            .catch((e) => { logger.warn(`hindsight agent recall error (bank ${o.agentBankId}): ${describeFetchError(e)}`); return null; })
         : Promise.resolve(null),
       orgClient
         ? withTimeout(orgClient.recall(o.orgBankId, query, { maxTokens: o.orgMaxTokens ?? o.maxTokens, budget: o.orgBudget ?? o.budget, types: o.orgTypes ?? o.types }), o.timeoutMs, 'org')
-            .catch((e) => { logger.warn(`hindsight org recall error (bank ${o.orgBankId}): ${e?.message || e}`); return null; })
+            .catch((e) => { logger.warn(`hindsight org recall error (bank ${o.orgBankId}): ${describeFetchError(e)}`); return null; })
         : Promise.resolve(null),
     ]);
     return { results: resp?.results ?? [], orgResults: orgResp?.results ?? [] };

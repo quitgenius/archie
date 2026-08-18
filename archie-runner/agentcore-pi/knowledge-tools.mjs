@@ -25,6 +25,7 @@
 // `hindsight.write`, which is policy-pinned (see archie-cedar-spike/policy/semantics.cedar B1).
 
 import { piAi } from './pi-runtime.mjs';
+import { describeFetchError } from './fetch-error.mjs';
 
 const T = piAi.Type;
 
@@ -58,9 +59,17 @@ const ok = (data) => {
 };
 
 async function apiGet(baseUrl, path, token, fetchImpl = fetch) {
-  const resp = await fetchImpl(`${baseUrl}${path}`, {
-    headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
-  });
+  // The fetch itself is wrapped, not just the response: a TLS or DNS failure rejects here with the useless
+  // `fetch failed`, and that string is what the MODEL sees as the tool result. Unwrapped, it reads the
+  // failure as "the knowledge base is empty" and carries on; named, it can say what is broken.
+  let resp;
+  try {
+    resp = await fetchImpl(`${baseUrl}${path}`, {
+      headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+    });
+  } catch (e) {
+    throw new Error(`hindsight GET ${path} failed: ${describeFetchError(e, baseUrl)}`);
+  }
   if (!resp.ok) {
     const body = await resp.text().catch(() => '');
     throw new Error(`API ${resp.status}: ${body}`);
@@ -69,11 +78,16 @@ async function apiGet(baseUrl, path, token, fetchImpl = fetch) {
 }
 
 async function apiPost(baseUrl, path, body, token, fetchImpl = fetch) {
-  const resp = await fetchImpl(`${baseUrl}${path}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
-    body: JSON.stringify(body),
-  });
+  let resp;
+  try {
+    resp = await fetchImpl(`${baseUrl}${path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+      body: JSON.stringify(body),
+    });
+  } catch (e) {
+    throw new Error(`hindsight POST ${path} failed: ${describeFetchError(e, baseUrl)}`);
+  }
   if (!resp.ok) {
     const text = await resp.text().catch(() => '');
     throw new Error(`API ${resp.status}: ${text}`);
