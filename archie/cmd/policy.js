@@ -421,6 +421,12 @@ async function seedCmd(ctx, args, out, deps = {}) {
     lines.push(`WARNING   ground-truth/ is absent — plugin-config capabilities (${seed.PLUGIN_CAP_SIGNALS.map((s) => s.cap).join(', ')}) `
       + 'were NOT derived. capture-ground-truth.mjs produces it (once per agent, plugins on).');
   }
+  // FLAG-vs-TOOL DISAGREEMENTS, printed whether or not anything changed. Each one is a capability that
+  // LOOKS configured and cannot be exercised (or a tool that is offered and fails), and it derives no
+  // membership either way — so without this line the only symptom is a pin group quietly missing a holder.
+  for (const c of derived.signalConflicts || []) {
+    lines.push(`CONFLICT  ${c.agent} / ${c.cap}: plugin flag=${c.flag}, tool admitted=${c.admitted} — ${c.detail}`);
+  }
   if (derived.unmappable.length) {
     // LOUD, because it means the two halves of this sandra tree describe different fleets, and a silent drop
     // seeds an allow-list missing real holders.
@@ -443,7 +449,7 @@ async function seedCmd(ctx, args, out, deps = {}) {
   }
 
   if (ctx.dryRun || !changes.length) {
-    answer(out, ctx, { env, sandra, changes, withheld, unmappable: derived.unmappable, coverage: cov, written: false, dryRun: Boolean(ctx.dryRun) },
+    answer(out, ctx, { env, sandra, changes, withheld, unmappable: derived.unmappable, signalConflicts: derived.signalConflicts, coverage: cov, written: false, dryRun: Boolean(ctx.dryRun) },
       [...lines, changes.length ? 'written   nothing (dry run) — re-run with --no-dry-run' : ''].filter(Boolean).join('\n'));
     return undefined;
   }
@@ -451,7 +457,7 @@ async function seedCmd(ctx, args, out, deps = {}) {
   const target = values.file || require('node:path').join(require('../lib/policy-sources').POLICY_DIR, `pins.${env}.json`);
   const next = seed.applySkillGroups(sources.pins, merged);
   require('node:fs').writeFileSync(target, `${JSON.stringify(next, null, 2)}\n`);
-  answer(out, ctx, { env, sandra, changes, withheld, unmappable: derived.unmappable, coverage: cov, written: true, file: target },
+  answer(out, ctx, { env, sandra, changes, withheld, unmappable: derived.unmappable, signalConflicts: derived.signalConflicts, coverage: cov, written: true, file: target },
     [...lines, `written   ${target} — review the diff and commit it`].filter(Boolean).join('\n'));
   return undefined;
 }
