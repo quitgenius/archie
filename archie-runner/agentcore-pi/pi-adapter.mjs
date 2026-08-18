@@ -17,7 +17,7 @@ import { buildCompatPlugins, prewarmCompatPlugins } from './openclaw-compat/plug
 import { createHindsightExtension } from './hindsight-extension.mjs';
 import { createClockExtension } from './clock-extension.mjs';
 import { makeCapabilityResolver, makeDecider, makeAllowCheck, policyRef } from './permissions/capabilities.mjs';
-import { loadPolicyTable, policyTableRequired } from './permissions/policy-table.mjs';
+import { loadPolicyTable } from './permissions/policy-table.mjs';
 import { createPermissionsExtension, makeCan } from './permissions/permissions-extension.mjs';
 import { applyToolFilter } from './permissions/tool-filter.mjs';
 import { buildProviderRegistry, checkClosure } from './permissions/provider-registry.mjs';
@@ -861,9 +861,11 @@ async function loadGrants(channel) {
 //     in the store that holds the permissions must never widen what an agent may do. Stricter than
 //     grants, though, because a table is authoritative — an empty grant set still leaves baseline, a
 //     deny-all table leaves nothing, so an outage here is a hard stop and should be alarmed.
-//   * row ABSENT → null, meaning "behave exactly as before this layer existed". Every scope is in this
-//     state until the first policy deploy reaches it. Permissive by design, and the reason
-//     POLICY_TABLE_REQUIRED exists to close it once the fleet is materialised.
+//   * row ABSENT → DENY-ALL, same as invalid (changed 2026-08-18; POLICY_TABLE_REQUIRED is gone). It used
+//     to be permissive — "behave exactly as before this layer existed" — which left any pin on an
+//     uncovered scope silently inert. The dispatcher writes this row on every turn before the invoke
+//     (ensureCurrentRuntime → ensurePolicyRow), so absent no longer means "not reached yet": it means the
+//     write failed or the fleet has no policy at all, and neither is a state to serve a turn in.
 async function loadPolicy() {
   const onProblem = (why, detail) => console.error(JSON.stringify({
     level: why === 'absent' ? 'info' : 'error', component: 'pi-adapter',
@@ -874,13 +876,15 @@ async function loadPolicy() {
     row = await (await ddbIO()).readPolicy();
   } catch (e) {
     onProblem('read-failed', { err: e.message });
-    return { verdictFor: () => 'deny', digest: null, denyAll: true, why: 'read-failed' };
+    // EMITTED HERE TOO, not only on the path below. This early return is the DynamoDB-outage case —
+    // the deny-all most worth paging on — and it bypasses the tail of this function, so an alarm wired
+    // only there would stay in OK through exactly the incident it exists for.
+    const failed = { verdictFor: () => 'deny', digest: null, denyAll: true, why: 'read-failed' };
+    emitPolicyDenyAll(failed);
+    return failed;
   }
+  // No null case any more: loadPolicyTable always returns a table, and an absent row is a deny-all one.
   const table = loadPolicyTable(row, { scope: AGENT_NAME, expectedAccount: EXPECTED_ACCOUNT, onProblem });
-  if (table === null && policyTableRequired()) {
-    onProblem('absent-but-required', {});
-    return { verdictFor: () => 'deny', digest: null, denyAll: true, why: 'absent-but-required' };
-  }
 
   // SUCCESS IS LOGGED TOO, and the first live check is why. Only the failure paths above logged, so a
   // healthy scope emitted NOTHING — which made "policy is in force at digest X" indistinguishable from
@@ -899,7 +903,45 @@ async function loadPolicy() {
       governs: table.capabilities.length, allowed: table.allowed,
     }));
   }
+  emitPolicyDenyAll(table);
   return table;
+}
+
+/**
+ * `PolicyDenyAll` — 1 when this scope fell back to deny-all, 0 when the policy loaded.
+ *
+ * WHY A METRIC WHEN THE FALLBACK ALREADY LOGS. Since 2026-08-18 an absent row denies EVERYTHING
+ * including baseline, so this fallback is now a HARD STOP for the agent rather than a quiet downgrade —
+ * and the shape it presents is the one this fleet is worst at noticing: the agent answers nothing, and a
+ * silent agent is indistinguishable from an idle one (the same argument BootFailedCount was added for).
+ * The log line is per-runtime — AgentCore gives each runtime its OWN log group
+ * (/aws/bedrock-agentcore/runtimes/<name>-<id>-DEFAULT) — so a log-based alarm would need one metric
+ * filter per runtime, recreated on every roll, which Terraform cannot own because the dispatcher creates
+ * the runtimes. An EMF metric sidesteps that entirely: one series, fleet-wide.
+ *
+ * EMITTED ON BOTH PATHS, 1 and 0. A metric that only appears on failure gives the alarm nothing to sit
+ * on between incidents, so it depends on `treat_missing_data` to distinguish "healthy" from "this image
+ * does not emit the metric at all" — which it cannot. A continuous series makes healthy explicit and
+ * makes the alarm's own absence visible.
+ *
+ * `why` is a dimension-free field rather than a dimension: absent / read-failed / the validation
+ * refusals are all the same alarm, and splitting them would let one cause fire while another stayed in
+ * OK on a per-reason series with no data. It is on the line so the alarm's log context names the cause.
+ */
+function emitPolicyDenyAll(table) {
+  try {
+    const denied = Boolean(table && table.denyAll);
+    console.log(JSON.stringify({
+      _aws: { Timestamp: Date.now(), CloudWatchMetrics: [{ Namespace: 'AgentCore/Pi', Dimensions: [['Agent'], []], Metrics: [{ Name: 'PolicyDenyAll', Unit: 'Count' }] }] },
+      Agent: AGENT_NAME, PolicyDenyAll: denied ? 1 : 0,
+      component: 'pi-adapter', msg: 'policy_deny_all',
+      why: denied ? (table.why || 'unknown') : null,
+      policyDigest: table && table.digest ? table.digest : null,
+    }));
+    // Same reasoning as emitBootFailed: a failed metric write must never replace the real state with
+    // "EMF write failed". The policy decision itself is already logged beside this.
+    // eslint-disable-next-line local/no-statementless-catch -- see above
+  } catch { /* telemetry never changes the verdict */ }
 }
 
 function ensureEfsReady() {

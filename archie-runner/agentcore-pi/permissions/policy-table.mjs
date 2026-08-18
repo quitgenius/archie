@@ -48,21 +48,31 @@ const denyAllTable = (why) => ({
  * @param {string|null} [opts.expectedAccount]  asserted against row.account when supplied; see below
  * @param {(msg: string, detail: object) => void} [opts.onProblem]  called for every refusal, once
  * @returns {{verdictFor: (cap: string) => ('allow'|'grant'|'deny'|undefined), digest: string|null,
- *            denyAll: boolean, why?: string} | null}
- *          `null` means NO ROW AT ALL — the caller keeps today's grant-only behaviour. Any other
- *          return is a table to consult.
+ *            denyAll: boolean, why?: string}}
+ *          ALWAYS a table — never null. An unusable or missing row yields a deny-all table.
  *
- * ABSENT IS NOT THE SAME AS INVALID, and conflating them would break the rollout in one direction or
- * the other. Every scope has no row until the first policy deploy reaches it, so absent must mean
- * "behave exactly as before" — that additive property is what makes the Phase 0 baseline meaningful and
- * what lets this ship before the fleet is fully materialised. Invalid, by contrast, means a row was
- * written and cannot be trusted, and that fails closed.
+ * ABSENT NOW MEANS DENY-ALL, exactly like invalid (2026-08-18). It used to return `null` for
+ * "behave exactly as before this layer existed", which made the rollout additive and made an absent row
+ * PERMISSIVE — so a scope the materialiser never covered kept grant-based behaviour and any pin on it was
+ * silently inert. That was not hypothetical: ch-cr89fluhion, the scope holding every sandbox pin, sat in
+ * exactly that state, and its five pins did nothing while looking configured. A permissive default for the
+ * component whose whole job is withholding capability is the wrong default, and "we will flip the flag once
+ * the fleet is materialised" is a promise no one is paged about.
  *
- * The danger in that split is real and worth naming: an absent row is PERMISSIVE, so a scope the
- * materialiser never covered keeps grant-based behaviour and any pin on it is silently inert. That is
- * not hypothetical — ch-cr89fluhion, the scope holding every sandbox pin, is absent from the deploy
- * roster for exactly this reason (§2.1). So absence is logged loudly here, and once the fleet is fully
- * materialised POLICY_TABLE_REQUIRED flips it to deny-all, which is the switch that closes the hole.
+ * WHAT MAKES THIS SAFE is not optimism, it is that the row is written on EVERY TURN before the invoke:
+ * `ensureCurrentRuntime` awaits `ensurePolicyRow` (archie-gateway/index.js:161), which is both the
+ * mint-time write for a scope no deploy can enumerate and the staleness backstop for a policy edit the
+ * deploy never saw. So a scope cannot serve a turn without a current row.
+ *
+ * WHAT IT COSTS, stated plainly because it is a real operational edge: if the FLEET ARTIFACT does not
+ * exist, `ensurePolicyRow` is a documented no-op ('no-artifact'), no rows are written anywhere, and every
+ * agent is denied everything — including baseline. Two consequences follow, and both are deliberate:
+ *   1. `archie policy publish` must precede the image roll. `archie deploy` already orders it that way
+ *      (step 1.5 publishes before the agent half), so a normal release satisfies this by construction.
+ *   2. An account with NO pins file can no longer run agents at all. `archie deploy` treats that as a
+ *      warning ('no-pins') on the grounds that the layer is additive — which is no longer true. That
+ *      branch should become a refusal; until it does, standing up a new environment means adding its
+ *      pins file first.
  */
 export function loadPolicyTable(row, { scope, expectedAccount = null, onProblem = () => {} } = {}) {
   const refuse = (why, detail = {}) => {
@@ -72,7 +82,7 @@ export function loadPolicyTable(row, { scope, expectedAccount = null, onProblem 
 
   if (row === null || row === undefined) {
     try { onProblem('absent', { scope }); } catch { /* ignore */ }
-    return null;
+    return denyAllTable('absent');
   }
   if (typeof row !== 'object' || Array.isArray(row)) return refuse('not-an-object');
 
@@ -125,12 +135,13 @@ export function loadPolicyTable(row, { scope, expectedAccount = null, onProblem 
   };
 }
 
-/**
- * Should an ABSENT row be treated as deny-all?
- *
- * Off by default so the layer is additive during rollout (see loadPolicyTable). Flipping this on is the
- * final step of materialising the fleet: after it, a scope with no POLICY row cannot act, so a pin can
- * never be silently inert. It is an env flag rather than a constant precisely because the safe value
- * changes over the rollout, and the change must be revertible without an image build.
- */
-export const policyTableRequired = (env = process.env) => env.POLICY_TABLE_REQUIRED === '1';
+// POLICY_TABLE_REQUIRED IS GONE (2026-08-18). It was the env flag that turned an absent row from
+// permissive into deny-all, off by default so the rollout could be additive. Deny-all is now the
+// UNCONDITIONAL default, so there is nothing left to switch: see loadPolicyTable's absent branch.
+//
+// What made the flag safe to delete rather than merely unnecessary: the dispatcher writes this row on
+// EVERY turn, before the invoke, and awaits it — `ensureCurrentRuntime` → `ensurePolicyRow`
+// (archie-gateway/index.js:161). That is both the mint-time write for a scope no deploy can enumerate and
+// the staleness backstop for a policy edit the deploy never saw. So a scope cannot take a turn without a
+// current row, and "absent" no longer means "not reached yet" — it means the write failed or the fleet has
+// no policy at all. Neither is a state to serve a turn in.

@@ -1,5 +1,5 @@
 // The compiled-verdict layer. Two things under test and they fail in opposite directions on purpose:
-// loadPolicyTable's validation (invalid → deny everything; absent → behave as before), and the
+// loadPolicyTable's validation (invalid AND absent → deny everything), and the
 // resolution rule shared by the decider and the tool filter.
 //
 // The assertions that matter most are the ones about a GRANT ROW BEING INERT. "Policy-pinned" means
@@ -9,7 +9,8 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { loadPolicyTable, policyTableRequired, CONTRACT_VERSION } from './policy-table.mjs';
+import { loadPolicyTable, CONTRACT_VERSION } from './policy-table.mjs';
+import * as policyTableModule from './policy-table.mjs';
 import { makeDecider, makeAllowCheck, policyRef } from './capabilities.mjs';
 
 const SCOPE = 'ch-cr89fluhion';
@@ -39,13 +40,24 @@ test('a loaded table can REPORT what it governs, without an external capability 
   assert.equal(t.digest, 'sha256:abc');
 });
 
-test('ABSENT is null, NOT deny-all — the layer must be additive before it is materialised', () => {
-  // Distinct from every invalid case below. Every scope is in this state until the first policy deploy
-  // reaches it, so conflating the two would deny-all the entire fleet on rollout.
+test('ABSENT is DENY-ALL, exactly like invalid', () => {
+  // REVERSED 2026-08-18 (was: absent → null → behave as before). The old contract made the rollout
+  // additive at the cost of making the absent case PERMISSIVE, which left any pin on an uncovered scope
+  // silently inert — ch-cr89fluhion held five pins in exactly that state and enforced none of them.
+  //
+  // Safe to reverse because the dispatcher writes this row on EVERY turn before the invoke
+  // (ensureCurrentRuntime → ensurePolicyRow), so absent no longer means "not reached yet".
   const problems = [];
-  assert.equal(load(null, { onProblem: (w) => problems.push(w) }), null);
-  assert.equal(load(undefined), null);
-  assert.deepEqual(problems, ['absent'], 'absence is still reported — it is permissive, so it must be visible');
+  const t = load(null, { onProblem: (w) => problems.push(w) });
+  assert.equal(t.denyAll, true);
+  assert.equal(t.why, 'absent');
+  assert.equal(load(undefined).denyAll, true);
+  // BASELINE IS DENIED TOO, which is the part with teeth: this is a hard stop, not a downgrade to
+  // grant-only. An agent in this state cannot even read a file.
+  assert.equal(t.verdictFor('fs.read'), 'deny');
+  assert.equal(t.verdictFor('hindsight.write'), 'deny');
+  assert.equal(t.digest, null);
+  assert.deepEqual(problems, ['absent'], 'still reported — it is now a hard stop, so it must be visible');
 });
 
 test('every malformed row fails CLOSED, denying capabilities it never mentioned', () => {
@@ -83,11 +95,13 @@ test('account is asserted when supplied, skipped-and-recorded when not', () => {
   assert.equal(load(rowOf({})).accountAsserted, false);
 });
 
-test('POLICY_TABLE_REQUIRED is off unless explicitly 1', () => {
-  assert.equal(policyTableRequired({}), false);
-  assert.equal(policyTableRequired({ POLICY_TABLE_REQUIRED: '0' }), false);
-  assert.equal(policyTableRequired({ POLICY_TABLE_REQUIRED: 'true' }), false, 'only the exact flag counts');
-  assert.equal(policyTableRequired({ POLICY_TABLE_REQUIRED: '1' }), true);
+test('POLICY_TABLE_REQUIRED no longer exists — deny-all is unconditional', () => {
+  // The flag existed to turn absent-is-permissive into absent-is-deny-all, off by default. With the
+  // default reversed there is nothing to switch, and a lingering export would imply the old behaviour is
+  // still reachable. Asserted as an ABSENCE so re-adding it has to be deliberate.
+  assert.equal(policyTableModule.policyTableRequired, undefined);
+  // And no option re-opens it: the absent branch takes no configuration at all.
+  assert.equal(load(null).denyAll, true);
 });
 
 // ---------------------------------------------------------------------------------------------------
@@ -150,8 +164,11 @@ test('an unusable table reports policy-unusable, not a bare deny', () => {
   assert.equal(signals[0].reason, 'policy-unusable');
 });
 
-test('with NO table the decider is byte-equivalent to the pre-policy rule', () => {
-  // The additive property Phase 0's baseline depends on.
+test('resolve() with a NULL table still applies the pre-policy rule', () => {
+  // NOT the absent-row case any more — loadPolicyTable never returns null (see above). This is the
+  // transient inside `policyRef()`, whose table starts null and is assigned by the adapter's first
+  // refresh, plus every caller that passes no policy at all (tests, one-shot checks). Kept because that
+  // code path is still reachable and its rule must stay defined.
   const { decide } = decideWith(null, ['datadog']);
   assert.equal(decide('fs.read'), true, 'baseline still ambient');
   assert.equal(decide('datadog'), true, 'grant still works');
