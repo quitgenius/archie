@@ -212,6 +212,113 @@ function checkMembership(sources, knownScopes) {
   return out;
 }
 
+// The capabilities that are not merely baseline but UNREMOVABLE — sandbox, 2026-08-18: "make that baseline
+// allow across all agents with no way to get rid of it". Recorded in semantics.json's
+// capGroups.baseline.$immutable, and read from there rather than duplicated, so the policy file stays the
+// declaration.
+const immutableCaps = (sources) => {
+  const g = requireCapGroups(sources).baseline || {};
+  // The list lives in `$immutable` as PROSE (it explains the rule at length), so the capability names are
+  // extracted from the members it names rather than parsed out of the sentences: a capability is immutable
+  // iff the prose names it AND it is a baseline member. That keeps the machine-readable half honest without
+  // asking a comment to be structured data.
+  const prose = (g.$immutable || []).join(' ');
+  return (g.members || []).filter((c) => prose.includes(c));
+};
+
+const requireCapGroups = (sources) => {
+  const data = sources && sources.data;
+  if (!data || !data.capGroups) throw new Error('policy checks: semantics.json capGroups missing');
+  return data.capGroups;
+};
+
+/**
+ * CHECK 8 — Cedar OWNS the "generally available" set, and the JS map may not disagree with it.
+ *
+ * `CAPABILITY_DEFAULTS` (agentcore-pi/permissions/capabilities.mjs) and `capGroups.baseline` are the same
+ * fact written twice, and semantics.json says which one is meant to be authoritative: "Cedar is intended
+ * to become the single declaration of this set, with the JS map derived from it."
+ *
+ * NOT BY CODEGEN, deliberately. Generating the JS from the JSON would make the policy file the literal
+ * source, but it would also put a generated module inside the image — and capabilities.mjs must stay
+ * import-free because the DISPATCHER loads it (grants.js:150), so a generated file adds a build step whose
+ * staleness is a new silent failure mode. Ownership is enforced by REFUSAL instead: the map stays
+ * hand-written, and a deploy where the two disagree does not happen. That gives the same guarantee — the
+ * two cannot drift — without a build artifact to go stale.
+ *
+ * Three rules, and the third is the one that matters most because Cedar cannot express it:
+ *   a. the sets are equal, both directions
+ *   b. every immutable capability is a baseline member
+ *   c. NO `forbid` names an immutable capability, directly or through a CapGroup it belongs to
+ *
+ * (c) exists because `forbid` beats every `permit`. So a future forbid naming `hindsight.read` would
+ * override even an unconditional permit for it, and "unremovable" would quietly stop being true — with no
+ * validation error, because the policy would be perfectly well-formed. semantics.json states this
+ * plainly: "That property cannot be written as a Cedar statement… Immutability is therefore a BUILD-TIME
+ * RULE the deploy must enforce." This is that enforcement.
+ */
+function checkBaseline(sources, caps, cedar = require('@cedar-policy/cedar-wasm/nodejs')) {
+  const out = [];
+  const groups = requireCapGroups(sources);
+  const declared = new Set((groups.baseline && groups.baseline.members) || []);
+  const inCode = new Set(
+    Object.entries(caps.CAPABILITY_DEFAULTS).filter(([k, v]) => k !== '*' && v === 'allow').map(([k]) => k),
+  );
+
+  for (const cap of [...declared].sort()) {
+    if (!inCode.has(cap)) {
+      out.push(finding(8, `'${cap}' is baseline in the policy but NOT allow in CAPABILITY_DEFAULTS`, {
+        detail: 'the policy is the declaration — either add it to CAPABILITY_DEFAULTS or remove it from '
+          + 'capGroups.baseline. Left alone, the runtime denies a capability the policy calls generally '
+          + 'available.',
+      }));
+    }
+  }
+  for (const cap of [...inCode].sort()) {
+    if (!declared.has(cap)) {
+      out.push(finding(8, `'${cap}' is allow in CAPABILITY_DEFAULTS but NOT baseline in the policy`, {
+        detail: 'the more dangerous direction: every agent has it ambiently while the policy does not say '
+          + 'so, and no pin or forbid written against it would describe the real behaviour.',
+      }));
+    }
+  }
+
+  const immutable = immutableCaps(sources);
+  for (const cap of immutable) {
+    if (!declared.has(cap) || !inCode.has(cap)) {
+      out.push(finding(8, `'${cap}' is declared UNREMOVABLE but is not baseline on both sides`, {}));
+    }
+  }
+
+  // (c) — walk the parsed statements for a forbid that reaches an immutable capability. Parsed, not raw
+  // text, for the reason check 3 learned: prose in this file discusses statements that do not exist.
+  const parsed = cedar.policySetTextToParts(String(sources.semantics));
+  if (parsed.type !== 'success') {
+    out.push(finding(8, 'immutability not checked — the policy does not parse (see check 1)', { fatal: false }));
+    return out;
+  }
+  const statements = Array.isArray(parsed.policies) ? parsed.policies : Object.values(parsed.policies || {});
+  // A capability is reachable from a forbid either by name or via any CapGroup that contains it.
+  const groupsContaining = (cap) => Object.keys(groups)
+    .filter((g) => !g.startsWith('$') && ((groups[g] && groups[g].members) || []).includes(cap));
+  for (const st of statements) {
+    const text = typeof st === 'string' ? st : JSON.stringify(st);
+    if (!/^\s*forbid/.test(text.replace(/^["']|\\n/g, ''))) continue;
+    for (const cap of immutable) {
+      const named = text.includes(`Capability::"${cap}"`) || text.includes(`Capability::\\"${cap}\\"`);
+      const viaGroup = groupsContaining(cap).some((g) => text.includes(`CapGroup::"${g}"`) || text.includes(`CapGroup::\\"${g}\\"`));
+      if (named || viaGroup) {
+        out.push(finding(8, `a forbid statement reaches '${cap}', which is declared UNREMOVABLE`, {
+          detail: `${named ? 'named directly' : 'via a CapGroup it belongs to'}. forbid beats every permit, `
+            + 'so this silently makes an unremovable capability removable — and the policy stays valid, so '
+            + 'nothing else catches it.',
+        }));
+      }
+    }
+  }
+  return out;
+}
+
 /**
  * CHECK 7 — does this policy change any DECISION, for any scope?
  *
@@ -245,6 +352,7 @@ function runSourceChecks(sources, { caps, knownScopes = null, cedar } = {}) {
     ...(caps ? checkCompleteness(sources, caps) : [finding(2, 'completeness not checked — no capability universe supplied', { fatal: false })]),
     ...checkBindings(sources),
     ...checkMembership(sources, knownScopes),
+    ...(caps ? checkBaseline(sources, caps, cedar) : [finding(8, 'baseline ownership not checked — no capability universe supplied', { fatal: false })]),
   ];
   return out.sort((a, b) => Number(b.fatal) - Number(a.fatal) || a.check - b.check);
 }
@@ -319,6 +427,6 @@ function readMcpPrefixes(dir) {
 }
 
 module.exports = {
-  checkValidates, checkCompleteness, checkBindings, checkMembership, diffDecisions,
+  checkValidates, checkCompleteness, checkBindings, checkMembership, checkBaseline, immutableCaps, diffDecisions,
   runSourceChecks, capabilityUniverse, verdictsFor, realKeys, capGroupNames,
 };

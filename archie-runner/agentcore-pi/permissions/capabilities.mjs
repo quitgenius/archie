@@ -20,14 +20,31 @@ const HINDSIGHT_WRITE_TOOLS = new Set(
   Object.entries(CUSTOM_TOOLS).filter(([, cap]) => cap === 'hindsight.write').map(([name]) => name),
 );
 
+// THE CEDAR POLICY OWNS THIS SET. `capGroups.baseline` in archie-cedar-spike/policy/semantics.json is the
+// declaration of what is "generally available"; this map is its runtime mirror, and `archie deploy` REFUSES
+// when the two disagree in either direction (check 8, archie/lib/policy-checks.js checkBaseline). So editing
+// one without the other is not a drift that shows up later — it is a deploy that does not happen.
+//
+// A MIRROR RATHER THAN GENERATED CODE, and that is a considered trade. Generating this from the JSON would
+// make the policy the literal source, but it would put a generated module inside the image — and this file
+// must stay import-free because the DISPATCHER loads it too (archie-gateway/grants.js:150), so a codegen
+// step adds a build artifact whose staleness is a NEW silent failure mode. Enforcing equality at deploy
+// gives the same guarantee (the two cannot diverge) with nothing to go stale.
+//
+// TWO OF THESE ARE UNREMOVABLE, not merely baseline — sandbox, 2026-08-18: "make that baseline allow across all
+// agents with no way to get rid of it", for `otel` and `hindsight.read`. That property CANNOT be written as
+// a Cedar statement, because `forbid` beats every `permit`: a future forbid naming either one would override
+// even an unconditional permit, and the policy would still be perfectly valid. Check 8's third rule is
+// therefore the only thing enforcing it — it rejects any forbid that reaches them, whether by name or
+// through a CapGroup they belong to.
 export const CAPABILITY_DEFAULTS = {
   'fs.read': 'allow',
   memory: 'allow',
   cron: 'allow',
-  otel: 'allow',
+  otel: 'allow', // UNREMOVABLE — see above
   connector: 'allow',
   health: 'allow', // benign plugin/MCP-server health & introspection tools (not data/action)
-  'hindsight.read': 'allow',
+  'hindsight.read': 'allow', // UNREMOVABLE — see above
   '*': 'deny',
 };
 

@@ -136,6 +136,54 @@ test('check 7: a revocation and a first publish are both reported', () => {
   assert.deepEqual(changes.find((c) => c.scope === 'ch-b'), { scope: 'ch-b', capability: 'airflow', from: null, to: 'allow' });
 });
 
+// ── check 8: Cedar owns the baseline set ─────────────────────────────────────────────────────────────
+
+test('check 8: the shipped baseline set agrees with CAPABILITY_DEFAULTS, in both environments', async () => {
+  const { checkBaseline, immutableCaps } = require('./policy-checks');
+  for (const s of [SANDBOX, PROD]) {
+    const caps = await capabilityUniverse(s);
+    assert.deepEqual(checkBaseline(s, caps), [], `${s.env} baseline disagrees with the runtime map`);
+    assert.deepEqual(immutableCaps(s), ['otel', 'hindsight.read'], 'the two sandbox declared unremovable');
+  }
+});
+
+test('check 8: a set disagreement is fatal in BOTH directions', async () => {
+  const { checkBaseline } = require('./policy-checks');
+  const caps = await capabilityUniverse(SANDBOX);
+  const withData = (mut) => { const s = { ...SANDBOX, data: JSON.parse(JSON.stringify(SANDBOX.data)) }; mut(s.data); return s; };
+
+  // Policy says baseline, code does not: the runtime denies something the policy calls generally available.
+  const added = withData((d) => d.capGroups.baseline.members.push('aws-readonly'));
+  assert.ok(checkBaseline(added, caps).some((f) => f.fatal && /baseline in the policy but NOT allow/.test(f.message)));
+
+  // Code says allow, policy does not: the more dangerous way round — every agent has it ambiently while no
+  // pin or forbid written against it would describe the real behaviour.
+  const dropped = withData((d) => { d.capGroups.baseline.members = d.capGroups.baseline.members.filter((c) => c !== 'health'); });
+  assert.ok(checkBaseline(dropped, caps).some((f) => f.fatal && /allow in CAPABILITY_DEFAULTS but NOT baseline/.test(f.message)));
+});
+
+test('check 8: a forbid reaching an UNREMOVABLE capability is fatal — the rule Cedar cannot express', async () => {
+  // THE ONE THAT MATTERS. `forbid` beats every `permit`, so a forbid naming hindsight.read would override
+  // even an unconditional permit and quietly make an unremovable capability removable — while leaving the
+  // policy perfectly valid, so checks 1-3 all pass. This check is the only thing standing there.
+  const { checkBaseline } = require('./policy-checks');
+  const caps = await capabilityUniverse(SANDBOX);
+  const withSemantics = (extra) => ({ ...SANDBOX, semantics: `${SANDBOX.semantics}\n${extra}\n` });
+
+  const direct = withSemantics('forbid (principal, action == Archie::Action::"use", resource) when { resource.name == Archie::Capability::"hindsight.read" };');
+  assert.ok(checkBaseline(direct, caps).some((f) => f.fatal && /reaches 'hindsight\.read'.*UNREMOVABLE/.test(f.message)),
+    'named directly');
+
+  // VIA A GROUP, which is the version someone would write by accident while tightening something else.
+  const viaGroup = withSemantics('forbid (principal, action == Archie::Action::"use", resource) when { resource in Archie::CapGroup::"baseline" };');
+  const found = checkBaseline(viaGroup, caps).filter((f) => f.fatal && /UNREMOVABLE/.test(f.message));
+  assert.equal(found.length, 2, 'both otel and hindsight.read are reached through the baseline group');
+
+  // A forbid on something NOT immutable is fine — this check must not block ordinary pins.
+  const ok = withSemantics('forbid (principal, action == Archie::Action::"use", resource) when { resource.name == Archie::Capability::"aws-readonly" };');
+  assert.deepEqual(checkBaseline(ok, caps).filter((f) => f.fatal), [], 'an ordinary forbid is not obstructed');
+});
+
 test('the shipped sources pass every check, in both environments', async () => {
   for (const s of [SANDBOX, PROD]) {
     const caps = await capabilityUniverse(s);
