@@ -62,20 +62,25 @@ describe('EMF namespaces honour the override at runtime', () => {
     const d = require('./dispatcher-metrics');
     const c = require('./cron-metrics');
     const i = require('./cron-inventory-metrics');
+    const q = require('./runtime-quota-metrics');
     process.stdout.write(JSON.stringify({
       dispatcher: d.DISPATCHER_METRIC_NAMESPACE,
       cron: c.CRON_METRIC_NAMESPACE,
       cronInventory: i.CRON_INVENTORY_NAMESPACE,
+      runtimeQuota: q.RUNTIME_QUOTA_NAMESPACE,
     }));
   `], { cwd: DIR, env: { ...process.env, ...env }, encoding: 'utf8' }));
 
-  it('all three emitters follow the override', () => {
+  it('every emitter follows the override', () => {
     const ns = namespacesUnder({
       DISPATCHER_METRIC_NAMESPACE: 'testStackDispatcher',
       CRON_METRIC_NAMESPACE: 'testStackCron',
     });
     expect(ns.dispatcher).toBe('testStackDispatcher');
     expect(ns.cron).toBe('testStackCron');
+    // The runtime-quota gauge shares the DISPATCHER knob: it is a dispatcher-side fleet gauge, and the
+    // alarm on it lives beside the other dispatcher alarms.
+    expect(ns.runtimeQuota).toBe('testStackDispatcher');
     // The one that was missed: it shares CRON_METRIC_NAMESPACE with cron-metrics rather than having its
     // own variable, so there is one knob per stack rather than one per file.
     expect(ns.cronInventory).toBe('testStackCron');
@@ -86,5 +91,6 @@ describe('EMF namespaces honour the override at runtime', () => {
     expect(ns.dispatcher).toBe('ClawdbotDispatcher');
     expect(ns.cron).toBe('ClawdbotCron');
     expect(ns.cronInventory).toBe('ClawdbotCron');
+    expect(ns.runtimeQuota).toBe('ClawdbotDispatcher');
   });
 });

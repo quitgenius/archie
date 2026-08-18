@@ -58,6 +58,7 @@ const { createCronHome } = require('./cron-home');
 const { mintAgentName } = require('./agent-scope');
 const { diffObserved, specDiff } = require('./spec-diff');
 const { createDispatcherMetrics } = require('./dispatcher-metrics');
+const { createRuntimeQuotaSampler } = require('./runtime-quota-metrics');
 const routingBuild = require('./routing-build');
 const { generateFileRef: _generateFileRef, parseFileRef } = require('./file-ref');
 const { Readable } = require('node:stream');
@@ -215,6 +216,10 @@ const imageSource = createImageSource({
   logger: log,
   metrics: agentCore.metrics,
 });
+
+// Fleet size against the AgentCore account quota. Started in the boot sequence below.
+const runtimeQuota = createRuntimeQuotaSampler({ log, region: agentCore.config.region });
+
 let _configDoc = null;
 function configDoc() {
   if (_configDoc) return _configDoc;
@@ -2262,6 +2267,12 @@ let slackBotUserId = null;
   // Keep the fleet image pointer warm so no turn pays the DynamoDB read. Best-effort by design: a
   // failed refresh keeps serving the last known image rather than stalling the fleet.
   imageSource.start();
+
+  // Account-wide agent-runtime count vs the AgentCore `Total Agents per Account` quota. Nothing else
+  // can see this: the quota publishes no AWS/Usage metric, so without this sample the first symptom of
+  // the ceiling is CreateAgentRuntime refusing mid-roll. Off the turn path (own 5-minute timer) and
+  // self-disabling if the role cannot list — see runtime-quota-metrics.js.
+  runtimeQuota.start();
 
   // Durable turn consumer. A poller receives a message and HANDS IT OFF, then goes straight back to
   // receiving — so `pollers` is just how fast we drain (one long-poll socket each), and

@@ -155,6 +155,13 @@ const body = {
     // correctly holding back" and "archie has silently stopped scheduling" look identical.
     metricWidget(0, 155, 8, 6, 'Cron fires DECLINED per agent — scope still on OpenClaw (§3a\')', [M.cronFireGated]),
     logWidget(8, 155, 16, 6, 'Cron cutover — which scopes archie is declining to fire, and why', Q.INSIGHTS.cron_gated),
+    // Row 23 — ACCOUNT QUOTA. The fleet consumes `agents x live image tags` AgentCore runtimes
+    // against a 1,000 account cap, and a roll stages the next tag before collecting the last — so the
+    // ceiling is hit DURING a release, where the symptom is CreateAgentRuntime refusing partway
+    // through and the unstaged agents serving nothing. Nothing in AWS publishes this: resource-count
+    // quotas in bedrock-agentcore have no AWS/Usage metric, so the dispatcher counts it itself.
+    metricWidget(0, 161, 12, 6, 'AgentCore runtimes vs account quota (alarmed at 900 of 1,000)', [M.agentRuntimeCount, M.agentRuntimeQuota]),
+    metricWidget(12, 161, 12, 6, 'Runtimes by status — DELETING holds its quota slot for ~5 min', [M.agentRuntimeByStatus]),
   ],
 };
 

@@ -812,6 +812,24 @@ const METRICS = {
   runtimeGenerationRolls: { expr: `SUM(SEARCH('{${DISPATCHER_NS},Agent} MetricName="RuntimeGenerationRollCount"', 'Sum', 300))`, label: 'Runtime generation rolls (fleet)' },
   imagePointerMissing: { expr: `SUM(SEARCH('{${DISPATCHER_NS},Agent} MetricName="ImagePointerMissingCount"', 'Sum', 300))`, label: 'NO fleet image published — alarmed (want 0)' },
 
+  // ── AgentCore account quota (`Total Agents per Account`, L-F4575653) ──────
+  // The only ceiling on this board with NO AWS-published series behind it: resource-COUNT quotas in
+  // bedrock-agentcore emit no AWS/Usage metric (only the per-second rate quotas do), so Service
+  // Quotas cannot alarm on it and this number exists solely because the dispatcher counts it
+  // (runtime-quota-metrics.js). The schema is `{Namespace}` with NO dimension — that dimensionless
+  // series is the one the alarm is built on; the Status cut below is a separate schema and must not
+  // be summed into it (the two partition the same population).
+  //
+  // Read the two lines TOGETHER: the fleet holds `agents x live image tags` runtimes, and a roll
+  // stages the next tag before collecting the last, so the count that matters is the peak DURING a
+  // roll, not the resting one.
+  agentRuntimeCount: { expr: `SEARCH('{${DISPATCHER_NS}} MetricName="AgentRuntimeCount"', 'Maximum', 300)`, stat: 'Maximum', label: 'Agent runtimes in the account' },
+  agentRuntimeQuota: { expr: `SEARCH('{${DISPATCHER_NS}} MetricName="AgentRuntimeQuota"', 'Maximum', 300)`, stat: 'Maximum', label: 'Quota (adjustable)' },
+  // DELETING is counted in the total above — the name and the quota slot are held for the ~5 minutes
+  // a delete takes. This cut is what separates "we own 900 runtimes" from "we own 700 and are waiting
+  // on 200 deletes", which is the difference between requesting an increase and waiting.
+  agentRuntimeByStatus: { expr: `SEARCH('{${DISPATCHER_NS},Status} MetricName="AgentRuntimeCount"', 'Maximum', 300)`, stat: 'Maximum', label: 'Runtimes by status' },
+
   // ── Message volume (namespace ClawdbotDispatcher) ─────────────────────────
   // Inbound Slack messages, per agent and fleet-wide. This existed ONLY in the DynamoDB
   // `message-metrics` table until 2026-08-11, whose sole reader is the ALB-fronted `archie` chart
