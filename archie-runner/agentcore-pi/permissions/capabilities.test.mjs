@@ -68,6 +68,35 @@ test('capabilityOf: the connector RCE tools are baseline connector — no exec c
   assert.equal(makeDecider({ grants: new Set() })('connector'), true);
 });
 
+// THE ALWAYS-ON INVARIANT for hindsight recall (2026-08-18). Same shape as otel-tool-test.mjs' self-observability test: the
+// property is true by construction today, and nothing enforced it, so a plausible refactor could remove
+// fleet-wide read access to org memory with no error anywhere.
+//
+// WHY A TEST AND NOT A POLICY STATEMENT: "no way to get rid of it" is not expressible in Cedar. `forbid`
+// beats every `permit`, so any future forbid naming hindsight.read would override an unconditional permit
+// for it. Immutability therefore has to be a BUILD-TIME assertion — this test, plus the policy-side rule
+// that no forbid may reference hindsight.read.
+test('hindsight.read is ambient for every agent, and the knowledge tools resolve to it', () => {
+  const cap = makeCapabilityResolver({ toolCaps: TC });
+
+  // (a) all three ALWAYS_ALLOW knowledge tools map to it. Reads only — retain is a hook, not a tool.
+  for (const t of ['agent_knowledge_recall', 'agent_knowledge_search_documents', 'agent_knowledge_get_document']) {
+    assert.equal(cap(t), 'hindsight.read', t);
+  }
+  // prefix-based, so a fourth read tool added later lands here rather than on 'unknown' → deny
+  assert.equal(cap('agent_knowledge_anything_new'), 'hindsight.read');
+
+  // (b) it is baseline-allow, so NO grant is consulted and an empty grant set still allows.
+  assert.equal(policyFor('hindsight.read'), 'allow');
+  assert.equal(makeDecider({ grants: new Set() })('hindsight.read'), true);
+  assert.equal(makeAllowCheck({ grants: new Set() })('hindsight.read'), true);
+
+  // (c) the write half is NOT dragged in with it — it stays default-deny and is policy-pinned.
+  assert.equal(policyFor('hindsight.write'), 'deny');
+  assert.equal(makeDecider({ grants: new Set() })('hindsight.write'), false);
+  assert.notEqual(cap('agent_knowledge_recall'), 'hindsight.write');
+});
+
 test('capabilityOf: pelago data vs health', () => {
   const cap = makeCapabilityResolver({ toolCaps: TC });
   assert.equal(cap('demo_cache__query'), 'demo_cache');      // data → grant-gated

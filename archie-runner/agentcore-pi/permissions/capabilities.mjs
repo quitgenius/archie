@@ -62,6 +62,21 @@ export function makeCapabilityResolver({ mcpPrefixes = [], toolCaps = {} } = {})
     // tools, and connector_* plugin helpers.
     if (n.startsWith('CONNECTOR_') || n.startsWith('mcp_connector') || n.startsWith('connector_')) return 'connector';
     if (n.startsWith('demo_cache')) return 'demo_cache';
+    // HINDSIGHT KNOWLEDGE TOOLS → hindsight.read, which is baseline, so these are ambient for every
+    // agent with no grant and no config signal. All three are reads: recall, search, fetch-by-id.
+    // `hindsight.write` is NOT reachable this way — retain is a hook, not a tool, and the write
+    // capability is policy-pinned.
+    //
+    // DEFENSIVE UNDER PI, and worth saying so rather than implying it fixes a live denial. The three
+    // names are in ALWAYS_ALLOW (config-resolver/boot-config.mjs:155) so every agent carries the
+    // TOKENS, but archie's hindsight is the native hooks-only extension (hindsight-extension.mjs;
+    // PLUGIN_PROVIDERS.hindsight is kind:'plugin-hooks') and BASE_PLUGINS' load.paths carries only
+    // mcp-auth, connector-session and slack-reply — so no tool by these names is built under Pi and
+    // nothing currently reaches this branch. It exists so that if a hindsight tool provider is ever
+    // added (or an OpenClaw compat path used), these resolve correctly instead of falling to
+    // 'unknown' → deny. boot-config.mjs:154's claim that "hindsight IS loaded and does provide them"
+    // describes OpenClaw, not archie.
+    if (n.startsWith('agent_knowledge_')) return 'hindsight.read';
     for (const { p, cap } of prefixCaps) if (n.startsWith(p)) return cap; // demo_query_app__…, demo_warehouse__…, demo_diagram_app__…
     return 'unknown'; // → policyFor('unknown') → '*' → deny (fail-closed)
   };
