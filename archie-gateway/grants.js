@@ -80,6 +80,30 @@ async function loadPinnedCaps(doc, table) {
   return _pinned.set;
 }
 
+/**
+ * The pinned skills this scope's POLICY row allows.
+ *
+ * NOT CACHED, unlike loadPinnedCaps: that reads one fleet-wide artifact, this reads a PER-SCOPE row, so a
+ * cache would either be keyed per agent (unbounded) or wrong. It is one GetItem on a button press, not on
+ * a turn.
+ *
+ * NULL when there is no row or the read fails, and pinAllows DENIES on null — the safe direction for a gate
+ * that decides whether to create a NEW install. That is deliberately the opposite of the runtime filter,
+ * which no-ops on a missing row because it decides what an existing holder KEEPS (plan D3).
+ */
+async function loadAllowedSkills(doc, table, agentId) {
+  if (!doc || !table || !agentId) return null;
+  try {
+    const schema = await loadSchema();
+    const { GetCommand } = require('@aws-sdk/lib-dynamodb');
+    const r = await doc.send(new GetCommand({ TableName: table, Key: schema.agentPolicyKey(agentId) }));
+    const row = r?.Item?.data ? JSON.parse(r.Item.data) : null;
+    return Array.isArray(row?.skills) ? row.skills : null;
+  } catch {
+    return null;
+  }
+}
+
 let _schema = null;
 async function loadSchema() {
   if (_schema) return _schema;
@@ -477,6 +501,7 @@ module.exports = {
   extraCapsForAgent,
   assertGrantable,
   loadPinnedCaps,
+  loadAllowedSkills,
   setDerivedRoleHook,
   toolCatalog,
   loadSkillPins,

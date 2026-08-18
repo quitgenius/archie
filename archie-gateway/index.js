@@ -1744,8 +1744,13 @@ bolt.action('marketplace_install', async ({ ack, body, client }) => {
   // This is the WEAKER of the two enforcement points and is documented as such: 134 of the 135
   // demo-crm installs never came through this button — they arrived via hydration, which is
   // gated separately in extract.mjs. A pin here alone would stop nothing that has already happened.
+  // MEMBERSHIP COMES FROM THE POLICY ROW now, not from skill-pins.mjs's inline lists (plan §8.2 D3). Those
+  // arrays are gone: while they existed this gate read one list and the runtime's skill filter read another,
+  // and they disagreed the moment the policy was seeded — this button refused every install of a pinned
+  // skill while the filter correctly permitted 146 existing holders.
   const pins = await grants.loadSkillPins();
-  if (pins.isPinned(skillId) && !pins.pinAllows(skillId, agentId)) {
+  const allowedSkills = await grants.loadAllowedSkills(configDoc(), AGENT_CONFIG_TABLE, agentId);
+  if (pins.isPinned(skillId) && !pins.pinAllows(skillId, allowedSkills)) {
     child.warn({ skill: skillId }, 'install refused: pinned skill, scope not on the allow-list');
     await client.chat.postMessage({ channel: userId, text: `:pushpin: ${pins.pinRefusalText(skillId)}` });
     return;
