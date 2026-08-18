@@ -881,6 +881,24 @@ async function loadPolicy() {
     onProblem('absent-but-required', {});
     return { verdictFor: () => 'deny', digest: null, denyAll: true, why: 'absent-but-required' };
   }
+
+  // SUCCESS IS LOGGED TOO, and the first live check is why. Only the failure paths above logged, so a
+  // healthy scope emitted NOTHING — which made "policy is in force at digest X" indistinguishable from
+  // "this image does not have the policy code". Verified 2026-08-18 on oc_ch_c66pp782t9k_9162733d: the
+  // layer was working, and the only way to tell was noticing that a permission_decision carried
+  // reason=policy-denied rather than reason=ungranted. That is an inference, not an observation, and it is
+  // not available at all until the agent happens to touch a pinned capability.
+  //
+  // Carries the DIGEST and the allow-list, because "which policy version is this scope on" is the question
+  // asked when a pin appears not to have taken effect — and the answer distinguishes a stale row from a
+  // wrong pin. Only the allows are named: the denies are the other ~11 and listing them buries the signal.
+  if (table && !table.denyAll) {
+    console.log(JSON.stringify({
+      level: 'info', component: 'pi-adapter', msg: 'policy_table', why: 'loaded', agent: AGENT_NAME,
+      policyDigest: table.digest, accountAsserted: table.accountAsserted,
+      governs: table.capabilities.length, allowed: table.allowed,
+    }));
+  }
   return table;
 }
 

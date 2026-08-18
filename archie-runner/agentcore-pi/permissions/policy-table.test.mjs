@@ -28,6 +28,17 @@ test('a valid row resolves its verdicts and exposes the digest', () => {
   assert.equal(t.digest, 'sha256:abc');
 });
 
+test('a loaded table can REPORT what it governs, without an external capability list', () => {
+  // Added after the first live check (2026-08-18, oc_ch_c66pp782t9k_9162733d): only the failure paths
+  // logged, so a healthy scope emitted nothing and "policy in force at digest X" was indistinguishable
+  // from "this image has no policy code". The row is the authority for what it governs, so the table
+  // reports it — any external list of capability names would be a mirror that drifts.
+  const t = load(rowOf({ 'hindsight.write': 'allow', airflow: 'allow', 'aws-readonly': 'deny', datadog: 'grant' }));
+  assert.deepEqual(t.capabilities, ['airflow', 'aws-readonly', 'datadog', 'hindsight.write'], 'sorted, all of them');
+  assert.deepEqual(t.allowed, ['airflow', 'hindsight.write'], 'only the allows — the denies are the majority and bury the signal');
+  assert.equal(t.digest, 'sha256:abc');
+});
+
 test('ABSENT is null, NOT deny-all — the layer must be additive before it is materialised', () => {
   // Distinct from every invalid case below. Every scope is in this state until the first policy deploy
   // reaches it, so conflating the two would deny-all the entire fleet on rollout.

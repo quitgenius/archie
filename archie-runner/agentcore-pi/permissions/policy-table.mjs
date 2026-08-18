@@ -107,6 +107,13 @@ export function loadPolicyTable(row, { scope, expectedAccount = null, onProblem 
 
   return {
     verdictFor: (cap) => verdicts[cap],
+    // The capabilities this row governs. Exposed so a caller can REPORT what the policy decided without
+    // needing a separate list of capability names to iterate — the row is the authority, and any external
+    // list would be a mirror that drifts. Added after the first live check found that a healthy load logged
+    // nothing at all, leaving "policy in force at digest X" indistinguishable from "this image has no
+    // policy code" (see pi-adapter loadPolicy).
+    capabilities: Object.keys(verdicts).sort(),
+    allowed: Object.keys(verdicts).filter((c) => verdicts[c] === 'allow').sort(),
     digest: typeof row.policyDigest === 'string' ? row.policyDigest : null,
     denyAll: false,
     accountAsserted: Boolean(expectedAccount && row.account),
