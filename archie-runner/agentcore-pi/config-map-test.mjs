@@ -1,25 +1,30 @@
-// Phase-1 local test: map a real generated openclaw.json → Pi session and prove
+// Local (manual, AWS-touching) harness: map a REAL resolved config → Pi session and prove
 //   (A) bootstrap MEMORY.md auto-injects into context (the @parity behaviour), and
 //   (B) the resolved 'read' tool works (the @toolexec behaviour),
 // using ONLY the config-derived model + tools (no hardcoding).
-//   OC_JSON=/tmp/oc-sample.json AGENT=bdd-tests PI_VENDOR_DIR=... AWS_PROFILE=sandbox node config-map-test.mjs
+//   AGENT=bdd-tests AGENT_CONFIG_TABLE=agent-config PI_VENDOR_DIR=... AWS_PROFILE=sandbox node config-map-test.mjs
+//
+// It used to read a config out of a FILE (OC_JSON, a dumped openclaw.json), which stopped being a
+// thing the boot path produces. It now resolves from DynamoDB through the same function the runtime
+// boots on, so what it exercises is the live path rather than a hand-made snapshot of a dead shape.
+// `cwd` comes from env because the resolved config no longer carries `workspace` — that was one of
+// the keys the old envelope rendered and nothing read.
 
 import fs from 'node:fs';
 import path from 'node:path';
 import { registerBedrock, getModel, runTurn, pca } from './pi-runtime.mjs';
-import { selectAgent, resolveModelSpec, resolveAllowedTools, buildBuiltinTools, readBootstrapContext, makeResourceLoader } from './config-map.mjs';
+import { resolveModelSpec, resolveAllowedTools, buildBuiltinTools, readBootstrapContext, makeResourceLoader } from './config-map.mjs';
+import { loadAgentConfig } from './agent-config.mjs';
 
-const OC = process.env.OC_JSON || '/tmp/oc-sample.json';
 const AGENT = process.env.AGENT || 'bdd-tests';
 const CODENAME = 'MERIDIAN-7';
 const FIXCODE = 'CFGMAP-4417';
 
 try {
-  const cfg = JSON.parse(fs.readFileSync(OC, 'utf8'));
-  const agent = selectAgent(cfg, AGENT);
+  const { agent, cfg } = await loadAgentConfig({ agentName: AGENT });
   const { provider, id } = resolveModelSpec(agent, cfg);
   const allow = resolveAllowedTools(agent);
-  const cwd = agent.workspace;
+  const cwd = process.env.CFGMAP_CWD || path.join('/tmp', `cfgmap-${AGENT}`);
   console.log('[cfgmap] agent=%s model=%s/%s cwd=%s allow=%j', agent.id, provider, id, cwd, [...allow]);
 
   // seed the workspace (direct on disk = EFS-equivalent): MEMORY.md + a read-tool fixture

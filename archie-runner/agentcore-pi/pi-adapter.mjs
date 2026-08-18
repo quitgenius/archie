@@ -9,11 +9,10 @@ import { tmpdir } from 'node:os';
 import { join, basename } from 'node:path';
 import { createRequire } from 'node:module';
 import { createHash } from 'node:crypto';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import { registerBedrock, getModel, runTurn, withModel, pca } from './pi-runtime.mjs';
 import { resolveSessionPath, writeIndexEntry } from './session-store.mjs';
-import { selectAgent, resolveModelSpec, resolveAllowedTools, buildBuiltinTools, buildCustomTools, readBootstrapContext, makeResourceLoader, resolvePluginManifest, findUnavailablePlugins } from './config-map.mjs';
+import { resolveModelSpec, resolveAllowedTools, buildBuiltinTools, buildCustomTools, readBootstrapContext, makeResourceLoader, resolvePluginManifest, findUnavailablePlugins } from './config-map.mjs';
+import { loadAgentConfig } from './agent-config.mjs';
 import { buildCompatPlugins, prewarmCompatPlugins } from './openclaw-compat/plugin-host.mjs';
 import { createHindsightExtension } from './hindsight-extension.mjs';
 import { createClockExtension } from './clock-extension.mjs';
@@ -516,72 +515,71 @@ let ready = false;
 let busy = 0;
 let turnIndex = 0; // requests this microVM has served — 1 means it booted for this turn
 const sessions = new Map(); // sessionKey -> { session, turnCtx, skillFp } (per-runtime warm cache)
-const execFileAsync = promisify(execFile);
 
 // `model` rides here so a FAILED skill read does not silently drop the picked model out of the
 // config fingerprint — dropping it would flip the fp, force a re-resolve, then flip it back on the
 // next successful read: two needless re-resolves from one transient DynamoDB error.
 let skillState = { fp: null, model: null }; // last skill-fingerprint materialized onto SKILLS_DIR (this microVM)
-let configState = { fp: null }; // last config-fingerprint resolved into openclaw.json (this microVM)
+let configState = { fp: null }; // last config-fingerprint bound into this microVM's live config
 
-// Map the pulled openclaw.json for AGENT_NAME -> model + tool allow-set.
+// Bind the resolved config for AGENT_NAME -> model + tool allow-set + plugin routing.
 //
-// FATAL if the config is missing, unreadable, or has no entry for this agent. There is no fallback:
-// see the note at the bottom of this function for why the old PI_MODEL_ID + no-tools path was worse
-// than crashing.
-function loadConfig() {
-  const p = process.env.OPENCLAW_JSON || process.env.OPENCLAW_CONFIG_FILE;
+// TAKES THE RESOLVED OBJECT, not a path. It used to read `openclaw.json` off disk, which the
+// entrypoint had rendered by spawning the resolver as a child process — the file existed only to
+// carry these two values across that process boundary. Both are gone; `resolved` is what
+// config-resolver/resolve-config.mjs returned (see agent-config.mjs).
+//
+// FATAL if the config has no entry for this agent. There is no fallback: see the note at the bottom
+// of this function for why the old PI_MODEL_ID + no-tools path was worse than crashing.
+function loadConfig(resolved) {
+  const { agent, cfg } = resolved || {};
   try {
-    if (p && existsSync(p)) {
-      const cfg = JSON.parse(readFileSync(p, 'utf8'));
-      const agent = selectAgent(cfg, AGENT_NAME);
-      if (agent) {
-        const { id } = resolveModelSpec(agent, cfg);
-        MODEL = getModel(id);
-        ALLOW = resolveAllowedTools(agent);
-        PLUGIN_MANIFEST = resolvePluginManifest(cfg);
-        // LOUD, on its own line, one per plugin: the agent is allowed a plugin Pi will not load,
-        // so a tool it has been told it has does not exist. Left implicit, this surfaces as an
-        // agent improvising with bash for minutes — see findUnavailablePlugins.
-        const unavailable = findUnavailablePlugins(ALLOW, PLUGIN_MANIFEST);
-        for (const u of unavailable) {
-          console.error(JSON.stringify({
-            level: 'warn', component: 'pi-adapter', msg: 'ALLOWED PLUGIN NOT AVAILABLE UNDER PI — tools it registers do not exist',
-            agent: agent.id, ...u,
-          }));
-        }
-        // MCP server prefixes for capability resolution (connector.extraMcpServers[].toolPrefix).
-        MCP_PREFIXES = (agent?.connector?.extraMcpServers ?? []).map((s) => s?.toolPrefix).filter(Boolean);
-        // SKILL_PATHS are set per turn by hydrateSkills (the agent's INSTALLED skills materialize
-        // from DDB onto /tmp, scoped by fingerprint) — not from the config's extraDirs here.
-        return {
-          source: p, agent: agent.id, model: id, allow: [...ALLOW],
-          plugins: {
-            hindsight: !!PLUGIN_MANIFEST.hindsight,
-            compat: PLUGIN_MANIFEST.compat.map((c) => c.id),
-            skipped: PLUGIN_MANIFEST.skipped,
-            // Carried in the summary too, so the one config line tells the whole story.
-            unavailable,
-          },
-        };
+    if (agent) {
+      const { id } = resolveModelSpec(agent, cfg);
+      MODEL = getModel(id);
+      ALLOW = resolveAllowedTools(agent);
+      PLUGIN_MANIFEST = resolvePluginManifest(cfg);
+      // LOUD, on its own line, one per plugin: the agent is allowed a plugin Pi will not load,
+      // so a tool it has been told it has does not exist. Left implicit, this surfaces as an
+      // agent improvising with bash for minutes — see findUnavailablePlugins.
+      const unavailable = findUnavailablePlugins(ALLOW, PLUGIN_MANIFEST);
+      for (const u of unavailable) {
+        console.error(JSON.stringify({
+          level: 'warn', component: 'pi-adapter', msg: 'ALLOWED PLUGIN NOT AVAILABLE UNDER PI — tools it registers do not exist',
+          agent: agent.id, ...u,
+        }));
       }
+      // MCP server prefixes for capability resolution (connector.extraMcpServers[].toolPrefix).
+      MCP_PREFIXES = (agent?.connector?.extraMcpServers ?? []).map((s) => s?.toolPrefix).filter(Boolean);
+      // SKILL_PATHS are set per turn by hydrateSkills (the agent's INSTALLED skills materialize
+      // from DDB onto /tmp, scoped by fingerprint) — not from the config's extraDirs here.
+      return {
+        source: 'ddb', agent: agent.id, model: id, allow: [...ALLOW],
+        plugins: {
+          hindsight: !!PLUGIN_MANIFEST.hindsight,
+          compat: PLUGIN_MANIFEST.compat.map((c) => c.id),
+          skipped: PLUGIN_MANIFEST.skipped,
+          // Carried in the summary too, so the one config line tells the whole story.
+          unavailable,
+        },
+      };
     }
   } catch (e) {
-    fail(`config load failed for ${p}`, e);
+    fail(`config bind failed for agent ${AGENT_NAME}`, e);
   }
-  // NO CONFIG, or a config with no entry for this agent. Also fatal.
+  // NO CONFIG for this agent. Fatal.
   //
   // This used to fall back to PI_MODEL_ID with an EMPTY tool allow-set, described as "the bare boot
-  // POC". It is not reachable in production and never was: pi-entrypoint.mjs:92-105 runs resolve-boot
-  // SYNCHRONOUSLY (a non-zero exit throws) and only then sets OPENCLAW_JSON, so by the time this
-  // runs a config is guaranteed. Its absence means resolve-boot silently produced nothing — a fault.
+  // POC". It is not reachable in production and never was: the resolver either returns an agent entry
+  // or throws, and boot() awaits it, so by the time this runs a config is guaranteed. Reaching here
+  // means the resolver returned an empty object — a fault.
   //
   // The fallback's failure mode was the reason to remove it rather than merely narrow it: the agent
   // booted, connected, answered, and had NO TOOLS — no read, no write, no memory, no cron — behind a
   // single `warn` line. "Talks but cannot act" is far harder to diagnose than a crash loop, and a
   // crash loop is visible in ECS/AgentCore and now alarms (BootFailedCount, from the one top-level
   // boot handler at the tail of this file).
-  return fail(p ? `no usable config at ${p} for agent ${AGENT_NAME}` : 'no OPENCLAW_JSON/OPENCLAW_CONFIG_FILE set');
+  return fail(`resolver returned no config entry for agent ${AGENT_NAME}`);
 }
 
 /**
@@ -812,8 +810,8 @@ async function ddbIO() {
     // policy-table.mjs's job, deliberately kept out of the IO layer so it is unit-testable without a
     // DynamoDB client. `null` here means the item does not exist, which is NOT the same as invalid.
     readPolicy: async () => schema.readData(await get(schema.agentPolicyKey(AGENT_NAME))) || null,
-    // The item resolve-boot builds this agent's config from. Read per turn purely to FINGERPRINT it
-    // (see readConfigState) — the resolution itself stays in resolve-boot.
+    // The item the resolver builds this agent's config from. Read per turn purely to FINGERPRINT it
+    // (see readConfigState) — the resolution itself stays in config-resolver/resolve-config.mjs.
     //
     // The fleet BASE half is gone: it is now a constant (schema.mjs BASE_MAIN), so it cannot change
     // without an image roll, and fingerprinting a constant only costs a DynamoDB read per turn.
@@ -925,22 +923,21 @@ function ensureEfsReady() {
 // Two cheap DDB GetItems (marketplace + manifest), in parallel. Cheap in-region (Spike 3); this
 // is what lets a marketplace install take effect on the very next turn.
 // ── Per-turn config (closes the Phase-3 follow-up noted in getSession) ────────────────────────
-// Model / tool allow-set / plugin manifest / MCP prefixes used to bind ONCE, at microVM boot: the
-// entrypoint ran resolve-boot to turn BASE_MAIN + AGENT#<id>/CONFIG into openclaw.json, and
-// loadConfig() read that file a single time. A config edit therefore only took effect when the
-// session's microVM happened to recycle (900s idle / 8h max) — invisible, unpredictable, and
-// indistinguishable from "the edit didn't work".
+// Model / tool allow-set / plugin manifest / MCP prefixes used to bind ONCE, at microVM boot, so a
+// config edit only took effect when the session's microVM happened to recycle (900s idle / 8h max) —
+// invisible, unpredictable, and indistinguishable from "the edit didn't work".
 //
 // Now the two source items are FINGERPRINTED every turn and the config is re-resolved only when
 // they change — the exact shape the skill path already uses, for the same reason: the steady-state
 // cost must be a couple of DynamoDB GetItems, not a re-resolve.
 //
-// Re-resolution SPAWNS resolve-boot rather than importing it. That is deliberate: resolve-boot is a
-// script with no exports, and config resolution is precisely the logic that must not exist twice —
-// a second in-process implementation would drift from what boot produces, and the symptom would be
-// an agent behaving differently after a config change than after a restart. Refactoring resolve-boot
-// into an importable function is the better end state and the obvious follow-up; until then the
-// subprocess is the honest way to keep one source of truth.
+// Re-resolution CALLS the resolver (loadAgentConfig, force) rather than spawning it. It used to spawn
+// `node resolve-boot.mjs` because that script had no exports, and config resolution is precisely the
+// logic that must not exist twice: a second in-process implementation would drift from what boot
+// produces, and the symptom would be an agent behaving differently after a config change than after a
+// restart. The resolver is now an importable function shared by both paths, which keeps that one
+// source of truth without the process — so boot and re-resolve run identical code by construction
+// instead of by discipline.
 /**
  * `model` is the App Home picker's selection (AGENT#<id>/MARKETPLACE `.models`), passed in from
  * readSkillState rather than re-read — same item, one GetItem.
@@ -959,21 +956,19 @@ async function readConfigState(io, model) {
   return { fp: configFingerprint(agent, model) };
 }
 
-// Re-run resolve-boot against the SAME output path the entrypoint used, then re-read it. Async
-// (not execFileSync like the entrypoint) because this runs on a live turn: a synchronous spawn would
-// block the event loop for the whole resolve (~290ms at boot), stalling any concurrent invoke in
-// this microVM. Env is inherited — the adapter already has AGENT_NAME / REGION / AGENT_CONFIG_TABLE /
-// OPENCLAW_HOME from the entrypoint — so only the output path is restated.
+// Re-read the config items and re-bind. `force` bypasses agent-config's memo (the whole point of the
+// call) and replaces it, so every later reader — including a subsequent cold path in this microVM —
+// sees the new config rather than the boot-time one.
+//
+// Still fully async, as the spawn it replaced had to be: this runs on a live turn, and blocking the
+// event loop for the resolve (~290ms measured at boot, now less without an interpreter start) would
+// stall any concurrent invoke in this microVM.
+//
+// The 20s timeout the spawn carried is gone with the process. The DynamoDB calls underneath keep the
+// SDK's own timeouts and retries, which is the bound that was actually doing the work — and a hang
+// here is caught by the caller, which keeps serving the previous config.
 async function reloadConfigFromDdb() {
-  const resolverDir = process.env.CONFIG_RESOLVER_DIR || '/app/config-resolver';
-  const configJson = process.env.OPENCLAW_JSON || process.env.OPENCLAW_CONFIG_FILE;
-  if (!configJson) throw new Error('no OPENCLAW_JSON/OPENCLAW_CONFIG_FILE path to re-resolve into');
-  await execFileAsync('node', [join(resolverDir, 'resolve-boot.mjs')], {
-    env: { ...process.env, AGENT_NAME, OPENCLAW_CONFIG_FILE: configJson },
-    timeout: 20_000,
-  });
-  process.env.OPENCLAW_JSON = configJson;
-  return loadConfig();
+  return loadConfig(await loadAgentConfig({ agentName: AGENT_NAME, force: true }));
 }
 
 async function readSkillState(io) {
@@ -986,8 +981,8 @@ async function readSkillState(io) {
   // `models` rides back with the skill read because it lives on the SAME item and the App Home
   // model picker writes it (marketplace.js setModel). It is deliberately NOT folded into the skill
   // fingerprint — that one keys the /tmp skill materialisation, and a model change must not force
-  // a needless re-hydrate. It goes to the CONFIG fingerprint instead, which is what re-resolves
-  // openclaw.json. See readConfigState.
+  // a needless re-hydrate. It goes to the CONFIG fingerprint instead, which is what re-resolves the
+  // config. See readConfigState.
   return { fp, names, manifest: man, model: (mkt && mkt.models) || null };
 }
 
@@ -1019,7 +1014,7 @@ async function getSession(key, seed = {}) {
   // fingerprints; a warm session with both unchanged is the fast path. When the installed skill
   // set/content changes (marketplace install/uninstall or a hydrator content bump), or when this
   // agent's config changes (model / tool allow-set / plugins / MCP prefixes — AGENT#<id>/CONFIG),
-  // the fingerprint flips → re-hydrate /tmp and/or re-resolve openclaw.json, then
+  // the fingerprint flips → re-hydrate /tmp and/or re-resolve the config, then
   // REBUILD the session (SessionManager.open on the same JSONL preserves the conversation — Spike 1).
   const io = await ddbIO();
   let skill;
@@ -1049,8 +1044,8 @@ async function getSession(key, seed = {}) {
   // warm + skills unchanged + config unchanged → fast path
   if (cached && cached.skillFp === skill.fp && cached.configFp === cfg.fp) return cached;
 
-  // Config changed (or first turn on this microVM): re-resolve openclaw.json from DDB and re-read it,
-  // so the rebuilt session below binds the NEW model / allow-set / plugins. On failure keep serving —
+  // Config changed (or first turn on this microVM): re-resolve from DDB and re-bind, so the rebuilt
+  // session below binds the NEW model / allow-set / plugins. On failure keep serving —
   // a warm session on the previous config beats failing the turn, and the next turn retries.
   if (cfg.fp && configState.fp && cfg.fp !== configState.fp) {
     try {
@@ -1438,7 +1433,9 @@ async function boot() {
   // opens. Reports its own success: a silently-failed install would show up later as a prepare_turn
   // that simply stopped splitting, which is indistinguishable from "the split isn't deployed yet".
   console.log(JSON.stringify({ level: 'info', component: 'pi-adapter', msg: 'bedrock dispatch mark', installed: bedrockMark.install() }));
-  const cfgInfo = loadConfig();
+  // Memoized: the entrypoint already resolved this, so on the normal boot path this is a cache hit,
+  // not a second DynamoDB read. It still resolves if the adapter is imported without the entrypoint.
+  const cfgInfo = loadConfig(await loadAgentConfig({ agentName: AGENT_NAME }));
   console.log(JSON.stringify({ level: 'info', component: 'pi-adapter', msg: 'config', ...cfgInfo }));
   // Before anything can build a session. Non-fatal by construction (prewarmCompatPlugins isolates
   // per-plugin failures and bounds the wait), so a Connector outage delays boot briefly rather than

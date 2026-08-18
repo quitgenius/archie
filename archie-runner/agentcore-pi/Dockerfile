@@ -99,7 +99,7 @@ RUN node patch-pi-ai-adaptive-thinking.mjs && rm patch-pi-ai-adaptive-thinking.m
 # adapter runs boot() at module load, so the fingerprint had to move to be testable) and adding it
 # here was forgotten. Nothing caught it until a from-scratch stack ran its first turn.
 COPY agentcore-pi/pi-runtime.mjs agentcore-pi/pi-adapter.mjs agentcore-pi/config-map.mjs \
-     agentcore-pi/config-fingerprint.mjs \
+     agentcore-pi/config-fingerprint.mjs agentcore-pi/agent-config.mjs \
      agentcore-pi/memory-tool.mjs agentcore-pi/session-store.mjs \
      agentcore-pi/hindsight-extension.mjs agentcore-pi/hindsight-client-recall.mjs \
      agentcore-pi/knowledge-tools.mjs \
@@ -125,9 +125,12 @@ COPY agentcore-pi/openclaw-compat/ ./openclaw-compat/
 COPY agentcore-pi/permissions/ ./permissions/
 COPY --from=plugins /build/plugins/ ./plugins/
 
-# The config-resolver (resolve-boot + its DDB client/schema — brings its own aws-sdk, as
+# The config-resolver (resolve-config + its DDB client/schema — brings its own aws-sdk, as
 # node:22-slim has none) and config-seed (just the hand-authored new-agent-skeleton/ now — the
-# skill library + catalog live in DynamoDB). The entrypoint resolves openclaw.json from DynamoDB;
+# skill library + catalog live in DynamoDB). The entrypoint resolves this agent's config from
+# DynamoDB in-process (agent-config.mjs imports resolve-config.mjs from CONFIG_RESOLVER_DIR below —
+# this COPY is what makes that specifier resolve, and the reason it is a dynamic import at all is
+# that this Dockerfile flattens agentcore-pi/ to /app/ while config-resolver/ lands one level in);
 # the adapter materializes skills + seeds the workspace onto EFS from DynamoDB post-mount.
 COPY config-resolver/ ./config-resolver/
 RUN cd config-resolver && npm install --omit=dev --no-fund --no-audit

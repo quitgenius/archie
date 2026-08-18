@@ -1,5 +1,5 @@
 // The per-turn config fingerprint — what decides whether a warm session keeps serving, or
-// re-resolves openclaw.json and rebuilds.
+// re-resolves its config from DynamoDB and rebuilds.
 //
 // WHY THIS FILE EXISTS. The App Home "Models" tab writes the picked model to
 // AGENT#<id>/MARKETPLACE `.models` (marketplace.js setModel), and the generator resolves it AHEAD

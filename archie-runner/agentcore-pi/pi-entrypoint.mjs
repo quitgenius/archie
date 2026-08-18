@@ -1,13 +1,12 @@
-// Pi-only AgentCore entrypoint: resolve openclaw.json from DynamoDB (config-resolver
-// resolve-boot) -> fetch runtime secrets -> hand off to the adapter. No OpenClaw runtime, no
-// gateway. The EFS mount-wait + workspace seed + skill-library sync are DEFERRED to the adapter
-// (ensureEfsReady, lazy/post-listen) so a slow (~90s) BYO-EFS mount can't block boot into an
-// AgentCore health-check restart loop.
+// Pi-only AgentCore entrypoint: resolve this agent's config from DynamoDB (config-resolver) ->
+// fetch runtime secrets -> hand off to the adapter. No OpenClaw runtime, no gateway. The EFS
+// mount-wait + workspace seed + skill-library sync are DEFERRED to the adapter (ensureEfsReady,
+// lazy/post-listen) so a slow (~90s) BYO-EFS mount can't block boot into an AgentCore health-check
+// restart loop.
 
-import { execFileSync } from 'node:child_process';
-import { mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { collectInsecureHosts, installScopedTlsBypass } from './tls-scoped.mjs';
+import { loadAgentConfig, agentConfig } from './agent-config.mjs';
 
 const BOOT_EPOCH_MS = Number(process.env.BOOT_EPOCH_MS) || Date.now();
 process.env.BOOT_EPOCH_MS = String(BOOT_EPOCH_MS); // share the epoch with the adapter
@@ -24,8 +23,14 @@ const EFS_DIR = process.env.EFS_DIR;
 // OpenClaw EFS state in place. Sessions stay at EFS_DIR/sessions (matches OpenClaw too).
 const WORKSPACE = process.env.PI_WORKSPACE || EFS_DIR || '/tmp/pi-ws';
 process.env.PI_WORKSPACE = WORKSPACE; // ensure the adapter uses the same cwd we seed
+// Written BACK to the environment, like PI_WORKSPACE and AWS_REGION above, because the config
+// resolver reads it: BASE_PLUGINS templates the demo-cache plugin's `dataRoot` from
+// process.env.OPENCLAW_HOME and falls back to /app/.openclaw when it is unset. Resolution used to run
+// in a child process that was handed this defaulted value explicitly; in-process the default has to
+// be published or a container that sets no OPENCLAW_HOME would silently get a different dataRoot
+// than it does today.
 const OPENCLAW_HOME = process.env.OPENCLAW_HOME || '/tmp/oc';
-const CONFIG_JSON = join(OPENCLAW_HOME, '.openclaw', 'openclaw.json');
+process.env.OPENCLAW_HOME = OPENCLAW_HOME;
 
 async function fetchSecret(secretId, region) {
   const { SecretsManagerClient, GetSecretValueCommand } = await import('@aws-sdk/client-secrets-manager');
@@ -82,42 +87,34 @@ const fingerprint = async (s) => {
 // ensureEfsReady), run LAZILY post-listen — a slow (~90s) mount must not block the
 // entrypoint/boot, or AgentCore's health check fails the container into a restart loop.
 
-// Resolve openclaw.json from DynamoDB via the config-resolver shipped in the image. The skill
-// catalog is sourced from DDB inside resolve-boot; the skill library itself + the per-agent
-// workspace seed are deferred to the adapter (ensureEfsReady → EFS, from DDB), since they need
-// the (async, ~90s) EFS mount which must not block boot.
+// Resolve this agent's config from DynamoDB, in-process, via the config-resolver shipped in the
+// image (agent-config.mjs memoizes it, so the adapter's boot reuses this one read). The skill catalog
+// is sourced from DDB inside the resolver; the skill library itself + the per-agent workspace seed are
+// deferred to the adapter (ensureEfsReady → EFS, from DDB), since they need the (async, ~90s) EFS
+// mount which must not block boot.
+//
+// This used to spawn `node resolve-boot.mjs` to render an `openclaw.json` the adapter read back. The
+// file and the subprocess are both gone: the resolver returns `{ agent, cfg }` and that object IS the
+// config from here on. What that removes from every cold boot is an entire Node interpreter start
+// before any of our code runs, and from every mid-session re-resolve a second one.
 async function bootConfig() {
-  const RESOLVER = process.env.CONFIG_RESOLVER_DIR || '/usr/local/share/clawdbot/config-resolver';
-  mkdirSync(join(OPENCLAW_HOME, '.openclaw'), { recursive: true });
-  execFileSync('node', [join(RESOLVER, 'resolve-boot.mjs')], {
-    stdio: ['ignore', 'inherit', 'inherit'],
-    env: {
-      ...process.env,
-      AGENT_NAME,
-      OPENCLAW_CONFIG_FILE: CONFIG_JSON,
-      OPENCLAW_HOME,
-      AWS_BEDROCK_ENABLED: 'true',
-      REGION,
-      OPENCLAW_GATEWAY_TOKEN: process.env.OPENCLAW_GATEWAY_TOKEN || 'pi-adapter-unused-token',
-      // RESOLVER_SKILLCATALOG_FILE intentionally unset: resolve-boot fetches SKILL#_catalog from DDB.
-    },
-  });
-  process.env.OPENCLAW_JSON = CONFIG_JSON;
-  log({ level: 'info', msg: 'openclaw.json resolved from DDB', path: CONFIG_JSON, table: process.env.AGENT_CONFIG_TABLE });
+  const { agent } = await loadAgentConfig({ agentName: AGENT_NAME, logger: console });
+  log({ level: 'info', msg: 'config resolved from DDB', agent: agent.id, table: process.env.AGENT_CONFIG_TABLE });
   phase('config_generated');
   // Skills + workspace seed happen in the adapter (ensureEfsReady) once EFS is mounted (§9).
 }
 
 /**
- * Is `tool` in this agent's resolved allow-set, per the openclaw.json resolve-boot just wrote?
+ * Is `tool` in this agent's resolved allow-set?
  *
- * MUST be called after resolveConfig(). Before it the file does not exist and this returns false,
- * which is the safe direction for its one caller (skip a secret fetch) but would silently disable any
- * future caller that reads it as "not allowed" rather than "not yet known".
+ * MUST be called after bootConfig(). agentConfig() THROWS before then rather than answering, because
+ * its one caller reads a false as "not allowed" and skips a secret fetch — an answer that must never
+ * be produced by "not resolved yet". The throw is reachable only if the boot order changes, and the
+ * entrypoint's top-level handler reports it.
  *
- * `agents.list` is a SINGLE-element list here — resolve-boot writes `list: [agent]` for this agent
- * alone (resolve-boot.mjs:127) — so there is no agent selection to get wrong, unlike the adapter's
- * selectAgent which handles the multi-agent config shape.
+ * The resolver returns THIS agent's entry directly, so there is no agent selection to get wrong (the
+ * old file carried a single-element `agents.list` purely to satisfy the adapter's multi-agent
+ * `selectAgent`, which is why both are gone).
  *
  * Deliberately NOT importing config-map's resolveAllowedTools: that module pulls in the Pi runtime
  * (`pca`), which would move a multi-megabyte import onto the pre-adapter boot path to answer a
@@ -127,15 +124,7 @@ async function bootConfig() {
  */
 function agentAllowsTool(tool) {
   if (String(tool).startsWith('group:')) throw new Error(`agentAllowsTool: expects a leaf tool token, got ${tool}`);
-  try {
-    const cfg = JSON.parse(readFileSync(CONFIG_JSON, 'utf8'));
-    const agent = (cfg?.agents?.list || [])[0];
-    return (agent?.tools?.alsoAllow || []).includes(tool);
-  } catch {
-    // No config, unreadable, or unparseable — the adapter is about to fail loudly on the same file, so
-    // do not add a second confusing error here. Answer "not allowed" and let it report.
-    return false;
-  }
+  return (agentConfig().agent?.tools?.alsoAllow || []).includes(tool);
 }
 
 
@@ -297,7 +286,7 @@ async function main() {
   // secret id for ungranted agents) would put a grant in `runtimeEnv`, which is fingerprinted into the
   // runtime NAME — so adding a datadog grant would force a runtime roll, destroying the property that
   // grants apply live on the next turn with no restart. The resolved allow-set is the same information
-  // one layer down, and it costs nothing: resolve-boot has already written it.
+  // one layer down, and it costs nothing: bootConfig has already resolved it.
   const ddRegion = process.env.DATADOG_KEY_SECRET_REGION;
   if (agentAllowsTool('datadog')) {
     for (const [secretEnv, keyEnv, label] of [
@@ -331,7 +320,8 @@ async function main() {
     } catch (e) { log({ level: 'warn', msg: 'dispatcher secret fetch failed', err: e.message }); }
   }
 
-  // Hand off — the adapter self-boots on import (reads OPENCLAW_JSON + PI_WORKSPACE).
+  // Hand off — the adapter self-boots on import. It takes the config from agent-config.mjs's memo
+  // (the resolve bootConfig already paid for, same module instance in this process) + PI_WORKSPACE.
   await import('./pi-adapter.mjs');
 }
 

@@ -1,9 +1,12 @@
-// Map a generated openclaw.json agent entry -> Pi createAgentSession inputs.
-// Ship-fast approach (pi-core-migration-plan §3.7): keep boot-time pull-config +
-// openclaw.json; map the resolved config to Pi in-process. Direct-EFS: cwd/sessions
-// ARE the EFS mount (no copy-sync). Phase 1 covers model, cwd, tool allow-list ->
-// Pi built-in tools, and bootstrap context-file auto-injection (the primary memory
-// path). Plugin/memory-FTS/hindsight tools come from later phases.
+// Map a resolved agent entry (config-resolver/resolve-config.mjs) -> Pi createAgentSession inputs.
+// Direct-EFS: cwd/sessions ARE the EFS mount (no copy-sync). Covers model, cwd, tool allow-list ->
+// Pi built-in tools, bootstrap context-file auto-injection (the primary memory path), and the
+// plugin manifest.
+//
+// `cfg`/`agent` here are the two halves of what the resolver returns. They used to arrive as a parsed
+// `openclaw.json` — the OpenClaw-shaped envelope the boot path rendered to a file and read back — so
+// the field paths below (`cfg.plugins.entries`, `agent.tools.alsoAllow`) are that shape's, minus the
+// keys nothing read. The file and the shape's generator are both gone; the field names stayed.
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -44,10 +47,11 @@ const GROUPS = {
   'group:runtime': ['exec', 'process'],
 };
 
-export function selectAgent(cfg, agentName) {
-  const list = cfg?.agents?.list || [];
-  return list.find((a) => a.id === agentName) || list.find((a) => a.default) || list[0] || null;
-}
+// NO selectAgent. It picked this agent out of `cfg.agents.list`, and that list only ever existed
+// because the boot path serialised the config to a file: the resolver builds ONE agent, and the writer
+// wrapped it as `list: [agent]` purely so this function had the multi-agent shape it expected on the
+// way back in. With the file gone the resolver returns `{ agent, cfg }` and there is nothing to select
+// — a lookup that can only return its single input is a place for it to return the wrong thing.
 
 export function resolveModelSpec(agent, cfg) {
   const spec = String(agent?.model || cfg?.agents?.defaults?.model?.primary || '');
@@ -139,7 +143,8 @@ export function makeResourceLoader({ cwd, bootstrap, extensionFactories = [], sk
   });
 }
 
-// Resolve the plugin manifest from the generated openclaw.json (cfg.plugins). Returns the
+// Resolve the plugin manifest from the resolved config's `cfg.plugins` (BASE_PLUGINS + this agent's
+// slice — see config-resolver/boot-config.mjs and plugin-slice.mjs). Returns the
 // intent; the adapter maps compat ids -> bundle paths (existence-checked there).
 //   { hindsight: {id, config}|null, compat: [{id, pluginConfig}], skipped: [{id, reason}] }
 export function resolvePluginManifest(cfg) {

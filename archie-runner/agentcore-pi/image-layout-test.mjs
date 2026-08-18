@@ -200,6 +200,60 @@ test('the guard actually discriminates — a file dropped from the COPY allowlis
   assert.equal(resolved, null, 'a missing COPY must be unresolvable, or this guard proves nothing');
 });
 
+/**
+ * The CROSS-TREE imports the graph walk above cannot see.
+ *
+ * agentcore-pi -> config-resolver cannot be a static relative import, because the two trees are at the
+ * same depth in the repo and at DIFFERENT depths in the image (`../config-resolver` in the repo,
+ * `./config-resolver` in /app). The convention is therefore a dynamic import built from
+ * CONFIG_RESOLVER_DIR — which means the specifier is a computed expression, and `localSpecifiers`
+ * only matches literals. So every one of these hops is invisible to the walk, including
+ * agent-config.mjs -> resolve-config.mjs, which is on the COLD BOOT path: a typo there is
+ * ERR_MODULE_NOT_FOUND on the agent's first invoke, the exact failure this file exists to prevent.
+ *
+ * config-resolver/ is COPYed as a whole directory, so the file being absent is not the risk; the
+ * filename being wrong is. This resolves each one against the same virtual layout, which catches that.
+ */
+function resolverDirSpecifiers(source) {
+  const code = source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  const specs = new Set();
+  const patterns = [
+    /RESOLVER_DIR\s*,\s*['"]([^'"]+\.(?:mjs|cjs|js))['"]/g,        // join(RESOLVER_DIR, 'x.mjs')
+    /CONFIG_RESOLVER_DIR\}\/([^'"`]+\.(?:mjs|cjs|js))/g,           // `${CONFIG_RESOLVER_DIR}/x.mjs`
+    /['"`]\.\.\/config-resolver\/([^'"`]+\.(?:mjs|cjs|js))['"`]/g, // '../config-resolver/x.mjs'
+  ];
+  for (const re of patterns) for (const m of code.matchAll(re)) specs.add(m[1]);
+  return [...specs];
+}
+
+test('cross-tree config-resolver imports resolve in the image layout too', () => {
+  const { layout } = buildImageLayout();
+  // Only files that actually SHIP — the test files in this directory are not in the image and their
+  // repo-relative '../config-resolver/…' imports are correct where they run.
+  const shipped = [...layout.entries()].filter(([inImage, src]) => inImage.startsWith('/app/')
+    && /\.(mjs|cjs|js)$/.test(src) && src.includes(`${path.sep}agentcore-pi${path.sep}`));
+
+  const missing = [];
+  const checked = [];
+  for (const [inImage, src] of shipped) {
+    for (const name of resolverDirSpecifiers(fs.readFileSync(src, 'utf8'))) {
+      const target = `/app/config-resolver/${name}`;
+      checked.push(`${inImage} -> ${target}`);
+      if (!layout.has(target)) {
+        missing.push(`${inImage}\n      dynamically imports config-resolver/'${name}'`
+          + `\n      -> ${target} is not in the image`
+          + `\n      (source: ${path.relative(CONTEXT, src)})`);
+      }
+    }
+  }
+
+  // Not vacuous: the boot path has at least agent-config -> resolve-config and pi-adapter -> schema.
+  assert.ok(checked.length >= 3, `expected several cross-tree specifiers, found ${checked.length}`);
+  assert.deepEqual(missing, [], missing.length
+    ? `\n\n${missing.length} cross-tree import(s) would be MODULE_NOT_FOUND in the image:\n\n  - ${missing.join('\n\n  - ')}\n`
+    : '');
+});
+
 test('flattening is modelled: permissions/ keeps its dir, agentcore-pi/ does not', () => {
   const { layout } = buildImageLayout();
   // agentcore-pi/*.mjs is flattened to /app/*.mjs …
