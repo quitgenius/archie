@@ -50,17 +50,26 @@ test('$-prefixed keys are annotation, and the filter is on the PREFIX not the ty
   const prod = loadPolicySources({ env: 'prod' });
   const sandbox = loadPolicySources({ env: 'sandbox' });
 
-  // 12 groups in each: 5 zero-holder pins + 7 seeded, one per pinned capability.
+  // 18 groups in each: 12 capability pins + 6 skill groups.
   assert.equal(realKeys(prod.pins.groups).length, 18);
   assert.equal(realKeys(sandbox.pins.groups).length, 18);
   assert.ok(!realKeys(prod.pins.groups).some((k) => k.startsWith('$')));
 
-  // THE CASE A TYPE-BASED FILTER GETS WRONG. `$pin.aws-readonly` is a bare STRING in prod and an
-  // ARRAY OF STRINGS in sandbox — structurally indistinguishable from a group. Only the `$` separates
-  // sandbox's nine-line review note from nine extra scope memberships.
-  assert.equal(typeof prod.pins.groups['$pin.aws-readonly'], 'string');
+  // PROD CARRIES NO ANNOTATIONS AT ALL since 2026-08-18 — its 154 lines of prose moved to
+  // policy/README.md (internal decision). Asserted, because a data file
+  // that is meant to be data only should fail if prose creeps back into it.
+  assert.deepEqual(Object.keys(prod.pins).filter((k) => k.startsWith('$')), [], 'prod is data only');
+  assert.deepEqual(Object.keys(prod.pins.groups).filter((k) => k.startsWith('$')), []);
+
+  // THE CASE A TYPE-BASED FILTER GETS WRONG, still demonstrated on REAL data: sandbox's
+  // `$pin.aws-readonly` is an ARRAY OF STRINGS, structurally indistinguishable from a group. Only the `$`
+  // separates a nine-line review note from nine extra scope memberships.
   assert.ok(Array.isArray(sandbox.pins.groups['$pin.aws-readonly']));
   assert.ok(!realKeys(sandbox.pins.groups).includes('$pin.aws-readonly'));
+  // The bare-STRING half used to be prod's own `$pin.aws-readonly` and went with the prose, so it is
+  // constructed here rather than dropped: both value shapes must be filtered, and a reader that special-cased
+  // one would pass on half the real data.
+  assert.deepEqual(realKeys({ 'pin.real': ['dm-x'], $note: 'a bare string', $lines: ['an', 'array'] }), ['pin.real']);
 
   // Same convention in the shared data file, where `$immutable` sits beside `members`.
   assert.deepEqual(realKeys(prod.data.capGroups), ['baseline', 'connector.comms']);
