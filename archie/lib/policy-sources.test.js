@@ -50,9 +50,9 @@ test('$-prefixed keys are annotation, and the filter is on the PREFIX not the ty
   const prod = loadPolicySources({ env: 'prod' });
   const sandbox = loadPolicySources({ env: 'sandbox' });
 
-  // 18 groups in each: 12 capability pins + 6 skill groups.
-  assert.equal(realKeys(prod.pins.groups).length, 18);
-  assert.equal(realKeys(sandbox.pins.groups).length, 18);
+  // 17 groups in each: 12 capability pins + 5 skill groups (comms-approval removed 2026-08-19).
+  assert.equal(realKeys(prod.pins.groups).length, 17);
+  assert.equal(realKeys(sandbox.pins.groups).length, 17);
   assert.ok(!realKeys(prod.pins.groups).some((k) => k.startsWith('$')));
 
   // PROD CARRIES NO ANNOTATIONS AT ALL since 2026-08-18 — its 154 lines of prose moved to

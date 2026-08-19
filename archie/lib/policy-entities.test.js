@@ -98,8 +98,12 @@ test('a capGroup member with no capability entity refuses loudly', () => {
   assert.equal(codeOf(() => capGroupParents(broken)), EXIT.PREFLIGHT);
 });
 
-test('the ScopeGroup vocabulary is the 12 pins PLUS the 6 skill groups, in both environments', () => {
-  // Two classes now (D3, 2026-08-18): `pin.<capability>` groups, which Cedar statements reference, and
+test('the ScopeGroup vocabulary is the 12 pins PLUS the 5 skill groups, in both environments', () => {
+  // FIVE skill groups since 2026-08-19: comms-approval was removed as a zero-holder pin. It was also the
+  // group the deployed gateway rejected, which made every POLICY row write fail non-fatally — so a group
+  // nobody held was disabling the policy layer for whichever scope tried to use it.
+  //
+  // Two classes (D3, 2026-08-18): `pin.<capability>` groups, which Cedar statements reference, and
   // `skill.<id>` groups, which no statement references — they are compiled into the row's `skills` list and
   // consumed by the runtime's skill filter. Both are ScopeGroups because both are per-environment scope
   // membership; the difference is who reads them, and check 3 exempts the skill prefix for that reason.
@@ -109,7 +113,7 @@ test('the ScopeGroup vocabulary is the 12 pins PLUS the 6 skill groups, in both 
     'pin.demo_cache', 'pin.sandbox-probe', 'pin.demo_mail_app',
   ];
   const skills = [
-    'skill.comms-approval', 'skill.demo-crm', 'skill.sales-reengagement-briefing',
+    'skill.demo-crm', 'skill.sales-reengagement-briefing',
     'skill.skill-builder', 'skill.support-member-update', 'skill.demo-sensitive-skill',
   ];
   const expected = [...pins, ...skills].sort();
@@ -186,11 +190,12 @@ test('membership is the Scope entity\'s parents, and an unnamed scope simply has
 
 test('entitiesFor is the shared set plus exactly one principal', () => {
   const shared = sharedEntities(PROD);
-  // 31 capabilities + 2 CapGroups + 18 ScopeGroups (12 pin + 6 skill, seeded 2026-08-18). The skill groups
+  // 31 capabilities + 2 CapGroups + 17 ScopeGroups (12 pin + 5 skill; comms-approval removed 2026-08-19,
+  // a zero-holder pin that was also breaking POLICY row writes on the deployed gateway). The skill groups
   // get entities like any other ScopeGroup even though no Cedar statement references them: the entity set is
   // vocabulary, and omitting them would make a Scope's `parents` name a group that does not exist — which
   // spike README §5 records as a dangling parent that still ALLOWS, i.e. fails OPEN.
-  assert.equal(shared.length, 31 + 2 + 18);
+  assert.equal(shared.length, 31 + 2 + 17);
   const all = entitiesFor(MEMBER, PROD);
   assert.equal(all.length, shared.length + 1);
   assert.equal(all[all.length - 1].uid.id, MEMBER);

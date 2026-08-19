@@ -20,7 +20,7 @@ import { filterPinnedSkills } from './skill-scope.mjs';
 
 const MAN = { skills: { 'otel-debug': 'v1', 'skill-builder': 'v1', 'demo-crm': 'v1', understand: 'v1' } };
 const INSTALLS = { 'otel-debug': {}, 'skill-builder': {}, 'demo-crm': {}, understand: {} };
-const GOVERNED = ['demo-crm', 'skill-builder', 'comms-approval'];
+const GOVERNED = ['demo-crm', 'skill-builder', 'demo-sensitive-skill'];
 const keys = (r) => Object.keys(r).sort();
 
 test('no policy row is a NO-OP, whichever argument is missing', () => {
