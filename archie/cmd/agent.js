@@ -1366,18 +1366,44 @@ function accessPointArnOf(g) {
 async function agentItemKeys(clients, table, agents) {
   const prefixes = agents.flatMap((a) => [`AGENT#${a}`, `GRANT#${a}`, `RUNTIME#${a}`]);
   const wanted = new Set(prefixes);
+  const scopes = new Set(agents);
   const keys = [];
   let ExclusiveStartKey;
   do {
     const r = await clients.doc.send(new clients.docCmds.ScanCommand({
       TableName: table,
-      ProjectionExpression: '#pk, #sk',
-      ExpressionAttributeNames: { '#pk': 'pk', '#sk': 'sk' },
+      // `data` is projected only to read the CRON alias below. Everything else is decided by the key.
+      ProjectionExpression: '#pk, #sk, #d',
+      ExpressionAttributeNames: { '#pk': 'pk', '#sk': 'sk', '#d': 'data' },
       ExclusiveStartKey,
     }));
     for (const item of r.Items || []) {
-      if (typeof item.pk !== 'string' || !wanted.has(item.pk)) continue;
-      keys.push({ pk: item.pk, sk: item.sk });
+      if (typeof item.pk !== 'string') continue;
+      if (wanted.has(item.pk)) { keys.push({ pk: item.pk, sk: item.sk }); continue; }
+      // THE LEGACY-NAME CRON ALIAS, which the three prefixes above cannot reach (2026-08-19).
+      //
+      // Cron hydration writes `AGENT#<legacyName>/CRON -> {alias: <scopeId>}` so the OpenClaw gate can
+      // find a scope-keyed runner flag while knowing only its config-repo AGENT_NAME. It is keyed by the
+      // LEGACY NAME, so a per-scope teardown left it behind — I previously called that correct, and it is
+      // not: it is a per-agent row, so it is part of that agent's footprint, and leaving it makes the
+      // table hold a pointer into a partition that no longer exists.
+      //
+      // Deleting it is also the right SIGNAL rather than merely tidy. The gate falls back to firing here
+      // when the flag is absent, and absent is exactly the truth after a teardown: there is no archie
+      // agent to run those crons, so OpenClaw should. Both states already reach that outcome — an absent
+      // alias resolves to 'default', and a dangling one logs "alias points at a missing row — firing
+      // here" — so this changes no behaviour today. It removes a stale pointer whose next reader has to
+      // work out that it means nothing.
+      //
+      // MATCHED BY ITS TARGET, not by META.efsRoot: teardown deletes META in the same run, and the
+      // already-torn-down case has no META at all, so resolving the legacy name that way would work only
+      // in the easy case. The alias names the scope it points at, which is the fact we have.
+      if (item.sk === 'CRON' && typeof item.data === 'string') {
+        try {
+          const body = JSON.parse(item.data);
+          if (typeof body.alias === 'string' && scopes.has(body.alias)) keys.push({ pk: item.pk, sk: item.sk });
+        } catch { /* a malformed row is not an alias; the key-matched pass above still covers it */ }
+      }
     }
     ExclusiveStartKey = r.LastEvaluatedKey;
   } while (ExclusiveStartKey);
