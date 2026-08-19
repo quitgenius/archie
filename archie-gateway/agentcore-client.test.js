@@ -1487,3 +1487,42 @@ describe('observedSpecOf — reading a live runtime\'s ACTUAL spec back from AWS
     expect(specs[OLD].image).toBe('repo:v1');
   });
 });
+
+describe('the POLICY row write is an UpdateItem, because that is the permission we have', () => {
+  // STRUCTURAL, because it cannot be behavioural: setClientsForTest sets `_faked`, and ensurePolicyRow
+  // returns { reason: 'no-table' } immediately when faked — so no injected double can reach the write.
+  //
+  // Worth pinning anyway. This wrote with PutCommand against a role that holds UpdateItem and NOT
+  // PutItem (the same constraint marketplace.js and the §9.9a seed pre-write record), so EVERY policy
+  // row write failed with AccessDeniedException — non-fatally, and invisibly, because a second bug
+  // upstream (rowFromMemberships throwing on an unknown group name) surfaced first and masked it.
+  //
+  // Since an absent row now means DENY-ALL, this is the difference between a working agent and one that
+  // cannot read a file. And the dispatcher is the ONLY writer for minted scopes, which no deploy can
+  // enumerate — measured live: dm-ux0mz5ckp2r and ch-c39t04uyfgs were both dead this way.
+  const src = require('node:fs').readFileSync(require.resolve('./agentcore-client.js'), 'utf8');
+  // END ANCHOR FOUND FORWARD FROM THE START, not by naming the next function. The first version sliced
+  // to `resolveEfsRootFromMeta`, which sits EARLIER in the file — so the slice was empty and the
+  // assertions passed against '' until the negation ones failed. A test that reads nothing looks green.
+  const start = src.indexOf('async function ensurePolicyRow');
+  const after = src.indexOf('\n  async function ', start + 1);
+  const ensureBody = src.slice(start, after > start ? after : start + 4000);
+
+  it('uses UpdateCommand and never PutCommand', () => {
+    expect(ensureBody).toMatch(/new UpdateCommand\(/);
+    expect(ensureBody).not.toMatch(/new PutCommand\(/);
+  });
+
+  it('carries no ConditionExpression — it must OVERWRITE a moved digest', () => {
+    // The seed pre-write is create-only (attribute_not_exists) on purpose; this is the opposite case.
+    // A condition here would make a policy change silently fail to reach any scope that already had a row.
+    expect(ensureBody).not.toMatch(/ConditionExpression/);
+  });
+
+  it('aliases the reserved attribute name', () => {
+    // `data` is fine unaliased, but an unaliased attribute is how the 2026-08-13 fleet-wide outage
+    // happened (a bare `agent`), so the expression is asserted to use a placeholder either way.
+    expect(ensureBody).toMatch(/ExpressionAttributeNames/);
+    expect(ensureBody).toMatch(/SET #d = :d/);
+  });
+});

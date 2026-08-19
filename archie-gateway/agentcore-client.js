@@ -925,7 +925,7 @@ function createAgentCoreClient(overrides = {}) {
       if (lastPolicyDigest.get(agent) === artifact.policyDigest) return { written: false, reason: 'cached' };
 
       const [schema, { rowFromMemberships, rowIsStale }] = [await loadConfigSchema(), require('./policy-derive')];
-      const { GetCommand, PutCommand } = require('@aws-sdk/lib-dynamodb');
+      const { GetCommand, UpdateCommand } = require('@aws-sdk/lib-dynamodb');
       const Key = schema.agentPolicyKey(agent);
       const cur = await docClient().send(new GetCommand({ TableName: config.agentConfigTable, Key }));
       const existing = cur?.Item?.data ? JSON.parse(cur.Item.data) : null;
@@ -934,9 +934,30 @@ function createAgentCoreClient(overrides = {}) {
         return { written: false, reason: 'current' };
       }
       const row = rowFromMemberships(agent, artifact);
-      await docClient().send(new PutCommand({
+      // UpdateItem, NOT PutItem, and this is a permission fact rather than a style choice: the
+      // dispatcher task role holds dynamodb:UpdateItem and NOT PutItem (the same constraint marketplace.js
+      // and the §9.9a seed pre-write both record). This wrote with PutCommand against a permission it
+      // never had, so EVERY policy row write failed:
+      //
+      //   User: .../archie-dispatcher-task-role/... is not authorized to perform: dynamodb:PutItem
+      //
+      // It failed non-fatally and was invisible for a different reason first — rowFromMemberships threw on
+      // a group name the deployed build did not know, so the AccessDenied only surfaced once that was
+      // fixed. Two failures stacked on the same swallowed path.
+      //
+      // WHY IT MATTERS MORE NOW: since absent-row means DENY-ALL, a scope whose row cannot be written is
+      // an agent that can do nothing at all — not even fs.read — and the dispatcher is the only thing that
+      // writes rows for MINTED scopes, which no deploy can enumerate. Measured live: dm-ux0mz5ckp2r and
+      // ch-c39t04uyfgs were both in exactly that state.
+      //
+      // NO CONDITION EXPRESSION. Unlike the seed pre-write (create-only, attribute_not_exists), this must
+      // OVERWRITE: the whole point is refreshing a row whose policy digest has moved.
+      await docClient().send(new UpdateCommand({
         TableName: config.agentConfigTable,
-        Item: { ...Key, data: JSON.stringify(row) },
+        Key,
+        UpdateExpression: 'SET #d = :d',
+        ExpressionAttributeNames: { '#d': 'data' },
+        ExpressionAttributeValues: { ':d': JSON.stringify(row) },
       }));
       lastPolicyDigest.set(agent, artifact.policyDigest);
       if (logger?.info) {
