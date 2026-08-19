@@ -436,8 +436,8 @@ async function seedCmd(ctx, args, out, deps = {}) {
     if (derived.unmappable.length > 6) lines.push(`            … +${derived.unmappable.length - 6} more`);
   }
   for (const w of withheld) {
-    lines.push(`KEPT      ${w.group}: ${w.members.length} member(s) no config surface explains (manual grant?) — `
-      + `${w.members.join(', ')}`);
+    lines.push(`REMOVED   ${w.group}: ${w.members.length} member(s) no config surface explains — `
+      + `${w.members.join(', ')}. This file is DERIVED; declare it in config to keep it.`);
   }
   if (!changes.length) lines.push('membership already matches this sandra tree — nothing to write');
   for (const c of changes) {

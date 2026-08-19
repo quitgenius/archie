@@ -98,8 +98,15 @@ test('check 4: catches the bug that actually shipped to pins.prod.json', () => {
   const prodScopes = [...new Set(realKeys(PROD.pins.groups).flatMap((g) => PROD.pins.groups[g] || []))];
   const bad = clone(PROD);
   bad.pins.groups['pin.cloudwatch-logs'] = ['ch-c66pp782t9k', 'dm-umrsp7355u7', 'dm-ubb6nu5514b', 'dm-ux0mz5ckp2r'];
-  const fatal = checkMembership(bad, prodScopes).filter((f) => f.fatal);
-  assert.equal(fatal.length, 2);
+  // NON-FATAL since 2026-08-19, and the reason is worth keeping next to this test: a derived pins file
+  // legitimately names scopes that are not hydrated (added to sandra, or deliberately torn down), and that
+  // is indistinguishable from here — so blocking every deploy on it was the worse trade. An unknown member
+  // grants and revokes nothing until the scope exists. It is still REPORTED on every publish, which is what
+  // caught the original prod contamination; the SHAPE check below stays fatal.
+  const found = checkMembership(bad, prodScopes).filter((f) => f.check === 4);
+  assert.equal(found.length, 2);
+  assert.ok(found.every((f) => !f.fatal), 'reported, not fatal');
+  const fatal = found;
   for (const id of ['ch-c66pp782t9k', 'dm-ux0mz5ckp2r']) {
     assert.ok(fatal.some((f) => f.message.includes(id)), `${id} is not a prod scope and must be caught`);
   }

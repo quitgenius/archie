@@ -205,10 +205,21 @@ function checkMembership(sources, knownScopes) {
         continue;
       }
       if (known && !known.has(member)) {
+        // NON-FATAL since 2026-08-19. This was fatal, to catch the pins.prod.json failure — sandbox ids in
+        // the prod file, which shape alone passes. But it cannot distinguish that from the NORMAL state of a
+        // derived pins file: an agent declared in the config repo whose scope is not hydrated (added to
+        // sandra but never hydrated, or deliberately torn down — "when I want to hydrate that specific agent
+        // then hydrate that specific agent"). Both look identical from here, and blocking every deploy on the
+        // legitimate one is the worse trade: an unknown member grants nothing and revokes nothing, so it is
+        // inert until the scope exists, whereas a stopped deploy is immediate.
+        //
+        // The shape check above stays FATAL — an agent NAME here denies every intended holder — and this
+        // still prints on every publish, so cross-environment contamination remains visible.
         out.push(finding(4, `${g} member '${member}' is not a scope in this environment`, {
-          detail: `well-formed but unknown — the pins.prod.json failure mode. This environment has `
-            + `${known.size} scope(s); publishing an id from another one silently revokes nothing and `
-            + 'grants nothing, while reading correctly.',
+          fatal: false,
+          detail: `well-formed but unknown. Either the scope is not hydrated yet (normal — it is inert until `
+            + `it is) or this is an id from another environment (the pins.prod.json failure mode). This `
+            + `environment has ${known.size} scope(s).`,
         }));
       }
     }

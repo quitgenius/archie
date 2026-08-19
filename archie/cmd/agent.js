@@ -1190,7 +1190,7 @@ async function teardown(ctx, args, out, deps) {
     });
   }
 
-  // ACCESS POINTS ARE OPT-IN VIA `--access-points` (2026-08-18). Deleting one does not lose EFS
+  // ACCESS POINTS GO TOO — part of "leave no trace" (2026-08-19). Deleting one does not lose EFS
   // data — the directory survives, and a re-provision recreates the AP at the same root from
   // META.efsRoot — but it does BREAK THE NEXT BOOT of any agent whose workspace has content. A fresh AP
   // sets `ap.selfCreated`, which makes the dispatcher pre-write the baked skeleton SEED; the next boot
@@ -1201,20 +1201,29 @@ async function teardown(ctx, args, out, deps) {
   // So the default is the reversible half (runtimes + recreatable table items) and detaching a live
   // workspace is a separate, deliberate act. `access-point gc` is the command for reaping APs that have
   // no live runtime, which is the safe case by construction.
-  const wantAps = Boolean(args.values['access-points']);
+  // Kept as a deliberate escape hatch rather than a default: --keep-access-points is for the case where the
+  // workspace is SHARED with a still-running OpenClaw agent and you want the archie mount left alone. It does
+  // not protect data either way (the directory survives an AP delete; a re-provision recreates the AP at the
+  // same root from META.efsRoot), so the only thing it changes is whether the next boot sees a fresh AP.
+  const wantAps = !args.values['keep-access-points'];
 
   // Access points: only the ones these runtimes actually mount, and only if tagged. Both filters are
   // required — the tag is what IAM permits deletion by, and ECS / agent-xx9aff / filebrowser access
   // points do not carry it (agent-teardown.js:33,77).
   const mounted = new Set(targets.map((t) => t.accessPointArn).filter(Boolean));
+  // Two ways in, because a mounted-only lookup misses exactly the no-runtime case above. The dispatcher
+  // names each access point after the scope it belongs to, so an explicitly named scope is matched by NAME
+  // as well as by "mounted by a runtime we just deleted". Still gated on the managed-by tag below, which is
+  // the only thing IAM permits deletion by — ECS, filebrowser and legacy access points stay untouchable
+  // either way.
   const onFs = wantAps
-    ? (await describeAccessPoints(clients, config.efsFsId)).filter((ap) => mounted.has(ap.AccessPointArn))
+    ? (await describeAccessPoints(clients, config.efsFsId))
+      .filter((ap) => mounted.has(ap.AccessPointArn) || (only && ap.Name === only))
     : [];
   const aps = onFs.filter(tagged).map((ap) => ({ accessPointId: ap.AccessPointId, path: (ap.RootDirectory || {}).Path || null }));
   if (!wantAps && mounted.size) {
-    out.progress(`${mounted.size} mounted access point(s) LEFT IN PLACE (no --access-points) — the workspaces `
-      + 'stay attached and the next provision reuses them. Deleting one breaks the next boot of an agent whose '
-      + 'workspace has content (fresh AP => skeleton SEED => seed guard FATAL).');
+    out.progress(`${mounted.size} mounted access point(s) LEFT IN PLACE (--keep-access-points) — the `
+      + 'workspaces stay attached and the next provision reuses them.');
   }
   const untagged = onFs.filter((ap) => !tagged(ap)).map((ap) => ap.AccessPointId);
   if (untagged.length) {
@@ -1227,18 +1236,15 @@ async function teardown(ctx, args, out, deps) {
       + 'mounting another filesystem is outside this deployment\'s EFS and is not ours to delete.');
   }
 
-  const agents = [...new Set(targets.map((t) => t.agent).filter(Boolean))].sort();
+  // AN EXPLICIT --agent MEANS THE SCOPE, NOT ITS RUNTIMES (2026-08-19). Enumeration starts from
+  // ListAgentRuntimes, so a scope whose runtime was already deleted matched NOTHING: teardown reported
+  // "0 items deleted" while CONNECTOR, MARKETPLACE and the access point sat there untouched. That is how a
+  // half-alive scope survived a teardown and later refused a deploy at check 4. Naming a scope is an
+  // instruction to remove whatever remains of it, runtime or not.
+  const agents = [...new Set([...targets.map((t) => t.agent), ...(only ? [only] : [])].filter(Boolean))].sort();
   const orphanRuntimes = targets.filter((t) => !t.agent).map((t) => t.runtimeName);
   if (orphanRuntimes.length) out.warn(`${orphanRuntimes.length} runtime(s) carry no AGENT_NAME — their runtimes and access points go, their table items stay`);
-  const { keys, preserved } = agents.length
-    ? await agentItemKeys(clients, ctx.resources.configTable, agents, { include: (f) => Boolean(args.values[f]) })
-    : { keys: [], preserved: [] };
-  if (preserved.length) {
-    const named = preserved.map((k) => `${k.sk} (${k.optInWith})`).join(', ');
-    out.progress(`${preserved.length} item(s) PRESERVED because hydration cannot put them back: ${named}. `
-      + 'CONNECTOR holds a project key Connector will not reissue; MARKETPLACE holds runtime-established '
-      + 'OAuth connectors. Opt in per item only when retiring the agent for good.');
-  }
+  const keys = agents.length ? await agentItemKeys(clients, ctx.resources.configTable, agents) : [];
 
   out.progress(`${scanned} runtime(s) scanned · ${targets.length} matched · ${skipped.length} skipped by the `
     + `pattern · ${foreign.length} foreign`);
@@ -1248,7 +1254,6 @@ async function teardown(ctx, args, out, deps) {
   const plan = {
     selector: only ? { agent: only } : { nameRe: String(nameRe) },
     skipRe: String(skipRe),
-    preserved,
     accessPointsRequested: wantAps,
     scanned,
     runtimes: targets.map((t) => ({ runtimeName: t.runtimeName, runtimeId: t.runtimeId, agent: t.agent, status: t.status })),
@@ -1334,58 +1339,34 @@ function accessPointArnOf(g) {
  * and not elsewhere is how the habit erodes.
  */
 /**
- * Item keys a teardown may delete, and the ones it must not.
+ * Every item key this teardown deletes: the agent's three partitions, in full.
  *
- * WHAT `config hydrate` CANNOT PUT BACK is the whole question here, because "recreatable" is the only
- * thing that makes deleting an item safe. Measured against the hydration path, not assumed:
+ * NO PRESERVATION (2026-08-19). An earlier
+ * version of this held back AGENT#<a>/CONNECTOR and AGENT#<a>/MARKETPLACE on the grounds that hydration
+ * cannot rewrite them — CONNECTOR because Connector will not reissue a project key, MARKETPLACE because its
+ * `connectors` record OAuth flows a human completed. Both facts are still true, and both were the wrong
+ * reason to leave items behind:
  *
- *   AGENT#<a>/{CONFIG,META,SEED,MARKETPLACE}  migrate-to-ddb writes all four → recreatable
- *   GRANT#<a>/SCOPE#*                         hydration recomputes it (clobbers, deliberately) → recreatable
- *   RUNTIME#<a>/GEN#*                         `fleet stage` rewrites bindings → recreatable
- *   AGENT#<a>/CRON                            `archie cron hydrate` folds it back from the agent's EFS
- *                                             cron store, which teardown never touches → recreatable
- *   AGENT#<a>/CONNECTOR                        **NOT RECREATABLE** — see below
- *   AGENT#<a>/MARKETPLACE                     **PARTLY NOT RECREATABLE** — see below
+ *   * A partial teardown is not a state anyone asked for. It leaves the environment half-alive, so
+ *     "torn down" and "still there" become indistinguishable to every other command — `policy publish`
+ *     check 4 read the leftovers as a live scope and refused a deploy over it.
+ *   * The operator, not this command, decides what is worth keeping. Teardown is explicit and per-agent;
+ *     hydration is how an agent comes back. Withholding items to protect the operator from their own
+ *     instruction just moved the surprise later.
  *
- * CONNECTOR IS EXCLUDED BY DEFAULT (2026-08-18). `config hydrate` is PUT-ONLY over the items it
- * knows and never writes CONNECTOR, so hydration cannot restore it. Worse, the upstream cannot either:
- * Connector has key regeneration disabled org-wide, no create-key route, and GET returns only the
- * ORIGINAL MASKED key — so a project whose key we have lost can never be re-keyed through the API. That
- * makes this one item's deletion permanent and un-fixable, in a command whose entire purpose is
- * "delete the recreatable state". `--include-connector` opts in for an agent being retired for good.
+ * WHAT IT COSTS, stated so nobody has to rediscover it: the agent's Connector PROJECT survives at the
+ * upstream but its key is gone from our side, so `agent ensure-connector` provisions a NEW project on the
+ * next hydrate and the old one's connected accounts are orphaned — every toolkit needs re-authorizing.
+ * That is the price of a clean teardown, and it is the operator's to pay knowingly.
  *
- * MARKETPLACE IS EXCLUDED BY DEFAULT for a subtler reason: the item is a UNION of config-sourced and
- * runtime-established state. `installs` comes from sandra's marketplace-installs.json and hydration
- * rewrites it — but `connectors` is the record of Connector OAuth flows a human clicked through, and
- * hydration only carries connectors for an agent sandra's marketplace-installs.json actually names.
- * Measured on ch-cr89fluhion (2026-08-18): 16 connectors — gmail, slack, demo-crm, googlecalendar and
- * the rest — on a scope that is ABSENT from that file, so hydration would write nothing back and every
- * one of them would have to be re-authorized by hand. Teardown cannot tell: it has no sandra checkout.
- *
- * WHY EXCLUDING BOTH COSTS NOTHING. `config hydrate` PUTs these items rather than merging, so deleting
- * them first buys no cleanliness — hydration overwrites whatever it knows and leaves what it does not.
- * The items worth deleting are the STALE ones hydration will never overwrite because they are keyed by an
- * identity it no longer writes (e.g. `AGENT#agent-xx9aff/CRON`, a pre-rekey legacy key), and those
- * are exactly the ones these exclusions do not protect.
- *
- * CONFIG#* IS NOT IN SCOPE AT ALL, and that is load-bearing rather than incidental: `CONFIG#image`
- * holds the live fleet pointer and, more importantly, `TAINT#<digest>` records. A taint is permanent by
- * design — there is no untaint and no force — so deleting one would make a known-bad image publishable
- * again. This function keys only off the three per-agent prefixes, so it cannot reach them; stated here
- * because a future author widening the scan is exactly how that protection would be lost.
+ * CONFIG#* IS STILL OUT OF SCOPE, and that is not softness: `CONFIG#image` holds the live fleet pointer and
+ * the TAINT#<digest> records, which are fleet-wide rather than per-agent. This function keys only off the
+ * three per-agent prefixes so it cannot reach them.
  */
-// sk → the flag that opts into deleting it. Data rather than an if-chain so the plan output, the warning
-// text and the guard cannot describe different sets.
-const UNRECREATABLE_SKS = new Map([
-  ['CONNECTOR', 'include-connector'],
-  ['MARKETPLACE', 'include-marketplace'],
-]);
-
-async function agentItemKeys(clients, table, agents, { include = () => false } = {}) {
+async function agentItemKeys(clients, table, agents) {
   const prefixes = agents.flatMap((a) => [`AGENT#${a}`, `GRANT#${a}`, `RUNTIME#${a}`]);
   const wanted = new Set(prefixes);
   const keys = [];
-  const preserved = [];
   let ExclusiveStartKey;
   do {
     const r = await clients.doc.send(new clients.docCmds.ScanCommand({
@@ -1396,13 +1377,11 @@ async function agentItemKeys(clients, table, agents, { include = () => false } =
     }));
     for (const item of r.Items || []) {
       if (typeof item.pk !== 'string' || !wanted.has(item.pk)) continue;
-      const flag = UNRECREATABLE_SKS.get(item.sk);
-      if (flag && !include(flag)) { preserved.push({ pk: item.pk, sk: item.sk, optInWith: `--${flag}` }); continue; }
       keys.push({ pk: item.pk, sk: item.sk });
     }
     ExclusiveStartKey = r.LastEvaluatedKey;
   } while (ExclusiveStartKey);
-  return { keys, preserved };
+  return keys;
 }
 
 // ── exports ──────────────────────────────────────────────────────────────────────────────────────

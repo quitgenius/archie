@@ -130,7 +130,7 @@ test('every scope carries exactly 12 entries, and the allows are exactly the mem
     // widened: all 29 already exercise their capability under OpenClaw today. The sandbox stays at 9, and
     // that it did not move is itself the check that the union merge preserves members no config explains —
     // seven of sandbox's nine are hand-placed test pins with no config signal at all.
-    assert.equal(allows, sources.env === 'prod' ? 29 : 9);
+    assert.equal(allows, sources.env === 'prod' ? 29 : 7);
   }
 
   // Which gives the fleet figure: 213 prod scopes × 12 = 2,556 entries, 29 `allow`, 2,527 `deny`.

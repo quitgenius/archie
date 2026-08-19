@@ -169,12 +169,15 @@ test('membership is the Scope entity\'s parents, and an unnamed scope simply has
   // zero-holder pins aimed at one channel (pins.sandbox.json:55-59) that prod deliberately keeps empty.
   const sandboxIndex = membershipIndex(SANDBOX);
   const sandboxPins = [...sandboxIndex.values()].reduce((n, g) => n + g.filter(pinOnly).length, 0);
-  assert.equal(sandboxPins, 9);
+  // 7, from 9: pins.sandbox.json became fully DERIVED on 2026-08-19, which dropped the two hand-added
+  // memberships (pin.aws-readonly, pin.demo_diagram_app) for dm-ux0mz5ckp2r — a scope that has since been
+  // torn down anyway. Everything left is explained by a config surface.
+  assert.equal(sandboxPins, 7);
   // +2 skill memberships: ch-c66pp782t9k AND dm-ux0mz5ckp2r both hold skill-builder in the sandbox config.
   // The second was MISSED by hand-seeding and found by seed-policy-pins.mjs, because agent-xx9aff
   // exists in both environments and the hand script assigned it to whichever routing matched first (prod).
   // Deriving per-environment against that environment's own routing gets it right by construction.
-  assert.equal([...sandboxIndex.values()].reduce((n, g) => n + g.length, 0), 11);
+  assert.equal([...sandboxIndex.values()].reduce((n, g) => n + g.length, 0), 9);
   assert.equal(sandboxIndex.size, 3);
   // 142, from 137: the five scopes the code-declared-skills surface added to pin.aws-readonly, plus
   // person79b333/agent-zxgm7w/sona-support/agent-ykdenu, less the overlap with scopes already
