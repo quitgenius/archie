@@ -246,6 +246,39 @@ async function configHydrate(ctx, args, out, deps) {
     return { dryRun: true, table, source, consequences: HYDRATE_CONSEQUENCES, ...(agents.length ? { agents } : {}) };
   }
 
+  // CONNECTOR ADOPTION ENV, resolved here rather than left to the operator's shell.
+  //
+  // hydrate.mjs runs connector-adopt so a torn-down agent comes back pointing at the SAME Connector
+  // project — the alternative is minting a fresh one and orphaning every OAuth connection the human
+  // authorised, silently. It needs four facts, and they come from three different places for a reason:
+  //
+  //   SECRET_BASE          derived from --name, like every other archie resource
+  //   CONNECTOR_ORG_SECRET  an SSM fact: the org key lives in another account, so it is an ARN
+  //   OPENCLAW_CLUSTER     SSM facts, and NOT derivable from --name: both belong to the OpenClaw
+  //   SHARED_SECRET        stack. Same argument as METRICS_TABLE_NAME (modules/archie/ssm.tf).
+  //
+  // ABSENT IS A VALUE. An environment with no OpenClaw stack publishes neither of the last two, and
+  // hydrate then SKIPS adoption and names the consequence. Guessing them is the failure that matters:
+  // a wrong cluster finds no task definition, which reads as "this agent has no key".
+  //
+  // Read through the same deployment-facts path the task-definition composition uses, so there is one
+  // parameter prefix and one set of semantics rather than a second opinion about where facts live.
+  // SECRET_BASE is set OUTSIDE the try, because it is derived from --name and cannot fail. It was inside,
+  // and a failed parameter read then dropped it too — turning one missing fact into three.
+  const adoptEnv = { SECRET_BASE: ctx.resources.credentialSecret };
+  try {
+    const { readGatewayConfig } = deps.facts || require('../lib/deployment-facts');
+    const cfg = await readGatewayConfig(ctx, deps);
+    const v = (cfg && cfg.values) || {};
+    if (v.CONNECTOR_ADOPT_CLUSTER) adoptEnv.OPENCLAW_CLUSTER = v.CONNECTOR_ADOPT_CLUSTER;
+    if (v.CONNECTOR_ADOPT_SHARED_SECRET) adoptEnv.SHARED_SECRET = v.CONNECTOR_ADOPT_SHARED_SECRET;
+    if (v.CONNECTOR_ORG_API_KEY_SECRET) adoptEnv.CONNECTOR_ORG_SECRET = v.CONNECTOR_ORG_API_KEY_SECRET;
+  } catch (e) {
+    // NOT FATAL, and the same reasoning as the step itself: adoption is a recovery, and a parameter
+    // read must not stop the config write. hydrate.mjs reports the skip with the missing names.
+    out.warn(`could not read the SSM facts for Connector adoption (${e.message}) — hydrate will skip it`);
+  }
+
   const { stdout } = await run({
     args: [SCRIPTS.hydrate],
     cwd: CONFIG_RESOLVER,
@@ -256,6 +289,7 @@ async function configHydrate(ctx, args, out, deps) {
       SANDRA_REF: ref,
       ...(sandraDir ? { SANDRA_DIR: sandraDir } : {}),
       ...(agents.length ? { HYDRATE_AGENTS: agents.join(',') } : {}),
+      ...adoptEnv,
     },
   }, out, deps);
   return { table, source, ...(agents.length ? { agents } : {}), log: tail(stdout, 2) };

@@ -819,3 +819,48 @@ test('every script path this file shells into resolves to a file that exists', (
     + 'They are built with path.join() from directory-name segments, so a renamed tree leaves them '
     + 'pointing at nothing and no linter or specifier sweep will notice.');
 });
+
+// The four facts hydrate.mjs needs to run connector-adopt, and WHERE each comes from. Asserted because
+// getting one wrong is silent in the worst way: a wrong cluster finds no task definition, which reads as
+// "this agent has no key", so the next turn mints a FRESH Connector project and orphans every OAuth
+// connection the human authorised. Nothing errors — an empty project is perfectly valid.
+const hydrateEnvWith = async (values) => {
+  const out = makeOut();
+  const seen = [];
+  // SELECT BY SCRIPT, not by call order. Source resolution shells out to git first, so seen[0] is a
+  // `git` env and the assertions were reading the wrong subprocess — which passed as "the fact is
+  // missing" and would have hidden a real regression just as happily.
+  const execFile = (cmd, argv, opts, cb) => {
+    if ((argv || []).some((a) => String(a).endsWith('hydrate.mjs'))) seen.push((opts && opts.env) || {});
+    cb(null, '{}', '');
+  };
+  await wrappers['config hydrate'](makeCtx({ dryRun: false }), args([], { 'sandra-dir': '/tmp/s' }), out, {
+    execFile,
+    env: {},
+    facts: { readGatewayConfig: async () => ({ values, missing: [], prefix: '/archie' }) },
+  });
+  return seen[0] || {};
+};
+
+test('config hydrate passes all four Connector adoption facts when SSM publishes them', async () => {
+  const env = await hydrateEnvWith({
+    CONNECTOR_ADOPT_CLUSTER: 'agent-4ggvzl',
+    CONNECTOR_ADOPT_SHARED_SECRET: 'agent-4ggvzl-connector-api-key',
+    CONNECTOR_ORG_API_KEY_SECRET: 'arn:aws:secretsmanager:us-east-1:1:secret:connector/org_secret-x',
+  });
+  assert.equal(env.OPENCLAW_CLUSTER, 'agent-4ggvzl', 'SSM fact — owned by the OpenClaw stack');
+  assert.equal(env.SHARED_SECRET, 'agent-4ggvzl-connector-api-key', 'the one fact adoption cannot infer');
+  assert.match(env.CONNECTOR_ORG_SECRET, /connector\/org_secret/, 'an ARN: the org key is cross-account');
+  assert.match(env.SECRET_BASE, /-connector-api-key$/, 'derived from --name, like every other resource');
+});
+
+test('config hydrate omits the OpenClaw pair rather than guessing it', async () => {
+  // An environment with no OpenClaw stack has nothing to adopt from; hydrate.mjs sees the absence and
+  // skips, naming the consequence. A default here would be a guess, and a wrong cluster is worse than no
+  // cluster because it looks like a successful lookup.
+  const env = await hydrateEnvWith({});
+  assert.equal(env.OPENCLAW_CLUSTER, undefined);
+  assert.equal(env.SHARED_SECRET, undefined);
+  assert.equal(env.CONNECTOR_ORG_SECRET, undefined);
+  assert.ok(env.SECRET_BASE, 'the name-derived one still goes: it is not a guess');
+});

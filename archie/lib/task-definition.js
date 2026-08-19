@@ -127,6 +127,18 @@ const SSM_HANDLES = [
   // able to drop it without the gateway refusing to deploy. `cron hydrate` enforces it for itself,
   // where the error can say what it is for.
   { key: 'CRON_HYDRATOR_ACCESS_POINT_ID', required: false },
+  // Connector ADOPTION inputs for `archie config hydrate`, which records where each agent's Connector
+  // project ALREADY is rather than creating one. Here rather than in SSM_PARAMETERS for the reason
+  // stated above: they are inputs to a CLI, not container environment. Putting them in SSM_PARAMETERS
+  // would promote them into the dispatcher's env, which re-fingerprints the task definition — and the
+  // dispatcher has no use for them.
+  //
+  // Both optional, and their absence is the OFF state: an environment with no OpenClaw stack has no
+  // cluster to discover keys in and no shared key, so hydrate skips adoption and says so. Neither may
+  // be guessed — a wrong cluster finds no task definition, which reads as "this agent has no key", and
+  // the next turn mints a NEW project, orphaning every OAuth connection the human authorised.
+  { key: 'CONNECTOR_ADOPT_CLUSTER', required: false },
+  { key: 'CONNECTOR_ADOPT_SHARED_SECRET', required: false },
 ];
 
 // ── §4.3, third category: SERVICE settings ───────────────────────────────────────────────────────
