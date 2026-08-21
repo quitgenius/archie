@@ -6,6 +6,11 @@
 // PI_VENDOR_DIR overrides to the frozen vendored dist for local testing.
 
 import { deltaEvent, toolEvent } from './sse-contract.mjs';
+// Reused, NOT reimplemented: the PEP already unwraps a batched connector multi-execute into its
+// inner action slugs, with the sanitiser that makes that PII-safe (permissions/third-party-slug.mjs).
+// A second unwrapper here would be a second thing to keep in step with Connector's shapes.
+import { toolSlugField } from './permissions/third-party-slug.mjs';
+import { toolOutcome } from './tool-outcome.mjs';
 
 const VENDOR = process.env.PI_VENDOR_DIR; // unset in image → bare package imports
 const spec = (pkg, sub) => {
@@ -268,6 +273,7 @@ export async function runTurn(session, prompt, onEvent) {
   let lastEmitted = ''; // longest accumulated assistant text already emitted as a delta
   const toolCalls = [];         // completed tool calls this turn (P1 per-tool spans) — always captured
   const toolStart = new Map();  // toolCallId -> start epoch ms, to time each call
+  const toolSlugs = new Map();  // toolCallId -> connector action slug(s); only `start` carries args
   // Per-model-request capture (the Bedrock-call child spans): each assistant message is one
   // model request (a tool-loop turn = several). Boundaries: assistant `message_start` opens a
   // request (fallback: the turn's own start, for providers that skip message_start), the first
@@ -310,13 +316,32 @@ export async function runTurn(session, prompt, onEvent) {
     // the stream when `emit` is set. Timing is wall-clock per toolCallId.
     if (t === 'tool_execution_start') {
       toolStart.set(ev.toolCallId, Date.now());
+      // THE SLUGS ARE DERIVED HERE, not at the end event, because only `tool_execution_start` carries
+      // `args` (pi-agent-core types.d.ts:269-284) and the inner connector action travels as an
+      // argument. Derived immediately and the args dropped: what is retained is the sanitised action
+      // identifier and nothing beside it. Without this, a batched multi-execute records as one
+      // anonymous `CONNECTOR_MULTI_EXECUTE_TOOL` and the trace cannot say WHICH tools ran.
+      toolSlugs.set(ev.toolCallId, toolSlugField(ev.toolName, ev.args));
       if (emit) emit(toolEvent(ev.toolCallId, ev.toolName, 'running'));
       return;
     }
     if (t === 'tool_execution_end') {
       const startMs = toolStart.get(ev.toolCallId) ?? Date.now();
       toolStart.delete(ev.toolCallId);
-      toolCalls.push({ id: ev.toolCallId, name: ev.toolName, startMs, endMs: Date.now(), isError: !!ev.isError });
+      const slugs = toolSlugs.get(ev.toolCallId) ?? null;
+      toolSlugs.delete(ev.toolCallId);
+      toolCalls.push({
+        id: ev.toolCallId,
+        name: ev.toolName,
+        startMs,
+        endMs: Date.now(),
+        isError: !!ev.isError,
+        slugs,
+        // Outcome ONLY — see tool-outcome.mjs for why the payload never travels with it. A connector
+        // failure returns HTTP 200 with `{successful:false}`, so `isError` alone leaves a failed call
+        // indistinguishable from a working one.
+        outcome: toolOutcome(ev.result, !!ev.isError),
+      });
       if (emit) emit(toolEvent(ev.toolCallId, ev.toolName, ev.isError ? 'error' : 'done'));
       return;
     }

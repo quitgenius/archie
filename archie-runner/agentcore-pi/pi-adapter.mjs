@@ -11,6 +11,7 @@ import { createRequire } from 'node:module';
 import { createHash } from 'node:crypto';
 import { registerBedrock, getModel, runTurn, withModel, pca } from './pi-runtime.mjs';
 import { resolveSessionPath, writeIndexEntry } from './session-store.mjs';
+import { outcomeAttributes } from './tool-outcome.mjs';
 import { resolveModelSpec, resolveAllowedTools, buildBuiltinTools, buildCustomTools, readBootstrapContext, makeResourceLoader, resolvePluginManifest, findUnavailablePlugins } from './config-map.mjs';
 import { loadAgentConfig } from './agent-config.mjs';
 import { buildCompatPlugins, prewarmCompatPlugins } from './openclaw-compat/plugin-host.mjs';
@@ -354,6 +355,20 @@ async function emitToolSpans(parent, toolCalls, sessionId) {
       const ts = otel.startSpan(`execute_tool ${tc.name || 'tool'}`, {
         traceId: parent.traceId, parentSpanId: parent.spanId, kind: 1, startTimeMs: tc.startMs,
       });
+      // WHICH connector action(s), and whether the call actually worked. Both were missing, and the
+      // pair is what makes a tool span answer a question rather than raise one:
+      //
+      //   slugs   `agent_i32pz9.tool.name` for every connector call is one of six generic wrappers, so a
+      //           batched CONNECTOR_MULTI_EXECUTE_TOOL recorded as one anonymous span. Same field the
+      //           PEP already emits (permissions-extension.mjs:59), comma-joined for Insights.
+      //   result  outcome only, never the payload — see tool-outcome.mjs.
+      //
+      // THE SPAN GOES RED ON A DECLARED FAILURE, not only on a thrown one. A connector call that fails
+      // returns HTTP 200 with `{successful:false}`, so before this a failed Gmail lookup and a working
+      // one were both green: measured 2026-08-21 on gmail-count-every-10min, one 755ms tool span with
+      // no error flag and a 43-character answer. `ok === false` is the assertion; `ok == null` (no
+      // envelope) deliberately does NOT fail the span.
+      const failed = tc.outcome && tc.outcome.ok === false;
       await otel.end(ts, {
         attributes: {
           'agent_i32pz9.operation.name': 'execute_tool',
@@ -361,8 +376,12 @@ async function emitToolSpans(parent, toolCalls, sessionId) {
           'agent_i32pz9.tool.call.id': tc.id,
           'agent_i32pz9.conversation.id': sessionId,
           'session.id': sessionId,
+          ...(tc.slugs ? { 'agent_i32pz9.tool.connector.slugs': tc.slugs } : {}),
+          ...outcomeAttributes(tc.outcome),
         },
-        error: tc.isError ? 'tool execution error' : undefined,
+        error: tc.isError
+          ? 'tool execution error'
+          : (failed ? `tool reported failure${tc.outcome.code ? ` (${tc.outcome.code})` : ''}` : undefined),
         endTimeMs: tc.endMs,
       });
     } catch { /* telemetry must never break a turn */ }

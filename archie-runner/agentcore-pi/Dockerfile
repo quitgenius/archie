@@ -106,7 +106,7 @@ COPY agentcore-pi/pi-runtime.mjs agentcore-pi/pi-adapter.mjs agentcore-pi/config
      agentcore-pi/clock-extension.mjs \
      agentcore-pi/otel-export.cjs agentcore-pi/pi-entrypoint.mjs agentcore-pi/sse-contract.mjs \
      agentcore-pi/bedrock-dispatch-mark.mjs \
-     agentcore-pi/reply-usage.mjs agentcore-pi/turn-outcome.mjs \
+     agentcore-pi/reply-usage.mjs agentcore-pi/turn-outcome.mjs agentcore-pi/tool-outcome.mjs \
      agentcore-pi/dispatcher-client.mjs \
      agentcore-pi/cron-tool-core.mjs agentcore-pi/cron-tool.mjs agentcore-pi/workspace-seed.mjs \
      agentcore-pi/skill-sync.mjs agentcore-pi/skill-scope.mjs agentcore-pi/tls-scoped.mjs \
