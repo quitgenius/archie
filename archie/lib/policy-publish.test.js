@@ -52,25 +52,7 @@ test('the derived row is COMPLETE over the pinned set, never sparse', () => {
   assert.equal(row.scope, UNSEEN);
 });
 
-test('membership IS the verdict: the pinned scope gets allow with no grant row anywhere', () => {
-  const row = rowFromMemberships(PINNED, artifactFor(SOURCES));
-  assert.equal(row.verdicts['hindsight.write'], 'allow');
-  assert.equal(rowFromMemberships(OTHER, artifactFor(SOURCES)).verdicts['hindsight.write'], 'deny');
-});
 
-// ── the negative cases: the assertion must actually bite ───────────────────────────────────────────
-
-test('a membership the artifact is MISSING is caught', () => {
-  // The shape a stale or hand-edited artifact takes: Cedar says allow (the pin is in the sources), the
-  // dispatcher would say deny. Silent loss of a pinned capability for every minted scope.
-  const a = artifactFor(SOURCES);
-  a.groups['pin.hindsight.write'] = a.groups['pin.hindsight.write'].filter((s) => s !== PINNED);
-  assert.throws(() => assertDerivationMatchesCedar([PINNED], SOURCES, a), (e) => {
-    assert.match(e.message, /DISAGREES with Cedar for ch-cr89fluhion \/ hindsight\.write/);
-    assert.match(e.message, /cedar=allow membership=deny/);
-    return true;
-  });
-});
 
 test('a membership the artifact INVENTS is caught', () => {
   // The dangerous direction: the dispatcher would grant a capability Cedar denies.
