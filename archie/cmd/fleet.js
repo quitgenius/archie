@@ -37,7 +37,7 @@ const path = require('node:path');
 const { spawn, execFileSync } = require('node:child_process');
 
 const {
-  CliError, EXIT, usage, refused, partial, drift, drift: driftExit,
+  CliError, EXIT, usage, refused, partial, drift, drift: driftExit, preflight,
 } = require('../lib/exit');
 const {
   digestFor, tagFor, assertPure, dirtyWarning, ROOT: DIGEST_ROOT,
@@ -364,19 +364,30 @@ async function fleetDeploy(ctx, args, out, deps = {}) {
     scanBindings(aws, ctx),
   ]);
   const rows = byTag(bindings).get(plan.imageTag) || [];
+  // THE AGENT COUNT the bypass turns on, from the roster staging ALREADY enumerated rather than a
+  // second query — `plan.stage.agents` is `agents.length` at cmd/stage.js:943. Re-reading the routing
+  // GSI here would let the gate and the thing it is gating disagree about how many agents exist.
+  const fleetAgents = plan.stage && typeof plan.stage.agents === 'number' ? plan.stage.agents : null;
   const refusal = imageCmd.publishRefusal({
     tag: plan.imageTag,
     found,
     taint,
     stats: bindingStats(rows),
     imageUri: imageUriFor(ctx, account, plan.imageTag),
+    fleetAgents,
   });
   if (refusal) {
     out.progress(`step 3/4  gate        REFUSED — nothing was published, ${plan.imageTag} is not live`);
     publish(ctx, out, plan, renderDeploy);
     throw refusal;
   }
-  out.progress(`step 4/5  gate        passed — ${rows.length} binding(s), every healthcheck ok`);
+  if (fleetAgents === 0) {
+    plan.healthcheckSkipped = true;
+    out.warn(imageCmd.emptyFleetWarning(plan.imageTag, ctx.resources.configTable));
+    out.progress(`step 4/5  gate        SKIPPED — no agents to stage or healthcheck; publishing ${plan.imageTag} unverified`);
+  } else {
+    out.progress(`step 4/5  gate        passed — ${rows.length} binding(s), every healthcheck ok`);
+  }
 
   // ── 5. the flip ────────────────────────────────────────────────────────────────────────────────
   const released = await runStep(steps.publish, ctx, {
@@ -407,6 +418,18 @@ async function resolveCanary(ctx, values, aws, deps, out) {
     return agents[0];
   }
   const { roster } = await stageCmd.enumerateAgents(aws, ctx, {}, deps);
+  // AN EMPTY ROSTER IS STILL FATAL HERE, unlike in a full stage. `enumerateAgents` stopped throwing on
+  // one so an empty deployment can publish (cmd/stage.js), but `--hotfix` means "stage exactly one
+  // agent and healthcheck it" — with no agents there is nothing to canary, and the sort below would
+  // pick `undefined` and stage a runtime for an identity that does not exist. Refuse instead: a hotfix
+  // with nothing to fix is a mistake about which deployment this is, not a releasable state.
+  if (!roster.length) {
+    throw preflight(`--hotfix needs an agent to canary, and ${ctx.resources.configTable} has none`, {
+      detail: 'either --name points at the wrong deployment (one knob derives every resource name, '
+        + 'lib/context.js) or the config has never been hydrated (`archie config hydrate`). Without '
+        + '--hotfix this deploy stages nothing and publishes unverified, which IS supported.',
+    });
+  }
   const pick = [...roster].sort()[0];
   out.progress(`canary      ${pick} (first in sorted order; --canary <agent> to choose another)`);
   return pick;

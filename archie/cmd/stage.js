@@ -322,7 +322,7 @@ const splitList = (v) => String(v || '').split(',').map((s) => s.trim()).filter(
  * is not in the roster is a usage error rather than a provision: a typo'd agent would otherwise mint
  * a role, an access point and a runtime for an identity that does not exist.
  */
-async function enumerateAgents(aws, ctx, values, deps = {}) {
+async function enumerateAgents(aws, ctx, values, deps = {}, out = null) {
   const roster = (deps.collectAgents
     ? await deps.collectAgents(aws.doc(), ctx.resources.configTable)
     : await collectFromDdb(aws.doc(), ctx.resources.configTable))
@@ -331,11 +331,28 @@ async function enumerateAgents(aws, ctx, values, deps = {}) {
 
   const only = splitList(values.agents);
   if (!only.length) {
-    if (!roster.length) {
-      throw preflight(`no agents in the routing GSI of ${ctx.resources.configTable}`, {
-        detail: 'either --name points at the wrong deployment (one knob derives every resource name, '
-          + 'lib/context.js) or the config has never been hydrated (`archie config hydrate`).',
-      });
+    // AN EMPTY ROSTER IS A WARNING, NOT A REFUSAL (2026-08-21). It used to throw `preflight`,
+    // which made an empty deployment un-releasable: `fleet deploy` died here at step 3 of 5, so the
+    // gate never ran and `image publish` never ran, and the pointer could not move. But a new agent
+    // mints onto the pointer AS IT STANDS — so the only way to get a fresh image in front of the first
+    // agent is to publish before any agent exists. Refusing made that impossible, and this sandbox sat
+    // on a 19 Aug image for it.
+    //
+    // Staging zero agents is a genuine no-op, not a fudge: `planStage([])` yields nothing to do, the
+    // pool runs nothing, coverage is 0/0, and no healthcheck is claimed to have passed. The publish
+    // gate is what decides whether an unverified tag may go live, and it makes that call itself
+    // (cmd/image.js `publishRefusal`, the `fleetAgents === 0` bypass) — this function's job is to
+    // report the roster honestly, not to pre-empt that decision.
+    //
+    // THE DIAGNOSTIC THE THROW CARRIED IS KEPT, because it is the likelier cause of a zero roster than
+    // a genuinely empty account: `--name` derives every resource name (lib/context.js), so a wrong one
+    // resolves to a table that exists and is empty, which is indistinguishable from an empty
+    // deployment. Losing that hint would trade a loud stop for a silent wrong-target publish.
+    if (!roster.length && out) {
+      out.warn(`no agents in the routing GSI of ${ctx.resources.configTable} — staging nothing. Either this `
+        + 'deployment genuinely has no agents (normal for a fresh account, or after a teardown), or --name '
+        + 'points at the wrong one (one knob derives every resource name, lib/context.js), or the config '
+        + 'has never been hydrated (`archie config hydrate`).');
     }
     return { agents: roster, roster };
   }
@@ -831,7 +848,7 @@ async function stage(ctx, args, out, deps = {}) {
   }
 
   // 3. THE ROSTER and what is already done.
-  const { agents } = await enumerateAgents(aws, ctx, values, deps);
+  const { agents } = await enumerateAgents(aws, ctx, values, deps, out);
   const bindings = await scanBindings(aws, ctx);
   const { todo, skipped } = planStage(agents, bindings, tag);
 

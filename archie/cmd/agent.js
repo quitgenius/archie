@@ -113,6 +113,12 @@ function withDefaults(deps = {}) {
     now: deps.now || (() => Date.now()),
     sleep: deps.sleep || sleep,
     clients: deps.clients || null,
+    // A SEAM, because the purge is the one teardown step that is not an AWS API call: it runs a
+    // Fargate task to reach an in-VPC HTTP endpoint, so it cannot be driven by the injected client
+    // bundle the way every other step is. Injectable here rather than reached for inside teardown, so
+    // an offline test asserts the WIRING (was it called, with which scopes, was --keep-cron honoured)
+    // without standing up ECS.
+    purgeCron: deps.purgeCron || purgeCronStores,
     modules: {
       deriveExecRole: () => import('../../archie-runner/config-resolver/derive-exec-role.mjs'),
       schema: () => import('../../archie-runner/config-resolver/schema.mjs'),
@@ -927,24 +933,50 @@ async function migrate(ctx, args, out, deps) {
     result.phases.config = { skipped: true };
   } else {
     out.progress('config: hydrating DynamoDB from the sandra config repo');
-    // Threaded through, so `agent migrate --agents X` hydrates X and not the whole fleet. Without
-    // this the config phase rewrote EVERY agent's CONFIG and GRANT while the runtime and cron phases
-    // below were scoped to one — a blast radius nobody asked for from a scoped command. Same
-    // comma-separated string both sides, so it is a pass-through and not a translation.
+    // ALL THREE OF `config hydrate`'s INPUTS ARE THREADED THROUGH. Same string on both sides in each
+    // case, so these are pass-throughs and not translations.
+    //
+    //   agents      — so `agent migrate --agents X` hydrates X and not the whole fleet. Without it the
+    //                 config phase rewrote EVERY agent's CONFIG and GRANT while the runtime and cron
+    //                 phases below were scoped to one: a blast radius nobody asked for from a scoped
+    //                 command.
+    //   ref         — WHICH BRANCH OF THE CONFIG REPO. Missing until 2026-08-21, and its absence was
+    //                 not a missing convenience but a silent wrong write. `config hydrate` defaults to
+    //                 `main`, and the SCOPE ID IS DERIVED FROM THE CONFIG: agent-xx9aff's
+    //                 slack.json carries `dm_users: ["UJ4IGI7XE"]` on main and `["UX0MZ5CKP2R"]` on
+    //                 sandbox-sandbox, so migrating the sandbox from main keyed the agent to
+    //                 `dm-uj4igi7xe` — a scope nothing routes to — and left `dm-ux0mz5ckp2r`, the one
+    //                 that actually takes turns, unhydrated. Both writes "succeed". Any deployment
+    //                 whose agents run a non-default ref (clawdbot_gh_config_ref) hit this.
+    //   sandra-dir  — the local-checkout alternative to a clone, threaded for the same reason: a
+    //                 command that cannot say where its config comes from will use the wrong one.
     result.phases.config = await wrappers['config hydrate'](
-      ctx, { positionals: [], values: { agents: args.values.agents } }, out, deps.wrapperDeps,
+      ctx,
+      {
+        positionals: [],
+        values: {
+          agents: args.values.agents,
+          ref: args.values.ref,
+          'sandra-dir': args.values['sandra-dir'],
+        },
+      },
+      out,
+      deps.wrapperDeps,
     );
   }
 
-  const agents = await agentRoster(ctx, clients, args, out);
-  out.progress(`${agents.length} agent(s) in scope`);
-  result.agents = agents;
+  const roster = await agentRoster(ctx, clients, args, out, deps);
+  out.progress(`${roster.length} agent(s) in scope`);
+  // SCOPE IDS on the result, because that is the identity everything downstream is keyed by and the
+  // identity the operator has to be able to look up afterwards. The legacy names they typed are already
+  // in the config phase's own output.
+  result.agents = roster.map((a) => a.scope);
 
   if (args.values['skip-runtimes']) {
     out.progress('runtimes: skipped');
     result.phases.runtimes = { skipped: true };
   } else {
-    out.progress(`runtimes: ensuring ${agents.length} runtime(s) at concurrency ${MIGRATE_CONCURRENCY} — `
+    out.progress(`runtimes: ensuring ${roster.length} runtime(s) at concurrency ${MIGRATE_CONCURRENCY} — `
       + 'bounded by EFS CreateAccessPoint, which is clean at 40 concurrent and fails outright once the '
       + 'bucket drains (agentcore-client.js:1072-1079), not by AgentCore');
     out.progress('this provisions only; READY is not serving. `archie fleet stage` is the '
@@ -952,57 +984,116 @@ async function migrate(ctx, args, out, deps) {
     // Normally no `--tag`, so every agent lands on the PUBLISHED one — which is what migrating a
     // fleet means. The pass-through is here so that declaring the flag is a one-line change in the
     // registry rather than a change here as well.
-    const runs = await pool(agents, MIGRATE_CONCURRENCY, (agent) => (
-      ensureRuntime(ctx, { positionals: [agent], values: { tag: args.values.tag || args.values.generation } }, out, deps)
+    // `a.scope`, NEVER the name the operator typed. Provisioning the typed name is what minted the
+    // phantom identity described on agentRoster.
+    const runs = await pool(roster, MIGRATE_CONCURRENCY, (a) => (
+      ensureRuntime(ctx, { positionals: [a.scope], values: { tag: args.values.tag || args.values.generation } }, out, deps)
     ));
     const ok = [];
     runs.forEach((r, i) => {
-      if (r.ok) { ok.push(agents[i]); return; }
+      if (r.ok) { ok.push(roster[i].scope); return; }
       // Per-unit, so `failures[]` names WHICH agent failed and the run exits 6 PARTIAL rather than
       // collapsing 208 units into one code (§1.4). Re-running is the designed response.
-      out.failure({ agent: agents[i], step: 'ensure-runtime', error: r.error });
+      out.failure({ agent: roster[i].scope, step: 'ensure-runtime', error: r.error });
     });
-    result.phases.runtimes = { ensured: ok.length, failed: agents.length - ok.length };
+    result.phases.runtimes = { ensured: ok.length, failed: roster.length - ok.length };
   }
 
   if (args.values['skip-cron']) {
     out.progress('cron: skipped');
     result.phases.cron = { skipped: true };
-  } else if (!deps.env.MOUNT_PATH || !(deps.env.MANAGER_API_URL || deps.env.DISPATCHER_BASE_URL)) {
-    // The same precondition agent-migrate.js:88-91 checks, and for the same reason: this phase reads
-    // the PARENT EFS access point read-only and posts to the dispatcher's manager API, neither of
-    // which exists on a laptop.
-    out.warn('cron: SKIPPED — needs MOUNT_PATH (the parent EFS access point, mounted read-only) and '
-      + 'MANAGER_API_URL. The cron store has exactly one writer, the dispatcher.');
-    result.phases.cron = { skipped: true, reason: 'not-configured' };
   } else {
+    // NO ENVIRONMENT PRECONDITION, and there used to be one: this refused unless MOUNT_PATH and a
+    // manager-API URL were set, inherited verbatim from agent-migrate.js:88-91 on the grounds that the
+    // phase "reads the PARENT EFS access point and posts to the dispatcher's manager API, neither of
+    // which exists on a laptop". True of the SCRIPT. Not true of `cron hydrate`, which grew a second
+    // mode for exactly this: with MOUNT_PATH it runs in-process, and without it composes an EPHEMERAL
+    // Fargate task around the parent access point, runs it once and deregisters it (wrappers.js
+    // cronHydrateViaTask). That path needs NOTHING from env — cluster and subnets come from
+    // ctx.resources and discovery, the shared secret from Secrets Manager, and the image from the
+    // running gateway's own task definition.
+    //
+    // So the gate was checking for the wrong thing and its failure was silent-by-warning: `agent
+    // migrate` claimed to migrate an agent and skipped a third of it every time it was run from a
+    // laptop, which is every time a human runs it. MOUNT_PATH selects the mode; it is not a
+    // prerequisite, and deciding the mode is `cron hydrate`'s job, not this one's.
+    //
+    // WHAT THIS COSTS: from a laptop each agent is now a Fargate task (~30-60s), run sequentially, and
+    // `cron hydrate` PURGES the owner's store before re-seeding — so an archie-created job that is not
+    // in the agent's EFS jobs.json does not survive. Both were always true of the phase; they were just
+    // never reached. `--skip-cron` is the way out.
+    out.progress('cron: folding in per-agent cron. Each agent PURGES its owner\'s dispatcher store then '
+      + 're-seeds from EFS; without MOUNT_PATH this runs as one ephemeral Fargate task per agent.');
     let hydrated = 0;
-    for (const agent of agents) {
+    for (const { scope, efsRoot } of roster) {
       try {
-        await wrappers['cron hydrate'](ctx, { positionals: [agent], values: {} }, out, deps.wrapperDeps);
+        // `efsRoot`, the legacy DIRECTORY — the opposite identifier to the runtime phase above, and
+        // deliberately so: `cron hydrate` reads the jobs file out of that directory (HYDRATE_AGENT is a
+        // path), then resolves the OWNER itself through the same resolveScopeOwner. Handing it a scope
+        // id makes it wipe the store and seed nothing.
+        await wrappers['cron hydrate'](ctx, { positionals: [efsRoot], values: {} }, out, deps.wrapperDeps);
         hydrated += 1;
       } catch (e) {
-        out.failure({ agent, step: 'cron-hydrate', error: e });
+        out.failure({ agent: scope, step: 'cron-hydrate', error: e });
       }
     }
-    result.phases.cron = { hydrated, failed: agents.length - hydrated };
+    result.phases.cron = { hydrated, failed: roster.length - hydrated };
   }
   return result;
 }
 
 /**
- * The agents to migrate: `--agents a,b` or the routing GSI.
+ * The agents to migrate: `--agents a,b` or the routing GSI. Returns `{ scope, efsRoot }` per agent.
  *
  * The GSI read is `routing-build.collectFromDdb` — the same one `agent-migrate.js:63` uses, so the
  * roster reflects what is actually ROUTED rather than what someone remembered to list.
+ *
+ * ── WHY TWO IDENTIFIERS, AND WHY THIS USED TO RETURN THE WRONG ONE ──────────────────────────────
+ *
+ * `--agents` is spelled in CONFIG-REPO names, because that is what the config phase consumes. This
+ * returned that string verbatim, and the runtime phase used it AS THE AGENT ID. Under §8.10 those are
+ * different things: hydrating `agent-xx9aff` writes `AGENT#dm-ux0mz5ckp2r` (the scope derived
+ * from its slack.json), so the runtime phase provisioned an identity the config phase had not created
+ * — and, finding nothing there, MINTED one: a derived IAM role, an EFS access point, a Connector
+ * secret, a workspace SEED, a marketplace seed and a runtime, all under `agent-xx9aff`. Nothing
+ * routes to it, so it can never serve a turn, while the real scope was left with no runtime binding.
+ * Measured live 2026-08-21; the phantom had to be torn down by hand.
+ *
+ * So the two later phases need DIFFERENT identifiers, and neither is "the string the operator typed":
+ *
+ *   scope    the archie identity — what runtimes, roles, grants and access points are keyed by.
+ *            Resolved by `wrappers.resolveScopeOwner`, the SAME resolver `cron hydrate` uses. Not a
+ *            second implementation: one link, so the phases cannot drift apart again.
+ *   efsRoot  the legacy OpenClaw DIRECTORY on EFS. `cron hydrate` reads the jobs file from it
+ *            (`HYDRATE_AGENT` is a path, not an identity), so passing a scope id there wipes the
+ *            store and seeds nothing — the mirror-image of the bug above. With `--agents` this is the
+ *            name as typed, which is already what the directory is named after; without it, META's own
+ *            `efsRoot`. So the routing GSI is read ONLY on the unscoped path — a scoped run costs one
+ *            resolver call per name and no table scan.
  */
-async function agentRoster(ctx, clients, args, out) {
+async function agentRoster(ctx, clients, args, out, deps) {
   const listed = String(args.values.agents || '').split(',').map((s) => s.trim()).filter(Boolean);
-  if (listed.length) return listed;
+  if (listed.length) {
+    const wrappers = deps.modules.wrappers();
+    const roster = [];
+    for (const name of listed) {
+      // REFUSES rather than guessing when a name resolves to nothing — which is the whole point. The
+      // old behaviour for an unresolvable name was to provision it, and that is what minted the phantom.
+      const scope = await wrappers.resolveScopeOwner(ctx, { values: {} }, out, deps.wrapperDeps, name);
+      if (scope !== name) out.progress(`${name} → ${scope}  (§8.10 scope id; efsRoot ${name})`);
+      // The typed name IS the EFS directory: `--agents` is spelled in config-repo names, which is what
+      // the legacy directories are named after. No routing read needed for this branch.
+      roster.push({ scope, efsRoot: name });
+    }
+    return roster;
+  }
+  // NO --agents: the roster is whatever is ROUTED, and META carries each scope's efsRoot directly.
+  // efsRoot defaults to the scope id — an agent minted under §8.10 never had a legacy directory, so its
+  // workspace already lives at its own name. Only a rekeyed/hydrated agent carries a different one.
   const configs = await routingBuild.collectFromDdb(clients.doc, ctx.resources.configTable, {
     log: { info() {}, warn() {}, error: (o, m) => out.warn(`${m} ${JSON.stringify(o)}`) },
   });
-  return configs.map((c) => c.agent);
+  return configs.map((c) => ({ scope: c.agent, efsRoot: (c.cfg && c.cfg.efsRoot) || c.agent }));
 }
 
 // ── §2.22 `archie agent rekey` ───────────────────────────────────────────────────────────────────
@@ -1099,6 +1190,90 @@ async function rekey(ctx, args, out, deps) {
  *   deleted per matched agent, and the agent id comes from the runtime's own `AGENT_NAME` env var, so
  *   the mapping is read off the resource rather than guessed from a sanitised name.
  */
+/**
+ * Delete each scope's jobs from the DISPATCHER cron store, as part of teardown (§E2).
+ *
+ * WHY THIS NEEDS A TASK AT ALL. The store is not in DynamoDB — it is one file per owner on the
+ * dispatcher's own EFS mount (`/efs/cron/<agentId>.json`, cron-store.js:4) with exactly one writer.
+ * So teardown cannot delete it the way it deletes table items; it has to ask the manager API, and
+ * that API is a Cloud Map internal name reachable only from inside the VPC. An ephemeral Fargate task
+ * is the same mechanism `archie cron hydrate` already uses to reach it.
+ *
+ * WHY IT RUNS FIRST, BEFORE THE RUNTIMES GO. A job is an ARMED TIMER in the dispatcher. Deleting the
+ * runtime first leaves timers that fire turns at a runtime that no longer exists — a burst of failed
+ * invokes attributed to an agent nobody can look up. Purging first disarms them (cron-service.js:206)
+ * while the agent it belongs to still exists, so the teardown is quiet.
+ *
+ * NOT FATAL. A purge failure must not strand a half-torn-down agent: the runtimes, access points and
+ * table items still have to go. It reports a failure (exit 6 PARTIAL) and names what was left, which
+ * is the honest outcome — jobs in the store whose owner no longer exists are exactly the ghost this
+ * step exists to prevent, and silence about them is what let one survive to 2026-08-19.
+ */
+async function purgeCronStores(ctx, agents, out, deps) {
+  const { discoverFacts, readGatewayConfig } = require('../lib/deployment-facts');
+  const { composeCronPurgeTaskDefinition } = require('../lib/task-definition');
+  const { runEphemeralTask } = require('../lib/run-task');
+  const { makeClient } = require('../lib/aws');
+
+  const ecs = deps.ecs || makeClient(ctx, '@aws-sdk/client-ecs', 'ECSClient');
+  const logs = deps.logs || makeClient(ctx, '@aws-sdk/client-cloudwatch-logs', 'CloudWatchLogsClient');
+
+  const config = await readGatewayConfig(ctx, deps);
+  const facts = await discoverFacts(ctx, config, deps);
+  const { readDeployedGatewayImage } = deps.modules.wrappers()._internals;
+  const deployed = await readDeployedGatewayImage(ctx, ecs, deps);
+
+  const results = [];
+  for (const agent of agents) {
+    const taskDefinition = composeCronPurgeTaskDefinition({
+      resources: ctx.resources, region: ctx.region, facts, image: deployed.image, ownerAgentId: agent,
+    });
+    const result = await runEphemeralTask({
+      ecs,
+      logs,
+      taskDefinition,
+      cluster: ctx.resources.cluster,
+      subnets: facts.subnetIds,
+      // The gateway admits 9090 only from the runtime and hydrator groups, so any other choice fails
+      // as a bare "fetch failed" from the manager API call. Same reasoning as `cron hydrate`.
+      securityGroups: [facts.cronHydratorSecurityGroupId],
+      logGroup: ctx.resources.dispatcherLogGroup,
+      streamPrefix: 'cron-purge',
+      out,
+      now: deps.now,
+    });
+    for (const line of result.logLines || []) out.progress(`            ${line}`);
+    results.push({ agent, ...result });
+  }
+  return results;
+}
+
+/**
+ * `removed` out of the purge task's own log lines — the task's report IS the count.
+ *
+ * Returns `{ removed, reports, unparsed }`. `reports` is load-bearing: a task can exit 0 having
+ * printed no summary at all (a container that started and died quietly), and `removed: 0` then means
+ * "nothing to purge" and "we never heard" identically. The caller distinguishes them.
+ */
+function purgedJobCount(logLines) {
+  let removed = 0;
+  let reports = 0;
+  let unparsed = 0;
+  for (const line of logLines || []) {
+    let o = null;
+    try {
+      o = JSON.parse(line);
+    } catch {
+      // Not swallowed — counted. A non-JSON line is normally the container's own startup noise, but a
+      // run that is ALL noise is a run whose report we did not get, which the caller must not read as
+      // a clean zero.
+      unparsed += 1;
+    }
+    if (o && o.purged && typeof o.purged.removed === 'number') { removed += o.purged.removed; reports += 1; }
+  }
+  return { removed, reports, unparsed };
+}
+
 async function teardown(ctx, args, out, deps) {
   // THE GUARDS COME FIRST, before a client is built or an account is resolved. A refusal an operator
   // can only see once their credentials load is a refusal that reads as a credentials problem — and
@@ -1246,9 +1421,28 @@ async function teardown(ctx, args, out, deps) {
   if (orphanRuntimes.length) out.warn(`${orphanRuntimes.length} runtime(s) carry no AGENT_NAME — their runtimes and access points go, their table items stay`);
   const keys = agents.length ? await agentItemKeys(clients, ctx.resources.configTable, agents) : [];
 
+  // CRON JOBS GO TOO (2026-08-19). They are not table items and not on the agent's own mount,
+  // so nothing else in this command reaches them: without this step a torn-down scope leaves its jobs
+  // armed in the dispatcher store, and the next hydrate of that scope resurrects them alongside the
+  // real ones. Observed exactly that on 2026-08-19 — a deleted job reappeared in archie's store.
+  // --keep-cron is the escape hatch for the case where the store is deliberately being preserved
+  // across a re-provision (the same shape as --keep-access-points).
+  const wantCron = !args.values['keep-cron'];
+  if (!wantCron && agents.length) {
+    out.progress(`cron store LEFT IN PLACE (--keep-cron) — ${agents.join(', ')} keeps its jobs, and a `
+      + 're-hydrate will merge them with whatever EFS holds.');
+  }
+
   out.progress(`${scanned} runtime(s) scanned · ${targets.length} matched · ${skipped.length} skipped by the `
     + `pattern · ${foreign.length} foreign`);
   out.progress(`${aps.length} access point(s) · ${keys.length} table item(s) across ${agents.length} agent(s)`);
+  if (wantCron && agents.length) {
+    // The count is deliberately not promised here. Enumerating it means reading the store, which is
+    // in-VPC only, so a laptop dry-run cannot know it without running a task — and running one to
+    // preview a destructive step is worse than saying so.
+    out.progress(`cron store PURGED for ${agents.length} scope(s): ${agents.join(', ')} — job count is not `
+      + 'knowable from outside the VPC, so it is reported by the task, not predicted here');
+  }
   for (const t of targets) out.verbose(`delete runtime ${t.runtimeName} (${t.agent || 'unknown agent'})`);
 
   const plan = {
@@ -1262,17 +1456,55 @@ async function teardown(ctx, args, out, deps) {
     accessPoints: aps,
     agents,
     tableItems: keys.length,
+    cronPurgeRequested: wantCron,
     // §6.4: never claim a clean teardown. Workload identities and agentic_ai ENIs survive runtime
     // deletion, cannot be removed by the caller, and pin the runtime security group indefinitely.
+    //
+    // The cron clause changed on 2026-08-19: the DISPATCHER store is now purged (below), but
+    // OpenClaw's own store — `<efsRoot>/cron/jobs.json` on the agent's EFS directory — is untouched
+    // and must stay that way. It is the migration SOURCE and OpenClaw's live scheduler reads it, so
+    // deleting it would silently drop the schedules of an agent that is still being served by
+    // OpenClaw. That is the one thing teardown must not do while both stacks are up.
     residue: 'workload identities and agentic_ai ENIs survive runtime deletion and are NOT cleaned (§6.4); '
-      + 'the dispatcher cron store is not touched (it has exactly one writer — use `archie cron`)',
+      + `the dispatcher cron store is ${wantCron ? 'purged' : 'NOT purged (--keep-cron)'}, but OpenClaw's own `
+      + 'EFS cron store (<efsRoot>/cron/jobs.json) is never touched — it is the hydration source and '
+      + 'OpenClaw is still firing from it',
   };
   if (ctx.dryRun) {
     out.progress('dry-run: nothing deleted. Re-run with --no-dry-run.');
     return { dryRun: true, ...plan };
   }
 
-  const deleted = { runtimes: [], accessPoints: [], tableItems: 0 };
+  const deleted = { runtimes: [], accessPoints: [], tableItems: 0, cronJobs: 0, cronScopes: [] };
+  // BEFORE THE RUNTIMES. See purgeCronStores' header: an armed timer outliving its runtime fires
+  // turns into a void, so disarm while the agent still exists.
+  if (wantCron && agents.length) {
+    try {
+      for (const r of await deps.purgeCron(ctx, agents, out, deps)) {
+        if (r.exitCode !== 0) {
+          out.failure({ agent: r.agent, step: 'cron purge', error: new Error(`purge task exited ${r.exitCode}`) });
+          continue;
+        }
+        const { removed, reports, unparsed } = purgedJobCount(r.logLines);
+        deleted.cronScopes.push(r.agent);
+        deleted.cronJobs += removed;
+        // EXIT 0 WITH NO REPORT IS NOT A CLEAN PURGE. The count comes from the task's own log, so a run
+        // that printed no summary tells us nothing about the store — and reporting that as "0 jobs"
+        // is the same false all-clear that let a ghost job survive in the first place.
+        if (!reports) {
+          out.warn(`cron purge for ${r.agent} exited 0 but printed no summary (${unparsed} unparsed line(s)) — `
+            + 'the store state is UNKNOWN, not empty. Check `GET /cron/' + r.agent + '` on the manager API.');
+        }
+      }
+    } catch (e) {
+      // Includes "the dispatcher is not running" — the purge needs the gateway up to answer, and a
+      // torn-down environment legitimately has none. Named, not swallowed: jobs may remain.
+      out.failure({ agent: agents.join(','), step: 'cron purge', error: e });
+      out.warn('cron store NOT purged — any jobs these scopes own are still in the dispatcher store and '
+        + 'will reappear on the next hydrate. Re-run teardown once the gateway is up, or purge with '
+        + '`DELETE /cron/<scope>` on the manager API.');
+    }
+  }
   for (const t of targets) {
     try {
       await clients.control.send(new DeleteAgentRuntimeCommand({ agentRuntimeId: t.runtimeId }));
@@ -1309,7 +1541,8 @@ async function teardown(ctx, args, out, deps) {
       { BatchWriteCommand: clients.docCmds.BatchWriteCommand, logger: loggerFor(out) });
   }
   out.progress(`deleted ${deleted.runtimes.length} runtime(s), ${deleted.accessPoints.length} access point(s), `
-    + `${deleted.tableItems} table item(s)`);
+    + `${deleted.tableItems} table item(s), ${deleted.cronJobs} cron job(s) across `
+    + `${deleted.cronScopes.length} scope(s)`);
   return { ...plan, deleted };
 }
 

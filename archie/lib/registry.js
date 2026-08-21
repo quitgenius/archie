@@ -82,9 +82,13 @@ const COMMANDS = {
   'agent ensure-connector': { options: {}, module: 'agent', task: 'W1-H', needsAws: true, positional: 'agent', summary: 'give the agent its own Connector project and key' },
   'agent seed-workspace': { options: {}, module: 'agent', task: 'W1-H', needsAws: true, positional: 'agent', summary: 'pre-write the agent workspace SEED' },
   'agent ensure-runtime': { options: { tag:{type:'string'} }, module: 'agent', task: 'W1-H', needsAws: true, positional: 'agent', summary: 'the full provisioning saga for one agent' },
-  'agent migrate': { options: { agents:{type:'string'}, tag:{type:'string'}, 'skip-config':{type:'boolean'}, 'skip-runtimes':{type:'boolean'}, 'skip-cron':{type:'boolean'} }, module: 'agent', task: 'W1-H', needsAws: true, summary: 'config hydrate, ensure runtimes, fold in per-agent cron' },
+  // `ref` and `sandra-dir` mirror `config hydrate`'s, because this command's config phase IS that
+  // command. Declaring only `agents` meant migrate could scope WHICH agents it hydrated but not WHICH
+  // BRANCH it hydrated them from — and since the scope id is derived from the config, a sandbox running
+  // a non-default ref silently hydrated a different scope than the one taking turns (see cmd/agent.js).
+  'agent migrate': { options: { agents:{type:'string'}, ref:{type:'string'}, 'sandra-dir':{type:'string'}, tag:{type:'string'}, 'skip-config':{type:'boolean'}, 'skip-runtimes':{type:'boolean'}, 'skip-cron':{type:'boolean'} }, module: 'agent', task: 'W1-H', needsAws: true, summary: 'config hydrate, ensure runtimes, fold in per-agent cron' },
   'agent rekey': { options: { 'to-scope':{type:'boolean'} }, module: 'agent', task: 'W1-H', needsAws: true, dryRunDefault: true, positional: 'agent', summary: 'move an agent identity to a scope key, carrying GRANT#' },
-  'agent teardown': { options: { agent:{type:'string'}, 'name-re':{type:'string'}, 'skip-re':{type:'string'}, 'multi-agent':{type:'boolean'}, 'keep-access-points':{type:'boolean'} }, module: 'agent', task: 'W1-H', needsAws: true, dryRunDefault: true, summary: 'delete one agent\'s runtimes, access points and ALL its table items (guarded; hydrate to bring it back)' },
+  'agent teardown': { options: { agent:{type:'string'}, 'name-re':{type:'string'}, 'skip-re':{type:'string'}, 'multi-agent':{type:'boolean'}, 'keep-access-points':{type:'boolean'}, 'keep-cron':{type:'boolean'} }, module: 'agent', task: 'W1-H', needsAws: true, dryRunDefault: true, summary: 'delete one agent\'s runtimes, access points, cron jobs and ALL its table items (guarded; hydrate to bring it back)' },
   'agent create': { options: {}, module: 'agent', task: null, phase: 2, needsAws: true, positional: 'agent', summary: 'mint an agent identity and enqueue provisioning' },
 
   // ── config, grants, cron, observability ──────────────────────────────────

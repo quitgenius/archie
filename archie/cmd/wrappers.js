@@ -754,7 +754,7 @@ async function cronList(ctx, args, out, deps) {
 async function cronHydrate(ctx, args, out, deps) {
   const agentId = oneAgent(args);
   const mountDir = deps.env.MOUNT_PATH;
-  const ownerAgentId = await resolveCronOwner(ctx, args, out, deps, agentId);
+  const ownerAgentId = await resolveScopeOwner(ctx, args, out, deps, agentId);
 
   out.progress(`${agentId}: WIPES ${ownerAgentId}'s cron store, then seeds from ${agentId}'s EFS directory`);
   return mountDir
@@ -763,7 +763,14 @@ async function cronHydrate(ctx, args, out, deps) {
 }
 
 /**
- * Which archie identity OWNS the jobs — §8.10 identity=scope.
+ * Which archie identity a legacy OpenClaw name resolves to — §8.10 identity=scope.
+ *
+ * SHARED, not cron-specific, and exported for that reason. `agent migrate`'s RUNTIME phase needs the
+ * identical answer: it used `--agents` verbatim as the agent id, so `--agents agent-xx9aff`
+ * provisioned a role, access point, Connector secret and runtime under the legacy name while the config
+ * phase had correctly written `dm-ux0mz5ckp2r` — a phantom scope no Slack event can reach, and the real
+ * one left without a runtime binding. Measured live 2026-08-21. A second copy of this link is how the
+ * two phases came to disagree in the first place, so there is one.
  *
  * The legacy OpenClaw name is a PATH on EFS, not an identity here. Storing jobs under it produces an
  * agent no Slack event resolves to: the jobs run, but the owner's App Home is empty and the agent has
@@ -783,7 +790,7 @@ async function cronHydrate(ctx, args, out, deps) {
  *                   Connector adopt path resolve through, so there is one link, not three.
  *   otherwise       REFUSE. Guessing is what created the split identity in the first place.
  */
-async function resolveCronOwner(ctx, args, out, deps, agentId) {
+async function resolveScopeOwner(ctx, args, out, deps, agentId) {
   const explicit = args.values.as;
   if (explicit) {
     out.progress(`owner       ${explicit}  (--as, not derived from routing)`);
@@ -1262,6 +1269,17 @@ async function metricsQuery(ctx, args, out, deps) {
 // Full command keys — see the header for why these are not verb-keyed.
 
 module.exports = {
+  // NOT a command — the shared §8.10 legacy-name -> scope-id resolver, used by `cron hydrate` here and
+  // by `agent migrate`'s runtime phase (cmd/agent.js agentRoster).
+  //
+  // WRAPPED IN withDefaults LIKE EVERY COMMAND BELOW, and for the same reason: an external caller has no
+  // `wrapperDeps` to hand it (cmd/agent.js's own withDefaults does not build one), so the raw function
+  // would dereference `deps.modules` on undefined. The command exports hide that because each applies
+  // withDefaults itself; exporting this one bare made it the single entry point that did not.
+  resolveScopeOwner: (ctx, args, out, deps, agentId) => (
+    resolveScopeOwner(ctx, args, out, withDefaults(deps), agentId)
+  ),
+
   'config hydrate': (ctx, args, out, deps) => configHydrate(ctx, args, out, withDefaults(deps)),
   'config hydrate-conversations': (ctx, args, out, deps) => configHydrateConversations(ctx, args, out, withDefaults(deps)),
   'config validate': (ctx, args, out, deps) => configValidate(ctx, args, out, withDefaults(deps)),
@@ -1295,5 +1313,9 @@ module.exports = {
     HYDRATE_CONSEQUENCES, SCOPED_QUERIES, SCRIPTS, DEFAULT_WINDOW_SECONDS,
     lastJson, oneAgent, tail, describeSource, observabilityEnv, childAwsEnv, withDefaults, run, grantClients,
     readStoredGrant, resolveSandraSource, finishGates,
+    // Shared with `agent teardown`'s cron purge, which runs the same image against the same manager
+    // API. Exported rather than re-expressed there so the two cannot disagree about which build of
+    // the gateway they are talking to.
+    readDeployedGatewayImage,
   },
 };

@@ -497,6 +497,64 @@ function composeCronHydratorTaskDefinition({
   };
 }
 
+/**
+ * The teardown counterpart: purge one scope's jobs from the dispatcher cron store (§E2).
+ *
+ * SAME IMAGE, DELIBERATELY LESS PRIVILEGE. It is the gateway's own build for the same reason the
+ * hydrator is — it speaks the manager API, so it must match the API's version — but it drops the EFS
+ * volume and mount entirely. A purge reads no jobs.json, so handing it the fleet-wide-read access
+ * point would grant "can read every agent's workspace" to an operation that needs "can call one HTTP
+ * endpoint". That is also why this does not just call the hydrator composer with a flag: the absence
+ * of the mount is the security property, and it should be impossible to pass the wrong argument and
+ * get it back.
+ *
+ * Keyed on ownerAgentId (the ScopeId) with NO legacy name anywhere: the store is keyed by owner, and
+ * a purge by legacy name deletes nothing while reporting success.
+ */
+function composeCronPurgeTaskDefinition({
+  resources, region, facts, image, ownerAgentId,
+}) {
+  requireFacts(facts, ['executionRoleArn', 'dispatcherSharedSecretArn']);
+  if (!image) throw new CliError('composeCronPurgeTaskDefinition needs an image');
+  if (!ownerAgentId) throw new CliError('composeCronPurgeTaskDefinition needs an ownerAgentId (the scope id)');
+
+  return {
+    family: `${resources.dispatcherService}-cron-purge`,
+    networkMode: 'awsvpc',
+    requiresCompatibilities: ['FARGATE'],
+    cpu: '256',
+    memory: '512',
+    executionRoleArn: facts.executionRoleArn,
+
+    containerDefinitions: [{
+      name: 'cron-purge',
+      image,
+      essential: true,
+      user: '1000:1000',
+      readonlyRootFilesystem: true,
+      linuxParameters: { capabilities: { add: [], drop: ['ALL'] }, noNewPrivileges: true },
+      entryPoint: ['node'],
+      command: ['cron-hydrator.js'],
+      workingDirectory: '/app',
+      environment: [
+        { name: 'CRON_PURGE_ONLY', value: '1' },
+        { name: 'HYDRATE_OWNER_AGENT', value: ownerAgentId },
+        { name: 'MANAGER_API_URL', value: dispatcherBaseUrl(resources.name) },
+        { name: 'AWS_REGION', value: region },
+      ],
+      secrets: [{ name: 'DISPATCHER_SHARED_SECRET', valueFrom: facts.dispatcherSharedSecretArn }],
+      logConfiguration: {
+        logDriver: 'awslogs',
+        options: {
+          'awslogs-group': resources.dispatcherLogGroup,
+          'awslogs-region': region,
+          'awslogs-stream-prefix': 'cron-purge',
+        },
+      },
+    }],
+  };
+}
+
 /** Kept as one expression so the port cannot disagree with the port mapping. */
 const healthCheckCommand = () => `node -e "require('http').get('http://localhost:${PORT}/health',`
   + 'r=>process.exit(r.statusCode===200?0:1)).on(\'error\',()=>process.exit(1))"';
@@ -516,4 +574,5 @@ module.exports = {
   PORT, CPU, MEMORY,
   SSM_PREFIX, dispatcherBaseUrl, healthCheckCommand,
   composeEnvironment, composeTaskDefinition, composeCronHydratorTaskDefinition,
+  composeCronPurgeTaskDefinition,
 };
