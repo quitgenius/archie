@@ -1525,4 +1525,60 @@ describe('the POLICY row write is an UpdateItem, because that is the permission 
     expect(ensureBody).toMatch(/ExpressionAttributeNames/);
     expect(ensureBody).toMatch(/SET #d = :d/);
   });
+
+  // ── no caches, and every outcome reported ──────────────────────────────────────────────────────
+  //
+  // Both properties exist because their absence was undetectable. The per-agent digest memo returned
+  // 'cached' WITHOUT reading the row, so a teardown that deleted the row out of band was never noticed
+  // again; and four of the five outcomes logged nothing, so the resulting deny-all looked exactly like a
+  // healthy scope. Measured live on dm-ux0mz5ckp2r: PolicyDenyAll=1 across 14:25-14:50Z on 2026-08-20,
+  // with not one line matching /policy/ in the dispatcher log group for the whole of that day.
+  it('caches neither the artifact nor the per-agent digest', () => {
+    const whole = src;
+    // The memo, by name and by shape. Only the historical comment may mention it.
+    expect(whole).not.toMatch(/^\s*const lastPolicyDigest/m);
+    expect(ensureBody).not.toMatch(/lastPolicyDigest/);
+    // The artifact read: no timestamp, no expiry window, no memo slot.
+    const pa = whole.slice(whole.indexOf('async function policyArtifact'));
+    const paBody = pa.slice(0, pa.indexOf('\n  }') + 4);
+    expect(paBody).not.toMatch(/TTL|_policyArtifactAtMs|Date\.now\(\)/);
+    // It must actually issue the read every call — not return an early-cached value.
+    expect(paBody).toMatch(/GetCommand/);
+  });
+
+  it('routes every non-write through the reporting helper', () => {
+    for (const reason of ['no-table', 'no-artifact', 'current']) {
+      expect(ensureBody).toContain(`noWrite('${reason}'`);
+    }
+    // A hand-rolled `return { written: false, ... }` is how a silent branch gets re-added. Exactly two
+    // are legitimate: `noWrite`'s own return, and the catch — which carries `error:` and has its own warn
+    // naming the failure (routing it through noWrite would replace that message with something vaguer).
+    const bare = ensureBody.match(/return \{ written: false[^}]*\}/g) || [];
+    expect(bare.length).toBeGreaterThan(0); // the anchor found the body, not an empty slice
+    const allowed = ['reason, ...extra', 'error:'];
+    for (const r of bare) expect(allowed.some((a) => r.includes(a))).toBe(true);
+  });
+
+  it('warns — not debugs — when NO row can be written for any scope', () => {
+    // no-artifact / no-table mean the whole account is deny-all, so they must be visible at the default
+    // level. `current` is the healthy steady state and would be one line per turn per agent.
+    expect(ensureBody).toMatch(/no-artifact'\s*\|\|\s*reason === 'no-table'\)\s*\?\s*'warn'\s*:\s*'debug'/);
+  });
+});
+
+describe('ensurePolicyRow reports the no-op it took', () => {
+  // BEHAVIOURAL for the one branch a fake can reach: setClientsForTest sets `_faked`, which is the
+  // `no-table` path. The others need a real doc client and stay structural above.
+  it('logs the reason instead of returning silently', async () => {
+    c.setClientsForTest(fakeAwsClients({ listResult: () => ({ agentRuntimes: [] }) }));
+    const warn = [];
+    const r = await c.ensurePolicyRow('dm-ux0mz5ckp2r', {
+      logger: { warn: (o, m) => warn.push({ o, m }), info: () => {}, debug: () => {} },
+    });
+    expect(r).toMatchObject({ written: false, reason: 'no-table' });
+    expect(warn).toHaveLength(1);
+    expect(warn[0].m).toBe('policy row not written (no-table)');
+    // The AGENT is on the line. Without it the warning says the fleet is broken but not for whom.
+    expect(warn[0].o).toMatchObject({ agent: 'dm-ux0mz5ckp2r', reason: 'no-table' });
+  });
 });

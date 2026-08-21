@@ -884,55 +884,87 @@ function createAgentCoreClient(overrides = {}) {
   // DERIVED — the artifact is its only authority — so it is overwritten whenever it is stale. Guarding
   // it would freeze a minted scope's verdicts at mint time and let a policy edit never reach it.
   //
-  // The artifact is cached in-process because this runs on the TURN PATH: a policy edit lands on the next
-  // turn after the TTL rather than instantly, which is the same freshness the CRON_RUNNER flag accepts
-  // for the same reason. Per-agent `lastPolicyDigest` then makes the steady state ZERO DynamoDB calls —
-  // the row is only read when the artifact's digest has moved since this process last wrote that agent.
-  let _policyArtifact = null;
-  let _policyArtifactAtMs = 0;
-  const POLICY_ARTIFACT_TTL_MS = 30_000;
-  const lastPolicyDigest = new Map();
+  // NOTHING ON THIS PATH IS CACHED, and both caches that used to be here are gone for cause. Every call
+  // reads the fleet artifact and the agent's own row from DynamoDB. Two GetItems on a code path that
+  // already does a dozen, in exchange for a verdict never decided from a stale copy.
+  //
+  //   1. A per-agent `lastPolicyDigest` Map short-circuited before the row was read. It assumed the
+  //      dispatcher was the only thing that could remove a row. `archie agent teardown` is exactly the
+  //      thing that isn't:
+  //
+  //        13:15Z  process starts
+  //        13:xxZ  a turn for dm-ux0mz5ckp2r finds the row CURRENT → memo := <digest>
+  //        14:09Z  teardown DELETES AGENT#dm-ux0mz5ckp2r/POLICY out of band
+  //        14:28Z  a DM re-mints the scope. The memo still says <digest>, so this returned 'cached'
+  //                WITHOUT READING the row — and no row was written again while the digest held still.
+  //
+  //      An absent row is DENY-ALL (permissions/policy-table.mjs), so the scope served six turns able to
+  //      do nothing at all — PolicyDenyAll=1 measured across 14:25-14:50Z on 2026-08-20 — while every log
+  //      line said the mint had succeeded.
+  //
+  //   2. The artifact sat behind a 30s expiry, argued as the same freshness the CRON_RUNNER flag accepts.
+  //      Not comparable: that flag is read uncached for precisely this reason, and here the stale copy
+  //      decides whether an agent may act at all.
+  //
+  // DO NOT REINTRODUCE EITHER (2026-08-21).
+  // Both were added here for read volume nobody had measured, beside logic whose correctness they broke.
+  // Caching this is a deliberate strategy decision and it is not this function's to make.
 
-  async function policyArtifact({ logger } = {}) {
-    const now = Date.now();
-    if (_policyArtifact && now - _policyArtifactAtMs < POLICY_ARTIFACT_TTL_MS) return _policyArtifact;
+  // NO LOGGER PARAMETER. It took one only to emit the debug line described below; the reporting lives
+  // entirely in ensurePolicyRow, which knows the agent this read was on behalf of.
+  async function policyArtifact() {
     const schema = await loadConfigSchema();
     const { GetCommand } = require('@aws-sdk/lib-dynamodb');
     const r = await docClient().send(new GetCommand({
       TableName: config.agentConfigTable, Key: schema.fleetPolicyKey(),
     }));
-    const body = r?.Item?.data ? JSON.parse(r.Item.data) : null;
-    // NULL IS A LEGITIMATE STATE, not an error: before the first `archie deploy` that publishes policy,
-    // no artifact exists and every scope should keep pre-policy behaviour. ensurePolicyRow does nothing
-    // in that case, so the layer stays additive (plan §1.1).
-    if (!body && logger?.debug) logger.debug('no fleet policy artifact — policy rows not managed yet');
-    _policyArtifact = body;
-    _policyArtifactAtMs = now;
-    return body;
+    // NULL IS NOT A BENIGN STATE, and this used to log it at DEBUG while a comment called the layer
+    // "additive". Both were wrong once permissions/policy-table.mjs made an absent row deny-all: with no
+    // artifact, ensurePolicyRow writes no rows for ANYONE, so every agent in the account is denied
+    // everything including baseline. policy-table.mjs:67-75 names the consequences — `archie policy
+    // publish` must precede the image roll, and an account with no pins file cannot run agents at all.
+    //
+    // NOT LOGGED HERE, deliberately. The caller warns on `no-artifact` (see `noWrite`), which is the one
+    // place that knows which agent was affected. A debug line here as well meant the prod-visible signal
+    // and the invisible one described the same fact at two levels — so whichever you found first, you
+    // could not tell whether it was the whole story.
+    return r?.Item?.data ? JSON.parse(r.Item.data) : null;
   }
 
   /**
    * Make sure this scope's POLICY row matches the current fleet artifact. Never fatal.
    *
-   * Returns {written, reason} so the caller can log a real write without logging the no-ops.
+   * Returns {written, reason}. EVERY outcome is logged, including the no-ops — see `noWrite`.
    */
   async function ensurePolicyRow(agent, { logger } = {}) {
-    if (_faked || !config.agentConfigTable) return { written: false, reason: 'no-table' };
+    // EVERY NON-WRITE IS LOGGED. This function had five outcomes and one log line: only a real write said
+    // anything, so `no-table`, `no-artifact`, `cached` and `current` were indistinguishable from each other
+    // AND from a healthy scope. That is how dm-ux0mz5ckp2r sat in deny-all across 2026-08-19/20 with the
+    // dispatcher log group containing not one line matching /policy/ — the absence of output was the only
+    // symptom, and absence is what a working system also produces.
+    //
+    // LEVELS ARE BY CONSEQUENCE, not by novelty:
+    //   * `no-artifact` / `no-table` mean NO ROW WILL BE WRITTEN FOR ANY SCOPE, and an absent row is
+    //     deny-all — so the whole fleet is inert. WARN, on every turn, deliberately: if this is firing the
+    //     noise IS the signal, and `archie deploy` ordering (policy publish before the image roll) is the
+    //     thing to check. There is no throttle here; a throttle on this is a throttle on the only warning.
+    //   * `current` is the healthy steady state and would be one line per turn per agent. DEBUG.
+    const noWrite = (reason, extra = {}) => {
+      const level = (reason === 'no-artifact' || reason === 'no-table') ? 'warn' : 'debug';
+      logger?.[level]?.({ agent, reason, ...extra }, `policy row not written (${reason})`);
+      return { written: false, reason, ...extra };
+    };
+    if (_faked || !config.agentConfigTable) return noWrite('no-table');
     try {
-      const artifact = await policyArtifact({ logger });
-      if (!artifact) return { written: false, reason: 'no-artifact' };
-      // The cheap gate: this process already wrote this agent at this policy version.
-      if (lastPolicyDigest.get(agent) === artifact.policyDigest) return { written: false, reason: 'cached' };
+      const artifact = await policyArtifact();
+      if (!artifact) return noWrite('no-artifact');
 
       const [schema, { rowFromMemberships, rowIsStale }] = [await loadConfigSchema(), require('./policy-derive')];
       const { GetCommand, UpdateCommand } = require('@aws-sdk/lib-dynamodb');
       const Key = schema.agentPolicyKey(agent);
       const cur = await docClient().send(new GetCommand({ TableName: config.agentConfigTable, Key }));
       const existing = cur?.Item?.data ? JSON.parse(cur.Item.data) : null;
-      if (!rowIsStale(existing, artifact)) {
-        lastPolicyDigest.set(agent, artifact.policyDigest);
-        return { written: false, reason: 'current' };
-      }
+      if (!rowIsStale(existing, artifact)) return noWrite('current', { policyDigest: artifact.policyDigest });
       const row = rowFromMemberships(agent, artifact);
       // UpdateItem, NOT PutItem, and this is a permission fact rather than a style choice: the
       // dispatcher task role holds dynamodb:UpdateItem and NOT PutItem (the same constraint marketplace.js
@@ -959,7 +991,6 @@ function createAgentCoreClient(overrides = {}) {
         ExpressionAttributeNames: { '#d': 'data' },
         ExpressionAttributeValues: { ':d': JSON.stringify(row) },
       }));
-      lastPolicyDigest.set(agent, artifact.policyDigest);
       if (logger?.info) {
         const allowed = Object.entries(row.verdicts).filter(([, v]) => v === 'allow').map(([c]) => c);
         logger.info({ agent, policyDigest: row.policyDigest, allowed, entries: Object.keys(row.verdicts).length },
@@ -967,10 +998,12 @@ function createAgentCoreClient(overrides = {}) {
       }
       return { written: true, reason: existing ? 'refreshed' : 'created' };
     } catch (e) {
-      // Never fail a turn over this. A missing or stale row means the runtime keeps its previous
-      // behaviour, which is safe in the pinned-DENY direction (an absent row denies nothing new) and
-      // merely late in the pinned-ALLOW direction. Loud, though — a persistent failure here means pins
-      // are not being applied.
+      // Never fail a turn over this, but do not call it safe either. This comment used to read "an absent
+      // row denies nothing new" — that was true when the runtime treated a missing row as permissive, and
+      // permissions/policy-table.mjs deliberately reversed it (a permissive default on the component whose
+      // job is withholding capability made every pin on ch-cr89fluhion silently inert). So a scope that
+      // reaches this catch on a FIRST write can do nothing at all, and one that reaches it on a refresh
+      // keeps stale verdicts. Non-fatal is about not failing the turn, not about the blast radius.
       if (logger?.warn) logger.warn({ agent, err: e?.message }, 'policy row ensure failed (non-fatal)');
       return { written: false, reason: 'error', error: e?.message };
     }
