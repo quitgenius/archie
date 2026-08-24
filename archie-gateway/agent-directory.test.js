@@ -294,3 +294,83 @@ describe('no cache may go quietly stale', () => {
     expect(code).not.toMatch(/gsi1pk/);
   });
 });
+
+// ---------- scanAgentScopes: the agent list ----------
+//
+// `AGENT#<scope>` partition keys ARE the list of agents. The single exception is the cron legacy-name
+// alias, whose key is a config-repo directory name. It is not an agent, and every enumerator in the
+// CLI runs off this function — including `agent teardown`, which would delete the pointer OpenClaw's
+// cron gate follows.
+
+describe('scanAgentScopes', () => {
+  const { scanAgentScopes } = require('./agent-directory');
+
+  function scanDoc(items, bodies = {}) {
+    const sent = [];
+    const doc = {
+      send(cmd) {
+        sent.push(cmd);
+        const input = cmd.input || {};
+        if (input.Key) {
+          const body = bodies[`${input.Key.pk}|${input.Key.sk}`];
+          return Promise.resolve(body === undefined ? {} : { Item: { data: JSON.stringify(body) } });
+        }
+        return Promise.resolve({ Items: items });
+      },
+    };
+    return { doc, sent };
+  }
+
+  const AGENT_ROWS = [
+    { pk: 'AGENT#dm-ux0mz5ckp2r', sk: 'CONFIG' },
+    { pk: 'AGENT#dm-ux0mz5ckp2r', sk: 'CRON' },
+    { pk: 'AGENT#ch-cr89fluhion', sk: 'CONFIG' },
+    { pk: 'GRANT#ch-cr89fluhion', sk: 'SCOPE#*' },
+    { pk: 'CONFIG#image', sk: 'FLEET' },
+  ];
+
+  it('excludes the cron legacy-name alias — it is a pointer, not an agent', async () => {
+    const items = [...AGENT_ROWS, { pk: 'AGENT#sandbox-archie-perms', sk: 'CRON' }];
+    const { doc } = scanDoc(items, {
+      'AGENT#sandbox-archie-perms|CRON': { alias: 'ch-cr89fluhion', setBy: 'hydrate:sandbox-archie-perms' },
+    });
+    expect(await scanAgentScopes(doc, 't')).toEqual(['ch-cr89fluhion', 'dm-ux0mz5ckp2r']);
+  });
+
+  it('keeps a CRON-only partition that holds a RUNNER row — that is a real minted agent', async () => {
+    const items = [{ pk: 'AGENT#ch-c0new00000', sk: 'CRON' }];
+    const { doc } = scanDoc(items, {
+      'AGENT#ch-c0new00000|CRON': { runner: 'agentcore', setBy: 'hydrate' },
+    });
+    expect(await scanAgentScopes(doc, 't')).toEqual(['ch-c0new00000']);
+  });
+
+  it('disambiguates by BODY, never by the shape of the name', async () => {
+    // `bdd-tests` looks exactly as legacy as `sandbox-archie-perms` does. Only the row says which.
+    const items = [{ pk: 'AGENT#bdd-tests', sk: 'CRON' }];
+    const { doc } = scanDoc(items, { 'AGENT#bdd-tests|CRON': { runner: 'openclaw' } });
+    expect(await scanAgentScopes(doc, 't')).toEqual(['bdd-tests']);
+  });
+
+  it('keeps a scope whose CRON row is unreadable — over-listing beats hiding an agent', async () => {
+    const items = [{ pk: 'AGENT#ch-ck34fg5rf', sk: 'CRON' }];
+    const doc = { send: (cmd) => (cmd.input && cmd.input.Key
+      ? Promise.reject(new Error('AccessDenied'))
+      : Promise.resolve({ Items: items })) };
+    expect(await scanAgentScopes(doc, 't')).toEqual(['ch-ck34fg5rf']);
+  });
+
+  it('costs no GetItem when every partition has a second sort key', async () => {
+    const { doc, sent } = scanDoc(AGENT_ROWS);
+    await scanAgentScopes(doc, 't');
+    expect(sent.filter((c) => c.input && c.input.Key)).toHaveLength(0);
+  });
+
+  it('aliases both key attributes in the projection', async () => {
+    const { doc, sent } = scanDoc(AGENT_ROWS);
+    await scanAgentScopes(doc, 't');
+    const scan = sent.find((c) => c.input && c.input.ProjectionExpression);
+    expect(scan.input.ProjectionExpression).toBe('#pk, #sk');
+    expect(scan.input.ExpressionAttributeNames).toEqual({ '#pk': 'pk', '#sk': 'sk' });
+  });
+});

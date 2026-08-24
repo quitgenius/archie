@@ -83,8 +83,8 @@ function composeLabel(name, scopeId) {
  * Sorted, so callers that report or iterate are deterministic.
  */
 async function scanAgentScopes(doc, tableName) {
-  const { ScanCommand } = require('@aws-sdk/lib-dynamodb');
-  const found = new Set();
+  const { ScanCommand, GetCommand } = require('@aws-sdk/lib-dynamodb');
+  const rows = new Map(); // scope -> Set(sk)
   let ExclusiveStartKey;
   let pages = 0;
   do {
@@ -93,20 +93,48 @@ async function scanAgentScopes(doc, tableName) {
       // NEVER a bare attribute name in an expression. `pk` is not itself reserved, but the rule is
       // uniform because knowing the reserved-word list by heart is not a control: an unaliased
       // `agent` broke every turn for every agent on 2026-08-13.
-      ProjectionExpression: '#pk',
-      ExpressionAttributeNames: { '#pk': 'pk' },
+      ProjectionExpression: '#pk, #sk',
+      ExpressionAttributeNames: { '#pk': 'pk', '#sk': 'sk' },
       ExclusiveStartKey,
     }));
     for (const it of r.Items || []) {
       const pk = it && it.pk;
       if (typeof pk === 'string' && pk.startsWith(AGENT_PK_PREFIX)) {
         const scope = pk.slice(AGENT_PK_PREFIX.length);
-        if (scope) found.add(scope);
+        if (!scope) continue;
+        if (!rows.has(scope)) rows.set(scope, new Set());
+        if (typeof it.sk === 'string') rows.get(scope).add(it.sk);
       }
     }
     ExclusiveStartKey = r.LastEvaluatedKey;
   } while (ExclusiveStartKey && ++pages < MAX_PAGES);
-  return [...found].sort();
+
+  // ONE `AGENT#…` partition is not an agent: the cron LEGACY-NAME ALIAS, keyed by an agent's
+  // config-repo directory name rather than its scope id, holding `{ alias: "<scopeId>" }` so the
+  // OpenClaw cron gate can bridge the two identities (cron-runner-flag.js setAlias). Counting it
+  // as an agent hands every enumerator a scope that does not exist — `deploy` stages a runtime for
+  // it, `teardown` DELETES THE POINTER OpenClaw's gate reads, and the App Home selector offers it.
+  //
+  // The test is the body, not the name: a legacy name is not distinguishable from a scope id by
+  // shape (`bdd-tests` and `test-agent` are both real agents). An alias row carries `alias` and no
+  // `runner`; the runner row carries `runner`. Only CRON-ONLY partitions can be ambiguous — any
+  // partition with a second sk is an agent whose CRON row is its runner flag — so this costs one
+  // GetItem for each of a handful of keys, never a second scan.
+  const candidates = [...rows].filter(([, sks]) => sks.size === 1 && sks.has('CRON')).map(([s]) => s);
+  const aliases = new Set();
+  for (const scope of candidates) {
+    let body = null;
+    try {
+      const r = await doc.send(new GetCommand({ TableName: tableName, Key: { pk: `${AGENT_PK_PREFIX}${scope}`, sk: 'CRON' } }));
+      body = r && r.Item && r.Item.data ? JSON.parse(r.Item.data) : null;
+    } catch {
+      // Unreadable/unparseable: KEEP it. Over-listing shows an operator a scope to ask about;
+      // dropping one hides an agent, and hidden agents are what this whole scan exists to end.
+      continue;
+    }
+    if (body && body.alias && !body.runner) aliases.add(scope);
+  }
+  return [...rows.keys()].filter((s) => !aliases.has(s)).sort();
 }
 
 /**
