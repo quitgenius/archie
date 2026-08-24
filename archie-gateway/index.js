@@ -1286,13 +1286,26 @@ function homeViewOptions(userId, agentId, extra = {}) {
   };
 }
 
+/**
+ * homeViewOptions plus the agent's MARKETPLACE row, read fresh.
+ *
+ * Every App Home render goes through here, because the Skills / Connected Apps / Model tabs all read
+ * that row and all three were previously served from a boot-time snapshot — so any agent minted after
+ * the gateway started rendered as if it had installed and connected nothing. One GetItem on a
+ * human-triggered render, no cache; see marketplace.fetchAgentMarketplace for the full account.
+ */
+async function homeViewOptionsAsync(userId, agentId, extra = {}) {
+  const mkt = await marketplace.fetchAgentMarketplace(configDoc(), AGENT_CONFIG_TABLE, agentId);
+  return homeViewOptions(userId, agentId, { marketplace: mkt, ...extra });
+}
+
 if (bolt) bolt.event('app_home_opened', async ({ event, client }) => {
   const userId = event.user;
   const agentId = homeTargetFor(userId, 'app_home');
   const activeTab = userActiveTab.get(userId) || 'conversations';
   const child = log.child({ event_type: 'app_home_opened', user: userId, agent: agentId });
   try {
-    const opts = homeViewOptions(userId, agentId);
+    const opts = await homeViewOptionsAsync(userId, agentId);
     if (activeTab === 'jobs' && agentId) {
       opts.jobs = await fetchAgentCronJobs(agentId);
       opts.cronRunner = await fetchCronRunner(agentId);
@@ -1411,7 +1424,7 @@ if (bolt) bolt.action('marketplace_tab_skills', async ({ ack, body, client }) =>
   const agentId = homeTargetFor(userId, 'app_home');
   userActiveTab.set(userId, 'skills');
   try {
-    const view = marketplace.buildHomeView(agentId, 'skills', homeViewOptions(userId, agentId));
+    const view = marketplace.buildHomeView(agentId, 'skills', await homeViewOptionsAsync(userId, agentId));
     await client.views.publish({ user_id: userId, view });
   } catch (err) {
     log.error({ err: err.message }, 'failed to switch to skills tab');
@@ -1428,7 +1441,7 @@ if (bolt) bolt.action('marketplace_tab_connectors', async ({ ack, body, client }
     await marketplace.fetchConnectorToolkits(CONNECTOR_API_KEY, { log });
   }
   try {
-    const view = marketplace.buildHomeView(agentId, 'connectors', homeViewOptions(userId, agentId));
+    const view = marketplace.buildHomeView(agentId, 'connectors', await homeViewOptionsAsync(userId, agentId));
     await client.views.publish({ user_id: userId, view });
   } catch (err) {
     log.error({ err: err.message }, 'failed to switch to connectors tab');
@@ -1444,7 +1457,7 @@ if (bolt) bolt.action('marketplace_tab_models', async ({ ack, body, client }) =>
   // Refresh Bedrock cache if needed
   await marketplace.fetchBedrockModels(bedrockClient, { log });
   try {
-    const view = marketplace.buildHomeView(agentId, 'models', homeViewOptions(userId, agentId));
+    const view = marketplace.buildHomeView(agentId, 'models', await homeViewOptionsAsync(userId, agentId));
     await client.views.publish({ user_id: userId, view });
   } catch (err) {
     log.error({ err: err.message }, 'failed to switch to models tab');
@@ -1458,7 +1471,7 @@ if (bolt) bolt.action('marketplace_tab_conversations', async ({ ack, body, clien
   const agentId = homeTargetFor(userId, 'app_home');
   userActiveTab.set(userId, 'conversations');
   try {
-    const view = marketplace.buildHomeView(agentId, 'conversations', homeViewOptions(userId, agentId));
+    const view = marketplace.buildHomeView(agentId, 'conversations', await homeViewOptionsAsync(userId, agentId));
     await client.views.publish({ user_id: userId, view });
   } catch (err) {
     log.error({ err: err.message }, 'failed to switch to conversations tab');
@@ -1477,7 +1490,7 @@ const handleConversationsPage = async ({ ack, body, client }) => {
   const page = Math.max(0, parseInt(body.actions[0].value, 10) || 0);
   if (!agentId) return;
   try {
-    const view = marketplace.buildHomeView(agentId, 'conversations', homeViewOptions(userId, agentId, { page }));
+    const view = marketplace.buildHomeView(agentId, 'conversations', await homeViewOptionsAsync(userId, agentId, { page }));
     await client.views.publish({ user_id: userId, view });
   } catch (err) {
     log.error({ err: err.message }, 'failed to page conversations');
@@ -1499,7 +1512,7 @@ if (bolt) bolt.action('conversations_toggle_pin', async ({ ack, body, client }) 
   if (!agentId || !threadTs) return;
   conversations.togglePin(agentId, threadTs);
   try {
-    const view = marketplace.buildHomeView(agentId, 'conversations', homeViewOptions(userId, agentId));
+    const view = marketplace.buildHomeView(agentId, 'conversations', await homeViewOptionsAsync(userId, agentId));
     await client.views.publish({ user_id: userId, view });
   } catch (err) {
     log.error({ err: err.message }, 'failed to toggle pin on conversation');
@@ -1515,7 +1528,7 @@ const handleConversationsMove = (direction) => async ({ ack, body, client }) => 
   if (!agentId || !threadTs) return;
   conversations.moveConversation(agentId, threadTs, direction);
   try {
-    const view = marketplace.buildHomeView(agentId, 'conversations', homeViewOptions(userId, agentId));
+    const view = marketplace.buildHomeView(agentId, 'conversations', await homeViewOptionsAsync(userId, agentId));
     await client.views.publish({ user_id: userId, view });
   } catch (err) {
     log.error({ err: err.message, direction }, 'failed to reorder conversation');
@@ -1532,7 +1545,7 @@ if (bolt) bolt.action('conversations_reset_order', async ({ ack, body, client })
   if (!agentId) return;
   conversations.resetRecentOrder(agentId);
   try {
-    const view = marketplace.buildHomeView(agentId, 'conversations', homeViewOptions(userId, agentId));
+    const view = marketplace.buildHomeView(agentId, 'conversations', await homeViewOptionsAsync(userId, agentId));
     await client.views.publish({ user_id: userId, view });
   } catch (err) {
     log.error({ err: err.message }, 'failed to reset conversation order');
@@ -1576,7 +1589,7 @@ if (bolt) bolt.action('marketplace_tab_jobs', async ({ ack, body, client }) => {
     cronRunner = await fetchCronRunner(agentId);
   }
   try {
-    const view = marketplace.buildHomeView(agentId, 'jobs', homeViewOptions(userId, agentId, { jobs, cronRunner }));
+    const view = marketplace.buildHomeView(agentId, 'jobs', await homeViewOptionsAsync(userId, agentId, { jobs, cronRunner }));
     await client.views.publish({ user_id: userId, view });
   } catch (err) {
     log.error({ err: err.message }, 'failed to switch to jobs tab');
@@ -1625,7 +1638,7 @@ if (bolt) bolt.action('marketplace_tab_tools', async ({ ack, body, client }) => 
   userActiveTab.set(userId, 'tools');
   const tools = await fetchToolPermissions(agentId);
   try {
-    const view = marketplace.buildHomeView(agentId, 'tools', homeViewOptions(userId, agentId, { tools }));
+    const view = marketplace.buildHomeView(agentId, 'tools', await homeViewOptionsAsync(userId, agentId, { tools }));
     await client.views.publish({ user_id: userId, view });
   } catch (err) {
     log.error({ err: err.message }, 'failed to switch to tools tab');
@@ -1636,7 +1649,7 @@ async function refreshToolsTab(userId, client) {
   const agentId = homeTargetFor(userId, 'app_home');
   if (!agentId) return;
   const tools = await fetchToolPermissions(agentId);
-  const view = marketplace.buildHomeView(agentId, 'tools', homeViewOptions(userId, agentId, { tools }));
+  const view = marketplace.buildHomeView(agentId, 'tools', await homeViewOptionsAsync(userId, agentId, { tools }));
   await client.views.publish({ user_id: userId, view });
 }
 
@@ -1691,7 +1704,7 @@ async function refreshJobsTab(userId, client) {
   if (!agentId) return;
   const jobs = await fetchAgentCronJobs(agentId);
   const cronRunner = await fetchCronRunner(agentId);
-  const view = marketplace.buildHomeView(agentId, 'jobs', homeViewOptions(userId, agentId, { jobs, cronRunner }));
+  const view = marketplace.buildHomeView(agentId, 'jobs', await homeViewOptionsAsync(userId, agentId, { jobs, cronRunner }));
   await client.views.publish({ user_id: userId, view });
 }
 
@@ -1818,7 +1831,8 @@ if (bolt) bolt.action('model_detail', async ({ ack, body, client }) => {
   const modelId = body.actions[0].value;
   const userId = body.user.id;
   const agentId = homeTargetFor(userId, 'app_home');
-  const modal = marketplace.buildModelDetailModal(modelId, agentId);
+  const modal = marketplace.buildModelDetailModal(modelId, agentId,
+    await marketplace.fetchAgentMarketplace(configDoc(), AGENT_CONFIG_TABLE, agentId));
   if (!modal) return;
   try {
     await client.views.open({ trigger_id: body.trigger_id, view: modal });
@@ -1833,7 +1847,8 @@ if (bolt) bolt.action('connector_detail', async ({ ack, body, client }) => {
   const slug = body.actions[0].value;
   const userId = body.user.id;
   const agentId = homeTargetFor(userId, 'app_home');
-  const modal = marketplace.buildConnectorDetailModal(slug, agentId);
+  const modal = marketplace.buildConnectorDetailModal(slug, agentId,
+    await marketplace.fetchAgentMarketplace(configDoc(), AGENT_CONFIG_TABLE, agentId));
   if (!modal) {
     log.warn({ slug }, 'connector detail modal unavailable (app not in Connector cache)');
     return;
@@ -1873,7 +1888,8 @@ if (bolt) bolt.view('connector_search_submit', async ({ ack, body, view }) => {
     return;
   }
 
-  const resultsModal = marketplace.buildConnectorSearchResultsModal(query, agentId);
+  const resultsModal = marketplace.buildConnectorSearchResultsModal(query, agentId,
+    await marketplace.fetchAgentMarketplace(configDoc(), AGENT_CONFIG_TABLE, agentId));
   await ack({ response_action: 'update', view: resultsModal });
 });
 
@@ -1888,7 +1904,7 @@ const NO_AGENT_MSG = 'You don\'t have a personal agent set up yet. Ask in *#sand
 
 async function refreshHome(userId, agentId, tab, client, child) {
   try {
-    const view = marketplace.buildHomeView(agentId, tab, homeViewOptions(userId, agentId));
+    const view = marketplace.buildHomeView(agentId, tab, await homeViewOptionsAsync(userId, agentId));
     await client.views.publish({ user_id: userId, view });
   } catch (err) {
     child.warn({ err: err.message }, 'failed to refresh app home');
