@@ -852,30 +852,20 @@ async function readAgentRouting(ctx, deps, agentId) {
  * the dispatcher's `legacyAgentIdFor` reads to decide an agent is not new. Resolving through it
  * here means the legacy→scope link has ONE definition rather than one per command.
  *
- * Routed agents only, via the routing GSI: an agent with no routing has no scope identity to own
- * jobs, which is the case the caller below refuses anyway. That also bounds this to the fleet size
- * rather than a full table scan.
+ * EVERY agent (`AGENT#` keys), then their META rows. This was the routing GSI, on the reasoning that
+ * "routed agents only… bounds this to the fleet size rather than a full table scan" — but the index
+ * cannot see a MINTED agent, so an agent whose legacy root was being looked up could be silently
+ * absent. `scanAgentScopes` is one Scan of a table in the low thousands of items, off any hot path.
  */
 async function findAgentByEfsRoot(ctx, deps, legacyName) {
   if (deps.agentByEfsRoot) return deps.agentByEfsRoot(legacyName);
   const { makeClient } = require('../lib/aws');
-  const { DynamoDBDocumentClient, QueryCommand, BatchGetCommand } = require('@aws-sdk/lib-dynamodb');
+  const { DynamoDBDocumentClient, BatchGetCommand } = require('@aws-sdk/lib-dynamodb');
+  const { scanAgentScopes } = require('../../archie-gateway/agent-directory');
   const doc = deps.doc || DynamoDBDocumentClient.from(makeClient(ctx, '@aws-sdk/client-dynamodb', 'DynamoDBClient'));
   const table = ctx.resources.configTable;
 
-  const ids = [];
-  let ExclusiveStartKey;
-  do {
-    const r = await doc.send(new QueryCommand({
-      TableName: table,
-      IndexName: 'routing',
-      KeyConditionExpression: 'gsi1pk = :p',
-      ExpressionAttributeValues: { ':p': 'ROUTING' },
-      ExclusiveStartKey,
-    }));
-    for (const it of r.Items || []) if (it.gsi1sk) ids.push(it.gsi1sk);
-    ExclusiveStartKey = r.LastEvaluatedKey;
-  } while (ExclusiveStartKey);
+  const ids = await scanAgentScopes(doc, table);
 
   for (let i = 0; i < ids.length; i += 100) { // BatchGetItem caps at 100 keys
     const Keys = ids.slice(i, i + 100).map((id) => ({ pk: `AGENT#${id}`, sk: 'META' }));
