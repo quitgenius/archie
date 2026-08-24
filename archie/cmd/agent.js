@@ -51,7 +51,8 @@
 
 const provisioning = require('../../archie-gateway/agentcore-provisioning');
 const derivedRole = require('../../archie-gateway/derived-role');
-const routingBuild = require('../../archie-gateway/routing-build');
+const { listAgents } = require('../lib/agents');
+const { legacyEfsRootOf } = require('../lib/efs-root');
 const { createRuntimeRegistry } = require('../../archie-gateway/runtime-registry');
 const { efsRootDir, generationRuntimeName, isGenerationOf } = require('../../archie-gateway/agentcore-client');
 const { derivedSpecFor, imageUriFor } = require('../lib/spec');
@@ -1045,7 +1046,7 @@ async function migrate(ctx, args, out, deps) {
 /**
  * The agents to migrate: `--agents a,b` or the routing GSI. Returns `{ scope, efsRoot }` per agent.
  *
- * The GSI read is `routing-build.collectFromDdb` — the same one `agent-migrate.js:63` uses, so the
+ * The agent list is `lib/agents.listAgents` (`AGENT#` keys) — the same one `agent-migrate.js` uses, so the
  * roster reflects what is actually ROUTED rather than what someone remembered to list.
  *
  * ── WHY TWO IDENTIFIERS, AND WHY THIS USED TO RETURN THE WRONG ONE ──────────────────────────────
@@ -1087,13 +1088,26 @@ async function agentRoster(ctx, clients, args, out, deps) {
     }
     return roster;
   }
-  // NO --agents: the roster is whatever is ROUTED, and META carries each scope's efsRoot directly.
-  // efsRoot defaults to the scope id — an agent minted under §8.10 never had a legacy directory, so its
+  // NO --agents: EVERY agent (`AGENT#` keys, lib/agents.js), each with its own efsRoot from META.
+  //
+  // This used to read the routing GSI, which returned the META body in the same query — convenient,
+  // but the index cannot see a MINTED agent, so an unscoped run silently skipped every agent that had
+  // never been hydrated. `AGENT#` answers "which agents" completely; `legacyEfsRootOf` answers "which
+  // directory" per agent, and it is the SAME reader the dispatcher and `fleet drift` use, so there is
+  // no second interpretation of that field.
+  //
+  // One GetItem per agent instead of one Query for all of them. This is a migration command run by
+  // hand over a fleet in the low hundreds, off any hot path — the completeness is worth the N reads.
+  //
+  // efsRoot defaults to the scope id: an agent minted under §8.10 never had a legacy directory, so its
   // workspace already lives at its own name. Only a rekeyed/hydrated agent carries a different one.
-  const configs = await routingBuild.collectFromDdb(clients.doc, ctx.resources.configTable, {
-    log: { info() {}, warn() {}, error: (o, m) => out.warn(`${m} ${JSON.stringify(o)}`) },
-  });
-  return configs.map((c) => ({ scope: c.agent, efsRoot: (c.cfg && c.cfg.efsRoot) || c.agent }));
+  const rows = await listAgents(clients.doc, ctx.resources.configTable);
+  const roster = [];
+  for (const { agent } of rows) {
+    const legacy = await legacyEfsRootOf({ doc: () => clients.doc }, ctx, agent);
+    roster.push({ scope: agent, efsRoot: legacy || agent });
+  }
+  return roster;
 }
 
 // ── §2.22 `archie agent rekey` ───────────────────────────────────────────────────────────────────

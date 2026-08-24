@@ -57,7 +57,7 @@ const {
 const { scanBindings, bindingStats, byTag, stateOf } = require('../lib/bindings');
 // The routing GSI query, reused rather than reimplemented — the same import cmd/stage.js, cmd/policy.js
 // and cmd/status.js make. Two spellings of "which agents exist" is how the gate and the roster drift.
-const { collectFromDdb } = require('../../archie-gateway/routing-build');
+const { listAgents } = require('../lib/agents');
 
 // How long a published pointer takes to reach every turn: the dispatcher caches it with a short TTL
 // and a background refresher (`image-source.js`). Reported so nobody watches Slack for 30s wondering
@@ -225,7 +225,7 @@ async function publish(ctx, args, out, deps = {}) {
     // agent as absent — and that agent is exactly the one the gate exists for: it has a scope
     // identity, it will take a turn, and it would mint onto this pointer having verified nothing.
     // `deps.collectAgents` is the test seam cmd/stage.js already uses for the same query.
-    (deps.collectAgents || collectFromDdb)(aws.doc(), table),
+    (deps.collectAgents || listAgents)(aws.doc(), table),
   ]);
   const mine = (byTag(rows).get(tag) || []);
   const stats = bindingStats(mine);

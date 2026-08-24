@@ -51,8 +51,11 @@ function fakeDoc(state = {}) {
       const input = cmd.input;
       calls.push(input);
       if (input.Key) return { Item: input.Key.sk === 'FLEET' ? (state.release || undefined) : undefined };
-      if (input.IndexName === 'routing') {
-        return { Items: (state.agents || []).map((a) => ({ gsi1pk: 'ROUTING', gsi1sk: a, data: '{}' })) };
+      // The agent enumeration is now a SCAN of `AGENT#` partition keys (lib/agents.js), not a Query on
+      // the routing GSI — that index cannot see a minted agent, so status under-reported the fleet.
+      // A Scan carries no KeyConditionExpression, which is what distinguishes it here.
+      if (!input.KeyConditionExpression) {
+        return { Items: (state.agents || []).map((a) => ({ pk: `AGENT#${a}` })) };
       }
       const pk = input.ExpressionAttributeValues[':pk'];
       if (pk === 'CONFIG#image') {
@@ -343,9 +346,9 @@ test('--agents parses a comma list and narrows the per-agent queries', async () 
   assert.equal(parseAgentFilter({}), null);
 });
 
-test('--agents warns about a name absent from the routing GSI instead of silently reporting nothing', async () => {
+test('--agents warns about a name with no AGENT# item instead of silently reporting nothing', async () => {
   const { c } = await run(healthyState(), { values: { agents: 'ch_platform,agent_e6slez' } });
-  assert.match(c.stderr(), /not present in the routing GSI: agent_e6slez/);
+  assert.match(c.stderr(), /no AGENT# item for: agent_e6slez/);
 });
 
 test('--brief skips the CloudWatch read entirely — the documented path past a metrics permissions gap', async () => {

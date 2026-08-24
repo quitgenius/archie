@@ -39,7 +39,7 @@
 
 const { CliError, EXIT, drift } = require('../lib/exit');
 const { makeClient } = require('../lib/aws');
-const { collectFromDdb } = require('../../archie-gateway/routing-build');
+const { listAgents } = require('../lib/agents');
 const { createRuntimeRegistry } = require('../../archie-gateway/runtime-registry');
 const { readImageItem } = require('../../archie-gateway/image-source');
 const { listTaints } = require('../lib/image-pointer');
@@ -579,8 +579,9 @@ async function status(ctx, args, out, deps = {}) {
     attempt(errors, `GetItem CONFIG#image/FLEET on ${table}`, () => readReleasePointer(clients.doc, table), null),
     attempt(errors, `Query CONFIG#image taints on ${table}`, () => listTaints(clients.doc, require('@aws-sdk/lib-dynamodb'), table), []),
     attempt(errors, `Query CONFIG#image on ${table}`, () => queryPartition(clients.doc, table, IMAGE_PK), []),
-    // The agent enumeration is the routing GSI (`routing-build.js:68`) — reused, not reimplemented.
-    attempt(errors, `Query routing GSI on ${table}`, () => collectFromDdb(clients.doc, table), []),
+    // The agent enumeration is `AGENT#` partition keys (lib/agents.js) — the complete list. It was the
+    // routing GSI, which cannot see a minted agent, so status under-reported the fleet.
+    attempt(errors, `Scan AGENT# items on ${table}`, () => listAgents(clients.doc, table), []),
   ]);
 
   const fleetAgents = routingRows.map((r) => r.agent);
@@ -592,7 +593,7 @@ async function status(ctx, args, out, deps = {}) {
   if (filter) {
     const known = new Set(fleetAgents);
     const unrouted = filter.filter((a) => !known.has(a));
-    if (unrouted.length) out.warn(`not present in the routing GSI: ${unrouted.join(', ')} (typo, or an agent with no routing config)`);
+    if (unrouted.length) out.warn(`no AGENT# item for: ${unrouted.join(', ')} (typo, or an agent that does not exist)`);
   }
 
   const registry = createRuntimeRegistry({ tableName: table, doc: () => clients.doc });
