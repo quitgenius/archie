@@ -242,7 +242,15 @@ async function configHydrate(ctx, args, out, deps) {
 
   if (ctx.dryRun) {
     out.progress(`would run: node ${SCRIPTS.hydrate}`);
-    return { dryRun: true, table, source, consequences: HYDRATE_CONSEQUENCES, ...(agents.length ? { agents } : {}) };
+    if (!args.values['skip-cron']) {
+      out.progress('would then fold in per-agent cron (`cron hydrate` per agent) — hydrate means hydrate. '
+        + 'Each agent PURGES its owner\'s dispatcher store then re-seeds from EFS. --skip-cron opts out.');
+    }
+    return {
+      dryRun: true, table, source, consequences: HYDRATE_CONSEQUENCES,
+      cron: args.values['skip-cron'] ? { skipped: true } : { wouldHydrate: agents.length || 'every agent with a META.efsRoot' },
+      ...(agents.length ? { agents } : {}),
+    };
   }
 
   // CONNECTOR ADOPTION ENV, resolved here rather than left to the operator's shell.
@@ -291,7 +299,87 @@ async function configHydrate(ctx, args, out, deps) {
       ...adoptEnv,
     },
   }, out, deps);
-  return { table, source, ...(agents.length ? { agents } : {}), log: tail(stdout, 2) };
+
+  // ── CRON, because HYDRATE MEANS HYDRATE ──────────────────────────────────────────────────────
+  //
+  // This command used to write config and stop, leaving an agent's cron store empty. That is not a
+  // partial success, it is a WRONG ANSWER to the question asked: `agent teardown` purges the
+  // dispatcher's cron store and its own output says "hydrate to bring it back", so the operation
+  // named hydrate has to bring back everything teardown removed. It did not, and the gap was invisible
+  // — config looked right, the agent came back, and its schedules were simply gone.
+  //
+  // WHY IT WAS SPLIT AT ALL: no reason that survives inspection. `config hydrate` and `cron hydrate`
+  // were both drawn in the first CLI commit (f59eea8e5, "CLI skeleton and the command contract") along
+  // storage lines — config is DynamoDB, cron is a file on EFS reachable only from inside the VPC — so
+  // the command set mirrored the plumbing instead of the intent. The complete operation then ended up
+  // filed under `agent migrate`, which reads like a one-off, while the word "hydrate" belonged to two
+  // commands that each did part of the job.
+  //
+  // The cron step is `cron hydrate` per agent, unchanged and not reimplemented — it already handles
+  // the awkward part (with MOUNT_PATH it runs in-process; without, it composes an ephemeral Fargate
+  // task around the parent access point and deregisters it). It takes the LEGACY DIRECTORY name, not
+  // the scope id: HYDRATE_AGENT is a path, and handing it a scope id wipes the store and seeds nothing.
+  //
+  // COSTS, both inherited from that step rather than introduced here: ~30-60s per agent from a laptop,
+  // sequential, and it PURGES the owner's store before re-seeding, so an archie-created job absent
+  // from the agent's EFS jobs.json does not survive. `--skip-cron` is the way out.
+  const cron = args.values['skip-cron']
+    ? { skipped: true }
+    : await (deps.hydrateCron || hydrateCron)(ctx, { agents, table }, out, deps);
+
+  return { table, source, ...(agents.length ? { agents } : {}), cron, log: tail(stdout, 2) };
+}
+
+/**
+ * The cron half of a hydrate: fold each agent's EFS cron store into the dispatcher's.
+ *
+ * The roster is CONFIG-REPO NAMES, which is exactly what `efsRoot` is — so a scoped run already has
+ * them in `--agents`, and an unscoped run reads them back off the META rows hydrate just wrote. That
+ * second path deliberately uses `legacyEfsRootOf`, the same reader the dispatcher and `fleet drift`
+ * use, rather than forming a second opinion about which directory an agent owns.
+ *
+ * Never throws: a cron failure must not retract a completed config write. Each agent's failure is
+ * reported and counted, and the summary says how many did not make it, because "hydrated 2 of 3" is
+ * the sentence whose absence caused this bug in the first place.
+ */
+async function hydrateCron(ctx, { agents, table }, out, deps) {
+  let roster = agents.slice();
+  if (!roster.length) {
+    try {
+      // Injectable, like every other collaborator here — `node --test` must touch neither credentials
+      // nor the network, which is this file's stated contract.
+      const { scanAgentScopes } = deps.agentScopes || require('../../archie-gateway/agent-directory');
+      const { legacyEfsRootOf } = deps.efsRoot || require('../lib/efs-root');
+      const { makeClient } = require('../lib/aws');
+      const { DynamoDBDocumentClient } = require('@aws-sdk/lib-dynamodb');
+      const doc = deps.doc || DynamoDBDocumentClient.from(makeClient(ctx, '@aws-sdk/client-dynamodb', 'DynamoDBClient'));
+      const aws = { doc: () => doc };
+      for (const scope of await scanAgentScopes(doc, table)) {
+        const legacy = await legacyEfsRootOf(aws, ctx, scope);
+        if (legacy) roster.push(legacy);
+        else out.warn(`cron: ${scope} has no META.efsRoot — no EFS cron store to fold in, skipping`);
+      }
+    } catch (e) {
+      out.warn(`cron: could not read the agent roster (${e.message}) — config was written, cron was NOT`);
+      return { hydrated: 0, failed: 0, rosterFailed: true };
+    }
+  }
+  if (!roster.length) return { hydrated: 0, failed: 0 };
+
+  out.progress(`cron: folding in per-agent cron for ${roster.length} agent(s). Each PURGES its owner's `
+    + 'dispatcher store then re-seeds from EFS; without MOUNT_PATH this is one ephemeral Fargate task per agent.');
+  let hydrated = 0; const failed = [];
+  for (const efsRoot of roster) {
+    try {
+      await module.exports['cron hydrate'](ctx, { positionals: [efsRoot], values: {} }, out, deps);
+      hydrated += 1;
+    } catch (e) {
+      failed.push(efsRoot);
+      out.warn(`cron: ${efsRoot} failed (${e.message}) — its config IS written; re-run \`archie cron hydrate ${efsRoot}\``);
+    }
+  }
+  out.progress(`cron: hydrated ${hydrated} of ${roster.length}${failed.length ? ` — FAILED: ${failed.join(', ')}` : ''}`);
+  return { hydrated, failed: failed.length, ...(failed.length ? { failedAgents: failed } : {}) };
 }
 
 async function configHydrateConversations(ctx, args, out, deps) {

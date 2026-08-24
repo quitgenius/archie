@@ -11,6 +11,11 @@ const wrappers = require('./wrappers');
 const { EXIT } = require('../lib/exit');
 const { resourcesFor } = require('../lib/context');
 
+// `config hydrate` folds in per-agent cron now (hydrate means hydrate — wrappers.js configHydrate).
+// These tests are about argument translation, so the cron step is stubbed: reaching the real one would
+// mean DynamoDB and a Fargate task, and this file touches neither credentials nor the network.
+const NO_CRON = async () => ({ hydrated: 0, failed: 0, stubbed: true });
+
 const { lastJson, oneAgent, observabilityEnv, describeSource } = wrappers._internals;
 
 // ── harness ──────────────────────────────────────────────────────────────────────────────────
@@ -103,7 +108,7 @@ test('observability env pins every stack-shaped name to --name', () => {
 test('config hydrate prints the three idempotency consequences BEFORE writing, and dry-run writes nothing', async () => {
   const out = makeOut();
   const execFile = fakeExec(({ argv }) => (argv[0] === 'ls-remote' ? { stdout: 'deadbeefcafe\trefs/heads/main\n' } : { stdout: '' }));
-  const r = await wrappers['config hydrate'](makeCtx({ dryRun: true }), args([], {}), out, { execFile, env: {} });
+  const r = await wrappers['config hydrate'](makeCtx({ dryRun: true }), args([], {}), out, { execFile, env: {}, hydrateCron: NO_CRON });
 
   assert.equal(r.dryRun, true);
   assert.equal(r.table, 'agent-gn0p84-config');
@@ -118,14 +123,14 @@ test('config hydrate prints the three idempotency consequences BEFORE writing, a
 test('config hydrate resolves the ref rather than tracking a moving one silently', async () => {
   const out = makeOut();
   const execFile = fakeExec(() => ({ stdout: 'deadbeefcafe1234\trefs/heads/main\n' }));
-  const r = await wrappers['config hydrate'](makeCtx({ dryRun: true }), args([], {}), out, { execFile, env: {} });
+  const r = await wrappers['config hydrate'](makeCtx({ dryRun: true }), args([], {}), out, { execFile, env: {}, hydrateCron: NO_CRON });
   assert.equal(r.source.sha, 'deadbeefcafe1234');
   assert.match(describeSource(r.source), /@ deadbeefcafe/);
 
   // ...and when it CANNOT be resolved, that is stated. Silence is the failure mode being closed.
   const out2 = makeOut();
   const failing = fakeExec(() => ({ code: 128, stderr: 'fatal: could not read Username' }));
-  const r2 = await wrappers['config hydrate'](makeCtx({ dryRun: true }), args([], {}), out2, { execFile: failing, env: {} });
+  const r2 = await wrappers['config hydrate'](makeCtx({ dryRun: true }), args([], {}), out2, { execFile: failing, env: {}, hydrateCron: NO_CRON });
   assert.equal(r2.source.sha, null);
   assert.match(out2.lines.warn.join('\n'), /MOVING ref/);
 });
@@ -133,7 +138,7 @@ test('config hydrate resolves the ref rather than tracking a moving one silently
 test('config hydrate --no-dry-run invokes hydrate.mjs with the table and ref derived from the context', async () => {
   const out = makeOut();
   const execFile = fakeExec(() => ({ stdout: 'hydrate: done — DynamoDB refreshed\n' }));
-  await wrappers['config hydrate'](makeCtx({ name: 'agent-b450oe' }), args([], { ref: 'topic', 'sandra-dir': '/tmp/sandra' }), out, { execFile, env: {} });
+  await wrappers['config hydrate'](makeCtx({ name: 'agent-b450oe' }), args([], { ref: 'topic', 'sandra-dir': '/tmp/sandra' }), out, { execFile, env: {}, hydrateCron: NO_CRON });
 
   const node = execFile.calls.find((c) => c.cmd === 'node');
   assert.ok(node.argv[0].endsWith('config-resolver/hydrate.mjs'));
@@ -141,6 +146,73 @@ test('config hydrate --no-dry-run invokes hydrate.mjs with the table and ref der
   assert.equal(node.env.SANDRA_DIR, '/tmp/sandra');
   assert.equal(node.env.SANDRA_REF, 'topic');
   assert.equal(node.env.AWS_REGION, 'us-east-1');
+});
+
+// ── HYDRATE MEANS HYDRATE ────────────────────────────────────────────────────────────────────
+//
+// `config hydrate` wrote config and stopped, leaving the cron store empty. That is not a partial
+// success: `agent teardown` PURGES the dispatcher cron store and its own output says "hydrate to bring
+// it back", so a torn-down agent came back with no schedules and nothing said so. It happened for real
+// on 2026-08-24 — the fleet was torn down, hydrated, reported as re-hydrated, and had no cron.
+//
+// These pin the whole operation rather than the config half.
+
+test('config hydrate folds in cron for each scoped agent — hydrate means hydrate', async () => {
+  const calls = [];
+  const execFile = fakeExec(() => ({ stdout: 'hydrate: done\n' }));
+  await wrappers['config hydrate'](
+    makeCtx(), args([], { 'sandra-dir': '/tmp/s', agents: 'agent-exgtoc,agent-31cdua' }), makeOut(),
+    { execFile, env: {}, hydrateCron: async (ctx, o) => { calls.push(o.agents); return { hydrated: 2, failed: 0 }; } },
+  );
+  assert.deepEqual(calls, [['agent-exgtoc', 'agent-31cdua']],
+    'the cron step must receive the CONFIG-REPO names — cron hydrate reads a path, and a scope id wipes '
+    + 'the store and seeds nothing');
+});
+
+test('config hydrate reports the cron outcome in its result, so "hydrated 2 of 3" is visible', async () => {
+  const execFile = fakeExec(() => ({ stdout: 'hydrate: done\n' }));
+  const r = await wrappers['config hydrate'](
+    makeCtx(), args([], { 'sandra-dir': '/tmp/s', agents: 'a' }), makeOut(),
+    { execFile, env: {}, hydrateCron: async () => ({ hydrated: 2, failed: 1, failedAgents: ['c'] }) },
+  );
+  // The absence of this is what let a half-hydrate read as a whole one.
+  assert.deepEqual(r.cron, { hydrated: 2, failed: 1, failedAgents: ['c'] });
+});
+
+test('--skip-cron is the ONLY way to get config-only, and it says so in the result', async () => {
+  const execFile = fakeExec(() => ({ stdout: 'hydrate: done\n' }));
+  let reached = false;
+  const r = await wrappers['config hydrate'](
+    makeCtx(), args([], { 'sandra-dir': '/tmp/s', 'skip-cron': true }), makeOut(),
+    { execFile, env: {}, hydrateCron: async () => { reached = true; return {}; } },
+  );
+  assert.equal(reached, false);
+  assert.deepEqual(r.cron, { skipped: true });
+});
+
+test('a cron failure does NOT retract the config write, and names the re-run', async () => {
+  const out = makeOut();
+  const execFile = fakeExec(() => ({ stdout: 'hydrate: done\n' }));
+  const r = await wrappers['config hydrate'](
+    makeCtx(), args([], { 'sandra-dir': '/tmp/s', agents: 'agent-exgtoc' }), out,
+    { execFile, env: {}, cronHydrateImpl: null,
+      hydrateCron: undefined,
+      agentScopes: { scanAgentScopes: async () => [] },
+      efsRoot: { legacyEfsRootOf: async () => null } },
+  );
+  // config still landed
+  assert.ok(execFile.calls.find((c) => c.cmd === 'node').argv[0].endsWith('config-resolver/hydrate.mjs'));
+  assert.ok(r.cron, 'the cron outcome is always reported, even when it did nothing');
+});
+
+test('the dry-run says it will do cron too — the plan must not understate the operation', async () => {
+  const out = makeOut();
+  const execFile = fakeExec(() => ({ stdout: '' }));
+  const r = await wrappers['config hydrate'](
+    makeCtx({ dryRun: true }), args([], { 'sandra-dir': '/tmp/s' }), out, { execFile, env: {} },
+  );
+  assert.match(out.lines.progress.join(' '), /fold in per-agent cron/);
+  assert.ok(r.cron, 'dry-run must state the cron intent, not omit it');
 });
 
 // ── config hydrate-conversations ─────────────────────────────────────────────────────────────
@@ -187,7 +259,7 @@ test('malformed rows come back as per-unit failures, not a collapsed exit code',
 test('a subprocess failure keeps the child stderr — a region mismatch must not look like an unpublished image', async () => {
   const execFile = fakeExec(() => ({ code: 2, stderr: 'ResourceNotFoundException: table agent-gn0p84-config not found in us-east-2' }));
   await assert.rejects(
-    wrappers['config hydrate'](makeCtx(), args([], { 'sandra-dir': '/tmp/s' }), makeOut(), { execFile, env: {} }),
+    wrappers['config hydrate'](makeCtx(), args([], { 'sandra-dir': '/tmp/s' }), makeOut(), { execFile, env: {}, hydrateCron: NO_CRON }),
     (e) => {
       assert.equal(e.exitCode, EXIT.FAILED);
       assert.match(e.detail, /us-east-2/);
@@ -609,14 +681,14 @@ test('dashboard deploy passes only ctx-derived targets, and prints them', async 
 test('dashboard deploy fails on a stack mismatch — the other stack is real, populated and wrong', async () => {
   const execFile = fakeExec(() => ({ stdout: '{"checkErrors":["ListMetrics X: AccessDenied"],"stackMismatches":[{"key":"DISPATCHER_LOG_GROUP","dashboard":"/ecs/agent-gn0p84-dispatcher","deployed":"/ecs/agent-4ggvzl-dispatcher"}]}' }));
   const out = makeOut();
-  await rejects(wrappers['dashboard deploy'](makeCtx(), args([], {}), out, { execFile, env: {} }), EXIT.DRIFT, /another stack/);
+  await rejects(wrappers['dashboard deploy'](makeCtx(), args([], {}), out, { execFile, env: {}, hydrateCron: NO_CRON }), EXIT.DRIFT, /another stack/);
   // A check that could not RUN is not a check that passed.
   assert.match(out.lines.warn.join('\n'), /could not run: ListMetrics X: AccessDenied/);
 });
 
 test('dashboard deploy honours dry-run', async () => {
   const execFile = fakeExec();
-  const r = await wrappers['dashboard deploy-latency'](makeCtx({ dryRun: true }), args([], {}), makeOut(), { execFile, env: {} });
+  const r = await wrappers['dashboard deploy-latency'](makeCtx({ dryRun: true }), args([], {}), makeOut(), { execFile, env: {}, hydrateCron: NO_CRON });
   assert.equal(r.dryRun, true);
   assert.equal(execFile.calls.length, 0);
 });

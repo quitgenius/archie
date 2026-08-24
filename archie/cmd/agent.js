@@ -959,6 +959,11 @@ async function migrate(ctx, args, out, deps) {
           agents: args.values.agents,
           ref: args.values.ref,
           'sandra-dir': args.values['sandra-dir'],
+          // `config hydrate` folds in cron itself now (hydrate means hydrate). This command has its own
+          // cron PHASE below, which runs after the runtime phase and reports per-agent — so the config
+          // step is told to skip it rather than doing it twice. `cron hydrate` PURGES before re-seeding,
+          // so running it twice is not merely wasteful: it is two Fargate tasks and two purges per agent.
+          'skip-cron': true,
         },
       },
       out,
