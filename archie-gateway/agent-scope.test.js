@@ -9,7 +9,7 @@
 // slack-dispatcher as CJS, so a top-level `import` here is a parse error, not a style choice).
 // The one ESM dependency — rekey-to-scope.mjs — is pulled in with a dynamic import inside the test
 // that needs it.
-const { normaliseScopeId, mintAgentName, scopeIdForRouting } = require('./agent-scope');
+const { normaliseScopeId, mintAgentName, scopeIdForRouting, slackRefFromScopeId } = require('./agent-scope');
 
 describe('scope id — the §8.10 identity rule', () => {
   it('mints dm-<user> for a DM and ch-<channel> for a channel', () => {
@@ -49,6 +49,32 @@ describe('scope id — the §8.10 identity rule', () => {
 
     const channel = 'CP6ZWTFXI6R';
     expect(scopeIdForRouting({ channels: [channel] })).toBe(mintAgentName({ channel_type: 'channel', channel }));
+  });
+
+  it('the inverse round-trips — minting then parsing returns the id you started with', () => {
+    // THE INVARIANT THAT MATTERS for anything labelling a scope: normaliseScopeId lowercases, and
+    // this is what says nothing was lost doing so. It holds only because Slack ids are an
+    // uppercase-only alphabet; if that ever stopped being true, this is the test that would say so.
+    for (const user of ['UX0MZ5CKP2R', 'UBB6NU5514B']) {
+      expect(slackRefFromScopeId(mintAgentName({ channel_type: 'im', user }))).toEqual({ kind: 'user', id: user });
+    }
+    for (const channel of ['CR89FLUHION', 'CMHP9RYCF1H', 'CP6ZWTFXI6R']) {
+      expect(slackRefFromScopeId(mintAgentName({ channel_type: 'channel', channel }))).toEqual({ kind: 'channel', id: channel });
+    }
+  });
+
+  it('the inverse refuses rather than guesses', () => {
+    // A scope that was never minted from Slack has no Slack object behind it. Returning null makes
+    // the caller render the raw id; inventing an id would make it query Slack for something that
+    // does not exist and silently show nothing.
+    expect(slackRefFromScopeId('bdd-tests')).toBe(null);
+    expect(slackRefFromScopeId('agent-xx9aff')).toBe(null);
+    expect(slackRefFromScopeId('dm-')).toBe(null);
+    expect(slackRefFromScopeId('')).toBe(null);
+    expect(slackRefFromScopeId(null)).toBe(null);
+    // {8,} on the channel arm, for the reason cron-inventory-metrics records: 'current' uppercases
+    // to CURRENT, which a {6,} pattern accepted — a false ACCEPT, the direction that fails silently.
+    expect(slackRefFromScopeId('ch-current')).toBe(null);
   });
 
   it('agrees with the rekey migration copy in config-resolver', async () => {
