@@ -37,7 +37,6 @@ const DISPATCHER = path.join(DOCKER_ROOT, 'archie-gateway');
 const SCRIPTS = {
   hydrate: path.join(CONFIG_RESOLVER, 'hydrate.mjs'),
   validateRequires: path.join(CONFIG_RESOLVER, 'validate-requires.mjs'),
-  routesParity: path.join(CONFIG_RESOLVER, 'routes-parity.mjs'),
   seedRoundtrip: path.join(CONFIG_RESOLVER, 'seed-roundtrip.mjs'),
   skillRoundtrip: path.join(CONFIG_RESOLVER, 'skill-roundtrip.mjs'),
   hydrateConversations: path.join(DISPATCHER, 'hydrate-conversations.mjs'),
@@ -443,11 +442,10 @@ async function configParity(ctx, args, out, deps) {
   if (!agentsDir) out.warn('AGENT_VE2BNZS_DIR unset — seed round-trip degrades to self-consistency (DDB vs items/), not git parity');
   if (!skillsDir) out.warn('SANDRA_SKILLS_DIR unset — skill round-trip degrades to self-consistency (DDB vs items/), not git parity');
 
+  // NO routes-parity GATE. It compared the routes table built from DynamoDB against the one built from
+  // git, and there is no routes table any more: routing is derived per event from the scope id, so
+  // there is nothing to hold in parity. Deleted with routing-build.js.
   const gates = [
-    await gate({
-      name: 'routes-parity', script: SCRIPTS.routesParity, cwd: CONFIG_RESOLVER, env,
-      requires: [path.join(CONFIG_RESOLVER, 'items', 'routing')],
-    }, out, deps),
     await gate({
       name: 'seed-roundtrip', script: SCRIPTS.seedRoundtrip, cwd: CONFIG_RESOLVER, env,
       argv: agentsDir ? [agentsDir] : [],

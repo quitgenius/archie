@@ -55,12 +55,11 @@ const { createImageSource } = require('./image-source');
 const { createTurnQueue } = require('./turn-queue');
 const { createSessionTracker } = require('./session-tracker');
 const { createCronHome } = require('./cron-home');
-const { mintAgentName, normaliseScopeId } = require('./agent-scope');
+const { mintAgentName, normaliseScopeId, slackRefFromScopeId } = require('./agent-scope');
 const { createAgentDirectory } = require('./agent-directory');
 const { diffObserved, specDiff } = require('./spec-diff');
 const { createDispatcherMetrics } = require('./dispatcher-metrics');
 const { createRuntimeQuotaSampler } = require('./runtime-quota-metrics');
-const routingBuild = require('./routing-build');
 const { generateFileRef: _generateFileRef, parseFileRef } = require('./file-ref');
 const { Readable } = require('node:stream');
 const { pipeline } = require('node:stream/promises');
@@ -327,13 +326,17 @@ function parseJsonEnv(name, fallback) {
 // top-level messages that aren't @mentions. Thread replies are allowed
 // if the bot was @mentioned in the thread root (tracked in mentionedThreads).
 
-let routes = {
-  dmUsers: {},
-  channels: {},
-  requireMention: new Set(),  // channel IDs where only @mentions (+ thread follow-ups) are forwarded
-  streamingAgents: new Set(), // agent names with streaming: true in slack.json
-  default: null,
-};
+// NO ROUTES TABLE. Routing is DERIVATION: the scope id contains the Slack source, so `mintAgentName`
+// answers "which agent serves this event" with no stored state at all (agent-scope.js).
+//
+// There WAS a table here, built from AGENT#<scope>/META via the routing GSI. It was redundant:
+// `assertSingleSource` caps every agent at <=1 DM and <=1 channel, so a lookup could only ever return
+// what the formula returns. Proven against the config repo before deletion — 215 of 216 routing
+// entries agreed with derivation, the one exception being `agent-83l3pa`, the only agent fleet-wide
+// with both a DM and a channel, whose channel now derives its own `ch-` scope by decision.
+//
+// `require_mention` survived the table and moved to AGENT#<scope>/CONFIG (requiresMention below).
+// `streaming` did not survive: it was parsed and never gated anything (see buildAgentPayload).
 
 // The dispatcher-owned cron subsystem (Option B) — the sole scheduler for every agent.
 // Forward-declared here; assigned once, below, where its collaborators exist.
@@ -402,24 +405,11 @@ setInterval(() => {
 // Reload mutex: serialises concurrent POST /reload so overlapping DDB re-reads don't race.
 const reloadMutex = new Mutex();
 
-async function loadRoutes() {
-  // Collect per-agent routing from the DynamoDB routing GSI, then aggregate.
-  const agentConfigs = await routingBuild.collectFromDdb(configDoc(), AGENT_CONFIG_TABLE, { log });
-  log.info({ count: agentConfigs.length, table: AGENT_CONFIG_TABLE }, 'routing source: DynamoDB');
-  routes = routingBuild.buildRoutes(agentConfigs, { extraStreamingAgents, log });
-
-  log.info(
-    {
-      dm_users: Object.keys(routes.dmUsers).length,
-      channels: Object.keys(routes.channels).length,
-      require_mention_channels: routes.requireMention.size,
-      streaming_agents: [...routes.streamingAgents],
-    },
-    'routes loaded',
-  );
-
-  // Load marketplace data (skill catalog + install state) from DynamoDB — same aggregate shape
-  // the old git files produced, so App Home is unchanged.
+async function loadFleetConfig() {
+  // WAS ALSO loadRoutes(). The routing half is gone — routing is derived per event, so there is
+  // nothing fleet-wide to load for it. What remains is the fleet-wide SKILL catalogue, which App Home
+  // renders from. (The per-agent installs half of this aggregate is no longer read by the view path
+  // either; buildSkillsTab and friends take the agent's own MARKETPLACE row per render.)
   const mktResult = await marketplace.loadMarketplaceDataFromDdb(configDoc(), AGENT_CONFIG_TABLE, { log });
   if (mktResult.error) {
     log.error({ err: mktResult.error }, 'marketplace data load failed');
@@ -428,9 +418,9 @@ async function loadRoutes() {
   }
 }
 
-async function reloadRoutes() {
+async function reloadFleetConfig() {
   return reloadMutex.runExclusive(async () => {
-    await loadRoutes();
+    await loadFleetConfig();
   });
 }
 
@@ -504,14 +494,41 @@ setInterval(() => {
 // duplicated in config-resolver/rekey-to-scope.mjs under a "keep in lockstep" comment. Three copies
 // of an id derivation that MUST agree is three chances for the same human to become two agents.
 
+/**
+ * Does this agent only answer when @mentioned?
+ *
+ * Reads `AGENT#<scope>/CONFIG` per channel message. That is a DynamoDB GetItem on the message path,
+ * including for chatter this is about to drop, and it is deliberate: the flag used to live in an
+ * in-memory set built at boot from the routing GSI, and every in-memory view of DynamoDB in this
+ * codebase has eventually served a stale answer. No cache. If the latency ever matters it becomes a
+ * measured decision with a number attached.
+ *
+ * 54 of every agent in the fleet in the config repo carry this, all of them `archie-*` agents in shared channels
+ * where answering every message would be unbearable. Absent means off, which is what a minted agent
+ * gets and what it already did.
+ *
+ * Fails OPEN (returns false → the agent answers) on a read error, matching the previous behaviour for
+ * an agent missing from the routes table. Failing closed would silence an agent on a transient
+ * DynamoDB error, which is the worse of the two.
+ */
+async function requiresMention(agentId) {
+  if (!AGENT_CONFIG_TABLE || !agentId) return false;
+  try {
+    const { GetCommand } = require('@aws-sdk/lib-dynamodb');
+    const r = await configDoc().send(new GetCommand({
+      TableName: AGENT_CONFIG_TABLE, Key: { pk: `AGENT#${agentId}`, sk: 'CONFIG' },
+    }));
+    if (!r.Item || !r.Item.data) return false;
+    return Boolean(JSON.parse(r.Item.data).require_mention);
+  } catch (err) {
+    log.warn({ agent: agentId, err: err.message }, 'require_mention read failed — treating as not required');
+    return false;
+  }
+}
+
 function resolveAgent(event) {
   const isDM = event.channel_type === 'im';
-  if (isDM) {
-    if (event.user && routes.dmUsers[event.user]) return routes.dmUsers[event.user];
-  } else {
-    if (event.channel && routes.channels[event.channel]) return routes.channels[event.channel];
-  }
-  // No explicit route → spawn/route a dedicated agent for this channel/DM.
+  // DERIVATION, and nothing else. There is no table to consult first: the scope id IS the route.
   return (isDM ? event.user : event.channel) ? mintAgentName(event) : null;
 }
 
@@ -522,12 +539,10 @@ function resolveAgent(event) {
 // is impossible on this path (Slack always supplies the viewer); if it ever happens we fail LOUD
 // rather than guess a persona.
 function homeAgentFor(userId, surface) {
-  const explicit = routes.dmUsers[userId];
-  if (explicit) return explicit;
   if (userId) return mintAgentName({ channel_type: 'im', user: userId });
   // The tripwire is the log + throw. It used to also emit a `DefaultRouteHit` metric, which was
-  // removed with the default-route concept: the metric reported `routes.default`, a field that no
-  // longer exists, and nothing graphed or alarmed on it. The throw is the signal that matters.
+  // removed with the default-route concept: the metric reported a field that no longer exists, and
+  // nothing graphed or alarmed on it. The throw is the signal that matters.
   log.error({ surface, userId }, 'homeAgentFor: no userId — refusing to guess an agent (§8.10 fail-closed)');
   throw new Error(`homeAgentFor: no userId for surface=${surface} — refusing to fall back to a shared default agent (§8.10 fail-closed)`);
 }
@@ -576,8 +591,8 @@ function agentcoreSessionId(sessionKey) {
 // DEFAULT was `false`: any second caller that forgot the flag would have silently produced a turn
 // instructing the agent to use a non-existent tool, and the user would have got nothing at all.
 // A dead branch guarded by an opt-IN is a trap; every AgentCore turn streams, so the branch is gone.
-// (`routes.streamingAgents` is still parsed from config but is only ever echoed in two debug
-// responses — it has never gated a routing decision.)
+// (`streaming` was also parsed from slack.json and echoed in two debug responses; it never gated a
+// routing decision, and it went with the routes table.)
 function buildAgentPayload(event, userProfile, { priorContext = '' } = {}) {
   const type = event.type || 'unknown';
   const channel = event.channel || '';
@@ -1105,7 +1120,9 @@ if (!NO_SOCKET_MODE) {
     // If we mark it processed here and then drop it, the app_mention
     // handler's dedup check would also skip it — silently losing the @mention.
     const isThreadReply = event.thread_ts && event.thread_ts !== event.ts;
-    if (event.channel_type !== 'im' && routes.requireMention.has(event.channel)) {
+    // The flag is per-AGENT now, read from its CONFIG row — it was a channel-keyed in-memory set
+    // built from the routing GSI. Same meaning: the agent for a channel message IS `ch-<channel>`.
+    if (event.channel_type !== 'im' && await requiresMention(resolveAgent(event))) {
       if (!isThreadReply) {
         log.info({ channel: event.channel, user: event.user, ts: event.ts }, 'message skipped: channel requires mention (deferring to app_mention)');
         return;
@@ -2143,10 +2160,10 @@ function resolvePhaseStatus(data) {
 // `dm-<userId>` mint pattern is deliberately NOT reverse-mapped: a user id is not a DM channel id
 // (resolving it needs conversations.open, which is I/O this must not do).
 function routedChannelFor(agentId) {
-  const owned = Object.entries(routes.channels || {})
-    .filter(([, a]) => a === agentId)
-    .map(([channel]) => channel);
-  return owned.length === 1 ? owned[0] : null;
+  // DERIVED, not reverse-scanned. A `ch-` scope is minted from exactly one channel, so the channel is
+  // the suffix uppercased — no table, and the "more than one channel is ambiguous" case cannot exist.
+  const ref = slackRefFromScopeId(agentId);
+  return ref && ref.kind === 'channel' ? ref.id : null;
 }
 
 const cronAlerts = createCronAlertEmitter({ log });
@@ -2377,7 +2394,7 @@ web.post('/simulate', async (req, res) => {
 // overlapping requests wait instead of racing on the clone dir.
 web.post('/reload', async (_req, res) => {
   try {
-    await reloadRoutes();
+    await reloadFleetConfig();
     res.json({ ok: true, routes: summariseRoutes() });
   } catch (err) {
     log.error({ err: err.message }, 'reload failed');
@@ -2393,13 +2410,10 @@ web.get('/debug/streaming', (_req, res) => {
   res.json({ ok: true, sessions: streaming.debugSnapshot(), sessionCount: streaming.sessionCount });
 });
 
+// Routing has no fleet-wide state to summarise any more — it is derived per event. What an operator
+// can still usefully see is which agents exist, which is what the directory holds.
 function summariseRoutes() {
-  return {
-    dm_users: routes.dmUsers,
-    channels: routes.channels,
-    require_mention: [...routes.requireMention],
-    streaming_agents: [...routes.streamingAgents],
-  };
+  return { routing: 'derived per event (dm-<userId> / ch-<channelId>)', agents: agentDirectory.size() };
 }
 
 // ---------- Startup ----------
@@ -2411,7 +2425,7 @@ let slackBotUserId = null;
 
 (async () => {
   try {
-    await reloadRoutes();
+    await reloadFleetConfig();
   } catch (err) {
     log.fatal({ err: err.message }, 'initial config pull failed');
     process.exit(1);

@@ -489,14 +489,16 @@ const CHECKS = [
         };
       }
       const gsis = described.GlobalSecondaryIndexes || [];
-      // 'routing' is a literal in routing-build.js's IndexName, so the NAME is load-bearing
+      // LEGACY CHECK. Nothing reads this index any more: agent enumeration is `AGENT#` keys
+      // (lib/agents.js) and routing is derived per event. Kept only until the GSI itself is dropped
+      // from agent_config.tf, so a table that still declares it is not reported as a fault.
       // (agent_config.tf:35-41).
       const routing = gsis.find((g) => g.IndexName === 'routing');
       if (!routing) {
         return {
           status: FAIL,
           note: `${table} exists but has no "routing" GSI (has: ${gsis.map((g) => g.IndexName).join(', ') || 'none'})`,
-          detail: 'routing-build.js queries IndexName "routing" literally — agent enumeration returns nothing without it',
+          detail: 'no longer load-bearing — nothing reads this index; enumeration is AGENT# keys',
         };
       }
       if (routing.IndexStatus && routing.IndexStatus !== 'ACTIVE') {

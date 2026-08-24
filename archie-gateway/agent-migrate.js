@@ -24,7 +24,6 @@ const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
 const { DynamoDBDocumentClient } = require('@aws-sdk/lib-dynamodb');
-const routingBuild = require('./routing-build');
 const { createAgentCoreClient } = require('./agentcore-client');
 const agentCore = createAgentCoreClient();
 const cronHydrator = require('./cron-hydrator');

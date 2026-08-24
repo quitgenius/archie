@@ -128,7 +128,6 @@ const IMAGES = {
       { path: 'archie-gateway/agentcore-provisioning.js' },
       { path: 'archie-gateway/dispatcher-metrics.js' },
       { path: 'archie-gateway/tracing.js' },
-      { path: 'archie-gateway/routing-build.js' },
       { path: 'archie-gateway/backpressure.js' },
       { path: 'archie-gateway/connector-credential.js' },
       { path: 'archie-gateway/session-tracker.js' },
