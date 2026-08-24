@@ -135,7 +135,11 @@ function createAgentDirectory({ tableName, doc, slack, logger } = {}) {
     do {
       const r = await doc().send(new ScanCommand({
         TableName: tableName,
-        ProjectionExpression: 'pk',
+        // NEVER a bare attribute name in an expression. `pk` is not itself reserved, but the rule is
+        // uniform because knowing the reserved-word list by heart is not a control: an unaliased
+        // `agent` broke every turn for every agent on 2026-08-13.
+        ProjectionExpression: '#pk',
+        ExpressionAttributeNames: { '#pk': 'pk' },
         ExclusiveStartKey,
       }));
       for (const it of r.Items || []) {

@@ -58,7 +58,7 @@ const { derivedSpecFor, specDigestFor, imageUriFor } = require('../lib/spec');
 const { describeImage, assertArm64 } = require('../lib/ecr');
 const { readTaint, taintTag } = require('../lib/image-pointer');
 const { diffObserved } = require('../../archie-gateway/spec-diff');
-const { collectFromDdb } = require('../../archie-gateway/routing-build');
+const { listAgents } = require('../lib/agents');
 const { pkFor: bindingPkFor, skFor: bindingSkFor } = require('../../archie-gateway/runtime-registry');
 const {
   CliError, EXIT, usage, preflight, refused, tainted, headroom,
@@ -315,7 +315,12 @@ const splitList = (v) => String(v || '').split(',').map((s) => s.trim()).filter(
 // ── enumeration ──────────────────────────────────────────────────────────────────────────────────
 
 /**
- * Every known agent, from the routing GSI (`routing-build.js:68`).
+ * Every known agent — `AGENT#` partition keys, via `lib/agents.listAgents`.
+ *
+ * WAS the routing GSI, which cannot answer this: an agent is only in that index if it has an
+ * `AGENT#<scope>/META` row, and META is written only by config-repo hydration, so every MINTED agent
+ * is invisible to it. Measured 2026-08-24: it returned 0 agents while 3 served traffic, so `stage`
+ * staged "0 of 3" and `archie deploy`'s agent half did nothing. See `lib/agents.js`.
  *
  * `stage` covers EVERY known agent — decided, plan §13: "Simpler, and `--keep 1` leaves the quota
  * headroom for it." `--agents` narrows it for canary staging and straggler re-runs, and a name that
@@ -325,7 +330,7 @@ const splitList = (v) => String(v || '').split(',').map((s) => s.trim()).filter(
 async function enumerateAgents(aws, ctx, values, deps = {}, out = null) {
   const roster = (deps.collectAgents
     ? await deps.collectAgents(aws.doc(), ctx.resources.configTable)
-    : await collectFromDdb(aws.doc(), ctx.resources.configTable))
+    : await listAgents(aws.doc(), ctx.resources.configTable))
     .map((r) => r.agent)
     .filter(Boolean);
 
@@ -349,7 +354,7 @@ async function enumerateAgents(aws, ctx, values, deps = {}, out = null) {
     // resolves to a table that exists and is empty, which is indistinguishable from an empty
     // deployment. Losing that hint would trade a loud stop for a silent wrong-target publish.
     if (!roster.length && out) {
-      out.warn(`no agents in the routing GSI of ${ctx.resources.configTable} — staging nothing. Either this `
+      out.warn(`no AGENT# items in ${ctx.resources.configTable} — staging nothing. Either this `
         + 'deployment genuinely has no agents (normal for a fresh account, or after a teardown), or --name '
         + 'points at the wrong one (one knob derives every resource name, lib/context.js), or the config '
         + 'has never been hydrated (`archie config hydrate`).');
