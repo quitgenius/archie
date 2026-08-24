@@ -53,7 +53,7 @@ const {
 } = require('../lib/spec');
 const { describeImage, assertArm64 } = require('../lib/ecr');
 const { diffObserved } = require('../../archie-gateway/spec-diff');
-const { adoptedRootFor } = require('../lib/efs-root');
+const { adoptedRootFor, legacyEfsRootOf } = require('../lib/efs-root');
 const { runtimeIdOf } = require('../../archie-gateway/runtime-registry');
 
 // AgentCore microVMs are arm64. Not overridable — §2.6, Makefile:59-68.
@@ -507,35 +507,6 @@ function defaultRunNode(args, { env, cwd }) {
   });
 }
 
-/**
- * The agent's legacy EFS root, from the item the dispatcher itself reads.
- *
- * THE BLIND SPOT THIS CLOSES. A §8.10-rekeyed agent (`dm-u01…`) carries `AGENT#<id>/META.efsRoot` =
- * its FORMER name, and the provisioning saga mounts THAT directory so the rekeyed agent keeps its
- * workspace, memory and sessions (`agentcore-client.js:621-630,862-868`). Derivation cannot know
- * that — `derivedSpecFor` always derives `efsRootDir(agent, prefix)` — so a comparison would report a
- * phantom `efsRoot` change for every rekeyed agent, and this command BLOCKS on `efsRoot` changes.
- * Left unhandled it would turn the loudest refusal in the CLI into a false alarm that operators learn
- * to route around, which is worse than not having it. `cmd/stage.js:516-529` does exactly this, for
- * exactly this reason, on the same item.
- */
-async function legacyEfsRootOf(aws, ctx, agent) {
-  const { GetCommand } = require('@aws-sdk/lib-dynamodb');
-  try {
-    const r = await aws.doc().send(new GetCommand({
-      TableName: ctx.resources.configTable,
-      Key: { pk: `AGENT#${agent}`, sk: 'META' },
-    }));
-    if (!r.Item || !r.Item.data) return null;
-    const meta = JSON.parse(r.Item.data);
-    return meta && typeof meta.efsRoot === 'string' && meta.efsRoot ? meta.efsRoot : null;
-  } catch {
-    // Best effort BY CONSTRUCTION, and the direction of the failure is the point: an unreadable META
-    // means we cannot PROVE the difference is a legacy adopt, and an unproven `efsRoot` difference
-    // stays data loss and stays blocking.
-    return null;
-  }
-}
 
 /** Does `root` look like the adopted legacy directory `<prefix>/<legacyName>`? */
 const isLegacyAdopt = (root, legacy) => Boolean(root && legacy && String(root).endsWith(`/${legacy}`));

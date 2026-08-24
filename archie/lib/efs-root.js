@@ -31,7 +31,24 @@ const looksAdopted = (root, legacy) => Boolean(root && legacy && String(root).en
  * The agent's legacy EFS root, from the item the dispatcher itself reads
  * (`agentcore-client.js:621-630` consults exactly this to decide an agent's access-point root).
  *
- * Best effort by construction — see the note above on which direction the uncertainty must fall.
+ * THE BLIND SPOT THIS CLOSES. A §8.10-rekeyed agent (`dm-u01…`) carries `AGENT#<id>/META.efsRoot` =
+ * its FORMER name, and the provisioning saga mounts THAT directory so the rekeyed agent keeps its
+ * workspace, memory and sessions. Derivation cannot know that — `derivedSpecFor` always derives
+ * `efsRootDir(agent, prefix)` — so a comparison reports a phantom `efsRoot` change for every rekeyed
+ * agent, and `fleet drift` BLOCKS on efsRoot changes. Left unhandled it would turn the loudest
+ * refusal in the CLI into a false alarm operators learn to route around, which is worse than not
+ * having it.
+ *
+ * Best effort BY CONSTRUCTION, and the direction of the failure is the point: an unreadable META
+ * means we cannot PROVE the difference is a legacy adopt, and an unproven `efsRoot` difference stays
+ * data loss and stays blocking.
+ *
+ * ONE IMPLEMENTATION, and now actually one. There were THREE byte-identical copies — here,
+ * cmd/fleet.js and cmd/stage.js — while THIS file's header claimed to be the only one. fleet.js gave
+ * it away: it already imported `adoptedRootFor` from here, and `adoptedRootFor` calls this, so it ran
+ * both copies in the same call graph. Three copies of the function that decides "legacy adopt, or
+ * data loss?" is three chances for that answer to diverge, visible only as a false block or a missed
+ * one.
  */
 async function legacyEfsRootOf(aws, ctx, agent) {
   const { GetCommand } = require('@aws-sdk/lib-dynamodb');

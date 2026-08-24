@@ -59,11 +59,9 @@ async function phaseConfig() {
 
 async function agentList() {
   if (agentsArg) return agentsArg.split('=')[1].split(',').map((s) => s.trim()).filter(Boolean);
-  // `AGENT#` keys are the complete agent list (archie/lib/agents.js). Was the routing GSI, which
-  // cannot see a minted agent. Local-only script, so requiring across trees is fine.
-  const { listAgents } = require('../archie/lib/agents');
-  const rows = await listAgents(doc, TABLE);
-  return rows.map((r) => r.agent);
+  // `AGENT#` keys are the complete agent list. Was the routing GSI, which cannot see a minted agent.
+  const { scanAgentScopes } = require('./agent-directory');
+  return scanAgentScopes(doc, TABLE);
 }
 
 async function phaseRuntimes(agents) {

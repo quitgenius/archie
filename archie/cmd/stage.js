@@ -54,6 +54,7 @@
 //     exception; the test file asserts that structurally, and an e2e is the real gate.
 
 const { scanBindings, tagOf } = require('../lib/bindings');
+const { legacyEfsRootOf } = require('../lib/efs-root');
 const { derivedSpecFor, specDigestFor, imageUriFor } = require('../lib/spec');
 const { describeImage, assertArm64 } = require('../lib/ecr');
 const { readTaint, taintTag } = require('../lib/image-pointer');
@@ -557,34 +558,6 @@ const nowIso = (deps) => new Date(deps.now ? deps.now() : Date.now()).toISOStrin
 
 // ── the read-back ────────────────────────────────────────────────────────────────────────────────
 
-/**
- * The agent's legacy EFS root, when it has one.
- *
- * §8.10 rekey: a scope-keyed agent (`dm-u0…`) carries `META.efsRoot` = its FORMER name, and the saga
- * mounts THAT directory so the rekeyed agent keeps its workspace, memory and sessions
- * (`agentcore-client.js:621-630, 862-868`). The tag's declared spec cannot know that — it
- * derives `efsRootDir(agent, prefix)` — so the read-back would report a phantom `efsRoot` change for
- * every rekeyed agent and fail them all. Read the SAME META item the dispatcher reads, and only when
- * the read-back actually disagreed about `efsRoot`: proving the difference is an adopted legacy root
- * costs one GetItem on an exceptional path, and guessing would be indistinguishable from real drift
- * (pointing the fleet at a different EFS root is how a side-by-side migration cuts over).
- */
-async function legacyEfsRootOf(aws, ctx, agent) {
-  const { GetCommand } = require('@aws-sdk/lib-dynamodb');
-  try {
-    const r = await aws.doc().send(new GetCommand({
-      TableName: ctx.resources.configTable,
-      Key: { pk: `AGENT#${agent}`, sk: 'META' },
-    }));
-    if (!r.Item || !r.Item.data) return null;
-    const meta = JSON.parse(r.Item.data);
-    return meta && typeof meta.efsRoot === 'string' && meta.efsRoot ? meta.efsRoot : null;
-  } catch {
-    // Best effort by construction: an unreadable META means we cannot PROVE the difference is a
-    // legacy adopt, and an unproven difference stays drift.
-    return null;
-  }
-}
 
 /**
  * Assert the runtime AWS actually created is the one the tag declared.

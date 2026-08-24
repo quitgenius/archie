@@ -69,6 +69,47 @@ function composeLabel(name, scopeId) {
 }
 
 /**
+ * EVERY AGENT: the distinct `AGENT#<scope>` partition keys. THE agent list, for this module and for
+ * the `archie` CLI, which imports it from here.
+ *
+ * It lives in the gateway rather than the CLI on purpose: the CLI already requires gateway modules
+ * (that is the established direction — `runtime-registry`, `spec-diff`, `agentcore-client`), and the
+ * gateway's lint stage only copies `archie-gateway/`, so a require pointing the other way fails the
+ * build. It also replaced `routing-build.collectFromDdb`, which lived here for exactly these reasons.
+ *
+ * ProjectionExpression does not reduce the read cost — DynamoDB bills the whole item either way — it
+ * reduces the payload, which matters because SEED rows carry a whole workspace skeleton.
+ *
+ * Sorted, so callers that report or iterate are deterministic.
+ */
+async function scanAgentScopes(doc, tableName) {
+  const { ScanCommand } = require('@aws-sdk/lib-dynamodb');
+  const found = new Set();
+  let ExclusiveStartKey;
+  let pages = 0;
+  do {
+    const r = await doc.send(new ScanCommand({
+      TableName: tableName,
+      // NEVER a bare attribute name in an expression. `pk` is not itself reserved, but the rule is
+      // uniform because knowing the reserved-word list by heart is not a control: an unaliased
+      // `agent` broke every turn for every agent on 2026-08-13.
+      ProjectionExpression: '#pk',
+      ExpressionAttributeNames: { '#pk': 'pk' },
+      ExclusiveStartKey,
+    }));
+    for (const it of r.Items || []) {
+      const pk = it && it.pk;
+      if (typeof pk === 'string' && pk.startsWith(AGENT_PK_PREFIX)) {
+        const scope = pk.slice(AGENT_PK_PREFIX.length);
+        if (scope) found.add(scope);
+      }
+    }
+    ExclusiveStartKey = r.LastEvaluatedKey;
+  } while (ExclusiveStartKey && ++pages < MAX_PAGES);
+  return [...found].sort();
+}
+
+/**
  * @param deps.tableName the single config table (AGENT_CONFIG_TABLE).
  * @param deps.doc       () => DynamoDBDocumentClient — a GETTER, so the client stays lazy and tests
  *                       can inject a fake without constructing an SDK client.
@@ -120,39 +161,7 @@ function createAgentDirectory({ tableName, doc, slack, logger } = {}) {
 
   // ---------- boot ----------
 
-  /**
-   * Every distinct `AGENT#<scope>` partition key. One Scan, projected to the keys.
-   *
-   * ProjectionExpression does not reduce the read cost (DynamoDB bills the whole item either way) —
-   * it reduces the payload, which is the part that matters when SEED rows carry a whole workspace
-   * skeleton. The table is small: 57 items in the sandbox, order-of-1500 in prod, one or two pages.
-   */
-  async function scanScopeIds() {
-    const { ScanCommand } = cmds();
-    const found = new Set();
-    let ExclusiveStartKey;
-    let pages = 0;
-    do {
-      const r = await doc().send(new ScanCommand({
-        TableName: tableName,
-        // NEVER a bare attribute name in an expression. `pk` is not itself reserved, but the rule is
-        // uniform because knowing the reserved-word list by heart is not a control: an unaliased
-        // `agent` broke every turn for every agent on 2026-08-13.
-        ProjectionExpression: '#pk',
-        ExpressionAttributeNames: { '#pk': 'pk' },
-        ExclusiveStartKey,
-      }));
-      for (const it of r.Items || []) {
-        const pk = it && it.pk;
-        if (typeof pk === 'string' && pk.startsWith(AGENT_PK_PREFIX)) {
-          const scope = pk.slice(AGENT_PK_PREFIX.length);
-          if (scope) found.add(scope);
-        }
-      }
-      ExclusiveStartKey = r.LastEvaluatedKey;
-    } while (ExclusiveStartKey && ++pages < MAX_PAGES);
-    return [...found];
-  }
+  const scanScopeIds = () => scanAgentScopes(doc(), tableName);
 
   /**
    * Bulk-label in two paginated calls rather than one lookup per scope.
@@ -331,4 +340,4 @@ function createAgentDirectory({ tableName, doc, slack, logger } = {}) {
   };
 }
 
-module.exports = { createAgentDirectory, composeLabel, OPTION_TEXT_MAX, SEARCH_LIMIT };
+module.exports = { createAgentDirectory, scanAgentScopes, composeLabel, OPTION_TEXT_MAX, SEARCH_LIMIT };
