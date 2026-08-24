@@ -538,7 +538,7 @@ const sessions = new Map(); // sessionKey -> { session, turnCtx, skillFp } (per-
 // `model` rides here so a FAILED skill read does not silently drop the picked model out of the
 // config fingerprint — dropping it would flip the fp, force a re-resolve, then flip it back on the
 // next successful read: two needless re-resolves from one transient DynamoDB error.
-let skillState = { fp: null, model: null }; // last skill-fingerprint materialized onto SKILLS_DIR (this microVM)
+let skillState = { fp: null, marketplace: null }; // last skill-fingerprint materialized onto SKILLS_DIR (this microVM)
 let configState = { fp: null }; // last config-fingerprint bound into this microVM's live config
 
 // Bind the resolved config for AGENT_NAME -> model + tool allow-set + plugin routing.
@@ -1030,9 +1030,9 @@ function ensureEfsReady() {
  */
 export { configFingerprint };
 
-async function readConfigState(io, model) {
+async function readConfigState(io, marketplace) {
   const { agent } = await io.readConfigItems();
-  return { fp: configFingerprint(agent, model) };
+  return { fp: configFingerprint(agent, marketplace) };
 }
 
 // Re-read the config items and re-bind. `force` bypasses agent-config's memo (the whole point of the
@@ -1070,12 +1070,16 @@ async function readSkillState(io, allowedSkills = null, governedSkills = null) {
     onPermissionSignal({ capability: `skill:${skillId}`, surface: 'skill', tool: skillId, reason: 'policy-denied', decision: 'deny' });
   });
   const { fp, names } = skillFingerprint(filtered, man);
-  // `models` rides back with the skill read because it lives on the SAME item and the App Home
-  // model picker writes it (marketplace.js setModel). It is deliberately NOT folded into the skill
-  // fingerprint — that one keys the /tmp skill materialisation, and a model change must not force
-  // a needless re-hydrate. It goes to the CONFIG fingerprint instead, which is what re-resolves the
-  // config. See readConfigState.
-  return { fp, names, manifest: man, model: (mkt && mkt.models) || null };
+  // THE WHOLE MARKETPLACE ITEM rides back, not a slice of it. It lives on the same item this read
+  // already fetched, so carrying all of it costs nothing, and every field on it that config
+  // resolution consumes — `.models` (the picker), `.connectors` (connector toolkits, plugin-slice.mjs:100),
+  // `.customMcp` — reaches the CONFIG fingerprint by construction rather than by someone remembering
+  // to add it. Two silent outages came from that list being hand-maintained; see config-fingerprint.mjs.
+  //
+  // It is still NOT folded into the SKILL fingerprint: that one keys the /tmp skill materialisation,
+  // and a model or connector change must not force a needless re-hydrate. The split stays; only the
+  // config half's input selection changed.
+  return { fp, names, manifest: man, marketplace: mkt || null };
 }
 
 // (Re)materialize the agent's installed skills onto /tmp (scoped: installs written, others pruned),
@@ -1122,16 +1126,16 @@ async function getSession(key, seed = {}) {
     console.error(JSON.stringify({ level: 'warn', component: 'pi-adapter', msg: 'skill fingerprint read failed — using cached session / current skills', key, err: e.message }));
     const cachedOnErr = sessions.get(key);
     if (cachedOnErr) return cachedOnErr;
-    skill = { fp: skillState.fp, names: [], manifest: { skills: {} }, model: skillState.model };
+    skill = { fp: skillState.fp, names: [], manifest: { skills: {} }, marketplace: skillState.marketplace };
   }
   // Remember the picked model on EVERY successful read, not inside hydrateSkills — that early-returns
   // whenever the skill fingerprint is unchanged, which is exactly the case where only the model moved.
-  if (skill.model !== undefined) skillState.model = skill.model;
+  if (skill.marketplace !== undefined) skillState.marketplace = skill.marketplace;
   // Same discipline as the skill read: a config-fingerprint failure keeps whatever is already
   // resolved rather than dropping the turn or re-resolving blindly.
   let cfg = { fp: configState.fp };
   try {
-    cfg = await readConfigState(io, skill.model);
+    cfg = await readConfigState(io, skill.marketplace);
   } catch (e) {
     console.error(JSON.stringify({ level: 'warn', component: 'pi-adapter', msg: 'config fingerprint read failed — keeping current config', key, err: e.message }));
   }
