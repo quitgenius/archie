@@ -99,6 +99,35 @@ describe('buildConversationsTab pagination', () => {
     expect(blocks.some((b) => b.type === 'actions')).toBe(false);
     expect(JSON.stringify(blocks)).toContain('No conversations yet');
   });
+
+  // A `ch-` scope's empty tab is not "empty yet" — it is empty BY CONSTRUCTION. This store is
+  // DM-only: recordConversation/updateActivity have one call site each, both inside
+  // `if (event.channel_type === 'im')`, and app_mention records nothing. Verified live 2026-08-24 —
+  // /efs/conversations.json held exactly one key, a dm- scope, despite an active channel agent.
+  //
+  // So the generic message told a channel agent's viewer to "send a DM to get started", advice that
+  // cannot work for an agent whose whole existence is a channel, making an empty tab read as a broken
+  // one. Invisible until App Home could target another agent.
+  it('tells a CHANNEL agent why its tab is empty, instead of telling it to send a DM', () => {
+    const blocks = conversations.buildConversationsTab('ch-cr89fluhion', TEAM, {});
+    const text = JSON.stringify(blocks);
+    expect(text).toContain('only tracked for DM agents');
+    expect(text).not.toContain('Send a DM to get started');
+    expect(blocks.some((b) => b.type === 'actions')).toBe(false);
+  });
+
+  it('keeps the generic message for a scope it cannot classify', () => {
+    // Not dm-, not ch- (a BDD fixture, or any non-Slack-minted id). Claiming "this agent answers in
+    // its channel" would be asserting something unknown, so the generic text stands.
+    for (const id of ['bdd-tests', 'test-agent']) {
+      expect(JSON.stringify(conversations.buildConversationsTab(id, TEAM, {}))).toContain('No conversations yet');
+    }
+  });
+
+  it('a DM agent still gets the original message', () => {
+    expect(JSON.stringify(conversations.buildConversationsTab('dm-ux0mz5ckp2r', TEAM, {})))
+      .toContain('No conversations yet');
+  });
 });
 
 describe('buildConversationsTab block budget', () => {

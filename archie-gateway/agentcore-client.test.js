@@ -1487,3 +1487,98 @@ describe('observedSpecOf — reading a live runtime\'s ACTUAL spec back from AWS
     expect(specs[OLD].image).toBe('repo:v1');
   });
 });
+
+describe('the POLICY row write is an UpdateItem, because that is the permission we have', () => {
+  // STRUCTURAL, because it cannot be behavioural: setClientsForTest sets `_faked`, and ensurePolicyRow
+  // returns { reason: 'no-table' } immediately when faked — so no injected double can reach the write.
+  //
+  // Worth pinning anyway. This wrote with PutCommand against a role that holds UpdateItem and NOT
+  // PutItem (the same constraint marketplace.js and the §9.9a seed pre-write record), so EVERY policy
+  // row write failed with AccessDeniedException — non-fatally, and invisibly, because a second bug
+  // upstream (rowFromMemberships throwing on an unknown group name) surfaced first and masked it.
+  //
+  // Since an absent row now means DENY-ALL, this is the difference between a working agent and one that
+  // cannot read a file. And the dispatcher is the ONLY writer for minted scopes, which no deploy can
+  // enumerate — measured live: dm-ux0mz5ckp2r and ch-c39t04uyfgs were both dead this way.
+  const src = require('node:fs').readFileSync(require.resolve('./agentcore-client.js'), 'utf8');
+  // END ANCHOR FOUND FORWARD FROM THE START, not by naming the next function. The first version sliced
+  // to `resolveEfsRootFromMeta`, which sits EARLIER in the file — so the slice was empty and the
+  // assertions passed against '' until the negation ones failed. A test that reads nothing looks green.
+  const start = src.indexOf('async function ensurePolicyRow');
+  const after = src.indexOf('\n  async function ', start + 1);
+  const ensureBody = src.slice(start, after > start ? after : start + 4000);
+
+  it('uses UpdateCommand and never PutCommand', () => {
+    expect(ensureBody).toMatch(/new UpdateCommand\(/);
+    expect(ensureBody).not.toMatch(/new PutCommand\(/);
+  });
+
+  it('carries no ConditionExpression — it must OVERWRITE a moved digest', () => {
+    // The seed pre-write is create-only (attribute_not_exists) on purpose; this is the opposite case.
+    // A condition here would make a policy change silently fail to reach any scope that already had a row.
+    expect(ensureBody).not.toMatch(/ConditionExpression/);
+  });
+
+  it('aliases the reserved attribute name', () => {
+    // `data` is fine unaliased, but an unaliased attribute is how the 2026-08-13 fleet-wide outage
+    // happened (a bare `agent`), so the expression is asserted to use a placeholder either way.
+    expect(ensureBody).toMatch(/ExpressionAttributeNames/);
+    expect(ensureBody).toMatch(/SET #d = :d/);
+  });
+
+  // ── no caches, and every outcome reported ──────────────────────────────────────────────────────
+  //
+  // Both properties exist because their absence was undetectable. The per-agent digest memo returned
+  // 'cached' WITHOUT reading the row, so a teardown that deleted the row out of band was never noticed
+  // again; and four of the five outcomes logged nothing, so the resulting deny-all looked exactly like a
+  // healthy scope. Measured live on dm-ux0mz5ckp2r: PolicyDenyAll=1 across 14:25-14:50Z on 2026-08-20,
+  // with not one line matching /policy/ in the dispatcher log group for the whole of that day.
+  it('caches neither the artifact nor the per-agent digest', () => {
+    const whole = src;
+    // The memo, by name and by shape. Only the historical comment may mention it.
+    expect(whole).not.toMatch(/^\s*const lastPolicyDigest/m);
+    expect(ensureBody).not.toMatch(/lastPolicyDigest/);
+    // The artifact read: no timestamp, no expiry window, no memo slot.
+    const pa = whole.slice(whole.indexOf('async function policyArtifact'));
+    const paBody = pa.slice(0, pa.indexOf('\n  }') + 4);
+    expect(paBody).not.toMatch(/TTL|_policyArtifactAtMs|Date\.now\(\)/);
+    // It must actually issue the read every call — not return an early-cached value.
+    expect(paBody).toMatch(/GetCommand/);
+  });
+
+  it('routes every non-write through the reporting helper', () => {
+    for (const reason of ['no-table', 'no-artifact', 'current']) {
+      expect(ensureBody).toContain(`noWrite('${reason}'`);
+    }
+    // A hand-rolled `return { written: false, ... }` is how a silent branch gets re-added. Exactly two
+    // are legitimate: `noWrite`'s own return, and the catch — which carries `error:` and has its own warn
+    // naming the failure (routing it through noWrite would replace that message with something vaguer).
+    const bare = ensureBody.match(/return \{ written: false[^}]*\}/g) || [];
+    expect(bare.length).toBeGreaterThan(0); // the anchor found the body, not an empty slice
+    const allowed = ['reason, ...extra', 'error:'];
+    for (const r of bare) expect(allowed.some((a) => r.includes(a))).toBe(true);
+  });
+
+  it('warns — not debugs — when NO row can be written for any scope', () => {
+    // no-artifact / no-table mean the whole account is deny-all, so they must be visible at the default
+    // level. `current` is the healthy steady state and would be one line per turn per agent.
+    expect(ensureBody).toMatch(/no-artifact'\s*\|\|\s*reason === 'no-table'\)\s*\?\s*'warn'\s*:\s*'debug'/);
+  });
+});
+
+describe('ensurePolicyRow reports the no-op it took', () => {
+  // BEHAVIOURAL for the one branch a fake can reach: setClientsForTest sets `_faked`, which is the
+  // `no-table` path. The others need a real doc client and stay structural above.
+  it('logs the reason instead of returning silently', async () => {
+    c.setClientsForTest(fakeAwsClients({ listResult: () => ({ agentRuntimes: [] }) }));
+    const warn = [];
+    const r = await c.ensurePolicyRow('dm-ux0mz5ckp2r', {
+      logger: { warn: (o, m) => warn.push({ o, m }), info: () => {}, debug: () => {} },
+    });
+    expect(r).toMatchObject({ written: false, reason: 'no-table' });
+    expect(warn).toHaveLength(1);
+    expect(warn[0].m).toBe('policy row not written (no-table)');
+    // The AGENT is on the line. Without it the warning says the fleet is broken but not for whom.
+    expect(warn[0].o).toMatchObject({ agent: 'dm-ux0mz5ckp2r', reason: 'no-table' });
+  });
+});

@@ -82,7 +82,12 @@ async function runEphemeralTask(opts) {
 
     const container = (finished.containers || [])[0] || {};
     const exitCode = container.exitCode;
-    const tail = logs ? await tailLogs({ logs, logGroup, streamPrefix, taskArn, out }) : [];
+    // The CONTAINER NAME is part of the stream path, so it comes from the definition being run rather
+    // than a constant. It was hardcoded to 'cron-hydrator', which meant the second kind of ephemeral
+    // task (`cron-purge`, teardown) looked up a stream that does not exist and silently reported no
+    // output — the run had worked, and the CLI said it could not tell.
+    const containerName = ((taskDefinition.containerDefinitions || [])[0] || {}).name;
+    const tail = logs ? await tailLogs({ logs, logGroup, streamPrefix, containerName, taskArn, out }) : [];
 
     if (exitCode !== 0) {
       throw new CliError(`the task exited ${exitCode === undefined ? 'without an exit code' : exitCode}`, {
@@ -141,11 +146,18 @@ async function waitForStop({ ecs, cluster, taskArn, out, now, sleep, budgetMs, p
  * The stream name is `<prefix>/<container>/<taskId>` — ECS's convention, not a guess, but derived
  * rather than looked up because ListLogStreams on a busy group is a paged scan for one known name.
  */
-async function tailLogs({ logs, logGroup, streamPrefix, taskArn, out }) {
+async function tailLogs({ logs, logGroup, streamPrefix, containerName, taskArn, out }) {
   if (!logGroup) return [];
   const { GetLogEventsCommand } = require('@aws-sdk/client-cloudwatch-logs');
   const taskId = arnTail(taskArn);
-  const streamName = `${streamPrefix}/cron-hydrator/${taskId}`;
+  if (!containerName) {
+    // Refusing to guess: a wrong container name reads as "the task wrote nothing", which is the exact
+    // false negative this parameter exists to remove.
+    out.warn(`cannot locate the log stream for ${arnTail(taskArn)} — the task definition declared no `
+      + 'container name, so the task\'s own output is not included below');
+    return [];
+  }
+  const streamName = `${streamPrefix}/${containerName}/${taskId}`;
   try {
     const res = await logs.send(new GetLogEventsCommand({
       logGroupName: logGroup, logStreamName: streamName, startFromHead: true, limit: 300,

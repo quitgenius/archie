@@ -33,6 +33,12 @@
 //   6. PENDING healthchecks — `pending` asserts nothing was ever invoked, and control-plane READY is
 //      not serving-ready. That gap is exactly what the check exists to catch.
 //
+// 3-6 ARE SKIPPED WHEN THE DEPLOYMENT HAS NO AGENTS. All four protect a real agent from an unverified
+// image, and an empty deployment has none — while refusing leaves it unable to ever publish, since
+// staging needs an agent and a new agent mints onto the pointer as it already stands. 1-2 still apply:
+// they are properties of the artefact, not of who runs it. It warns, loudly, because the agent count is
+// the whole safety argument and a wrong `--name` produces a zero count. See `publishRefusal`.
+//
 // `--hotfix` is GONE from publishing, deliberately. It was a label on the pointer, recorded and
 // never gated on: no rail consulted it. Narrowing COVERAGE is a staging concern and still exists
 // there (`archie fleet deploy --hotfix` stages one canary, and healthchecks it exactly as a full
@@ -49,6 +55,9 @@ const {
   readFleetPointer, readTaint, listTaints, taintTag, publishFleetPointer,
 } = require('../lib/image-pointer');
 const { scanBindings, bindingStats, byTag, stateOf } = require('../lib/bindings');
+// The routing GSI query, reused rather than reimplemented — the same import cmd/stage.js, cmd/policy.js
+// and cmd/status.js make. Two spellings of "which agents exist" is how the gate and the roster drift.
+const { listAgents } = require('../lib/agents');
 
 // How long a published pointer takes to reach every turn: the dispatcher caches it with a short TTL
 // and a background refresher (`image-source.js`). Reported so nobody watches Slack for 30s wondering
@@ -93,9 +102,32 @@ function requireTag(args, verb) {
  * control limit with two implementations is a control limit with a bypass, and "there is no force
  * flag" has to be true of the code and not only of the flags (§5.1). Composing it here means this
  * file cannot be given a gate of its own by a later edit — there is nowhere to put one.
+ *
+ * ── THE ONE BYPASS ──────────────────────────────────────────────────────────────────────────────
+ *
+ * `fleetAgents === 0` SKIPS the staging and health checks (3-6), and only those.
+ *
+ * Every one of 3-6 asks the same question — "would this flip put a REAL agent on an image nothing has
+ * verified?" — and when the deployment holds no agents at all there is no such agent to protect. The
+ * checks then refuse for the one reason that is not a problem, and refuse permanently: staging needs an
+ * agent, a new agent mints onto whatever the pointer already names, so an empty deployment can never
+ * publish anything and is pinned to its last pointer forever. Measured: this sandbox sat on a 19 Aug
+ * image with `0 routed + 1 minted-only` scopes, and after that scope was torn down it had none at all.
+ *
+ * TAINT AND THE IMAGE ITSELF (1-2) STILL APPLY, unconditionally. Those are properties of the ARTEFACT,
+ * not of who might run it: a tainted, missing or amd64 image is just as unpublishable into an empty
+ * deployment, and the first agent to mint would be the one to discover it.
+ *
+ * `null` (the default), NOT 0, is "the caller did not say" — so a caller that has not been taught to
+ * count keeps the full gate rather than silently inheriting the bypass.
+ *
+ * WHAT THIS COSTS, stated because it is a real hole: the count is what makes it safe, so a WRONG count
+ * is a bypass. `--name` selects the config table (lib/context.js), so pointing it at a deployment that
+ * does not exist yields an empty table, zero agents, and a publish that now proceeds where it used to
+ * refuse. The callers warn loudly for exactly that reason — see `emptyFleetWarning`.
  */
 function publishRefusal({
-  tag, found, taint, stats, imageUri,
+  tag, found, taint, stats, imageUri, fleetAgents = null,
 }) {
   // 1. TAINT. First, and before anything else is reported: a tainted tag is unpublishable whatever
   //    else is true of it, and every other message would be a distraction from that one.
@@ -120,6 +152,10 @@ function publishRefusal({
       detail: 'this is almost always the amd64 dispatcher image published by mistake.',
     });
   }
+
+  // 2a. AN EMPTY DEPLOYMENT. Checks 3-6 all protect a real agent from an unverified image; there is
+  //     none to protect, so they are skipped rather than refusing forever. See the header.
+  if (fleetAgents === 0) return null;
 
   // 3. NEVER STAGED. Bindings are what the turn path reads, so a tag with none is a pointer at
   //    nothing: every agent would provision from cold, unhealthchecked, on its next message.
@@ -157,6 +193,21 @@ function publishRefusal({
   return null;
 }
 
+/**
+ * The line every caller of `publishRefusal` must print when the bypass above applies. ONE wording, two
+ * call sites (`image publish` and `fleet deploy`), because the gate is pure and cannot print.
+ *
+ * STDERR, via out.warn, not stdout. `--json` reserves stdout for a single buffered envelope
+ * (lib/output.js:37-41) precisely so a command that fails midway cannot emit a half-document, so a
+ * warning written there would corrupt the one output a script parses. The publish RESULT carries
+ * `healthcheckSkipped` for that reader instead.
+ */
+const emptyFleetWarning = (tag, table) => `no agents in ${table} — the healthcheck gate is SKIPPED and `
+  + `${tag} is being published unverified. Nothing is staged, nothing was invoked, and no agent has run `
+  + 'this image. The first agent to mint will be the first to run it. If you did not expect an empty '
+  + 'deployment, check --name: it selects the config table, and a name that resolves to nothing looks '
+  + 'exactly like a deployment with no agents.';
+
 // ── image publish ────────────────────────────────────────────────────────────────────────────────
 
 async function publish(ctx, args, out, deps = {}) {
@@ -166,17 +217,27 @@ async function publish(ctx, args, out, deps = {}) {
   const account = await resolveAccount(ctx, aws);
   const uri = imageUriFor(ctx, account, tag);
 
-  const [taint, found, rows] = await Promise.all([
+  const [taint, found, rows, roster] = await Promise.all([
     readTaint(aws.doc(), aws.docCmds, table, tag),
     describeImage(aws, { account, repo: ctx.resources.agentRepo, tag }),
     scanBindings(aws, ctx),
+    // ROUTED AGENTS TOO, not just bound ones. Bindings alone would count a routed-but-never-staged
+    // agent as absent — and that agent is exactly the one the gate exists for: it has a scope
+    // identity, it will take a turn, and it would mint onto this pointer having verified nothing.
+    // `deps.collectAgents` is the test seam cmd/stage.js already uses for the same query.
+    (deps.collectAgents || listAgents)(aws.doc(), table),
   ]);
   const mine = (byTag(rows).get(tag) || []);
   const stats = bindingStats(mine);
-  const fleetAgents = new Set(rows.map((r) => r.agent)).size;
+  const fleetAgents = new Set([
+    ...rows.map((r) => r.agent),
+    ...(roster || []).map((r) => r.agent),
+  ].filter(Boolean)).size;
 
-  const refusal = publishRefusal({ tag, found, taint, stats, imageUri: uri });
+  const refusal = publishRefusal({ tag, found, taint, stats, imageUri: uri, fleetAgents });
   if (refusal) throw refusal;
+  const healthcheckSkipped = fleetAgents === 0;
+  if (healthcheckSkipped) out.warn(emptyFleetWarning(tag, table));
 
   const previous = await readFleetPointer(aws.doc(), aws.docCmds, table);
   const at = nowIso(deps);
@@ -188,20 +249,23 @@ async function publish(ctx, args, out, deps = {}) {
     + `  coverage ${stats.live}/${fleetAgents}  health ${stats.ok} ok / ${stats.failed} failed`,
     `previous  ${(previous && previous.tag) || 'none'}`,
   ];
+  // ON THE ANSWER, not only in the warning. The warning is stderr and a script does not read it, so
+  // without this line a --json consumer cannot tell a gated publish from an ungated one.
+  if (healthcheckSkipped) head.push('gate      SKIPPED — no agents in this deployment, nothing verified this image');
 
   // Already live: nothing to write. Checked AFTER the gate on purpose — re-publishing must be a
   // clean no-op (`fleet deploy` composes this), but a LIVE tag that has since been tainted or reaped
   // must still refuse loudly rather than be waved through as "already there".
   if (previous && previous.tag === tag) {
     out.progress(`${tag} is already live (published ${previous.publishedAt || 'unknown'}) — nothing written`);
-    answer(out, ctx, { ...pointer, publishedAt: previous.publishedAt || null, publishedBy: previous.publishedBy || null, written: false, unchanged: true },
+    answer(out, ctx, { ...pointer, publishedAt: previous.publishedAt || null, publishedBy: previous.publishedBy || null, written: false, unchanged: true, healthcheckSkipped },
       [...head, `written   nothing — already live since ${previous.publishedAt || 'unknown'}`].join('\n'));
     return undefined;
   }
 
   if (ctx.dryRun) {
     out.progress(`would write ${IMAGE_PK} / ${FLEET_SK}  tag=${tag}`);
-    answer(out, ctx, { ...pointer, written: false, dryRun: true },
+    answer(out, ctx, { ...pointer, written: false, dryRun: true, healthcheckSkipped },
       [...head, 'written   nothing (dry run)', `effective would be within ~${POINTER_TTL_SECONDS}s`].join('\n'));
     return undefined;
   }
@@ -232,7 +296,7 @@ async function publish(ctx, args, out, deps = {}) {
   }
 
   out.progress(`published ${IMAGE_PK} / ${FLEET_SK} → ${tag}`);
-  answer(out, ctx, { ...pointer, written: true },
+  answer(out, ctx, { ...pointer, written: true, healthcheckSkipped },
     [...head, `written   ${IMAGE_PK} / ${FLEET_SK}`, `effective within ~${POINTER_TTL_SECONDS}s, on each agent's next turn`].join('\n'));
   return undefined;
 }
@@ -391,5 +455,8 @@ function values_limit(args) {
 module.exports = {
   publish, taint, show, list,
   publishRefusal,
+  // Exported for the SAME reason as the gate: `fleet deploy` evaluates the bypass too, and must say the
+  // same thing when it fires. Two wordings for one condition is how one of them goes stale.
+  emptyFleetWarning,
   'image publish': publish, 'image taint': taint, 'image show': show, 'image list': list,
 };

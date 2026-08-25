@@ -55,11 +55,11 @@ const { createImageSource } = require('./image-source');
 const { createTurnQueue } = require('./turn-queue');
 const { createSessionTracker } = require('./session-tracker');
 const { createCronHome } = require('./cron-home');
-const { mintAgentName } = require('./agent-scope');
+const { mintAgentName, normaliseScopeId, slackRefFromScopeId } = require('./agent-scope');
+const { createAgentDirectory } = require('./agent-directory');
 const { diffObserved, specDiff } = require('./spec-diff');
 const { createDispatcherMetrics } = require('./dispatcher-metrics');
 const { createRuntimeQuotaSampler } = require('./runtime-quota-metrics');
-const routingBuild = require('./routing-build');
 const { generateFileRef: _generateFileRef, parseFileRef } = require('./file-ref');
 const { Readable } = require('node:stream');
 const { pipeline } = require('node:stream/promises');
@@ -238,6 +238,22 @@ function configDoc() {
   return _configDoc;
 }
 
+// The App Home agent selector's list: every agent, labelled by its real Slack name.
+//
+// `slack` is a const declared much further down, so it cannot be handed over here — the wrapper defers
+// each reference to CALL time, which is after boot has initialised it. Same reasoning as
+// resolveUserProfile's comment; done with an explicit shim rather than a comment because this one is
+// evaluated at module load, where a bare `slack` would be a TDZ throw rather than a latent bug.
+const agentDirectory = createAgentDirectory({
+  tableName: AGENT_CONFIG_TABLE,
+  doc: () => configDoc(),
+  slack: {
+    users: { list: (a) => slack.users.list(a), info: (a) => slack.users.info(a) },
+    conversations: { list: (a) => slack.conversations.list(a), info: (a) => slack.conversations.info(a) },
+  },
+  logger: log,
+});
+
 // Bedrock — used to list available models for the marketplace model selector.
 const bedrockClient = new BedrockClient({ region: process.env.AWS_REGION || 'us-east-1' });
 // Bedrock Runtime — used for conversation title summarization via Claude Haiku.
@@ -310,13 +326,17 @@ function parseJsonEnv(name, fallback) {
 // top-level messages that aren't @mentions. Thread replies are allowed
 // if the bot was @mentioned in the thread root (tracked in mentionedThreads).
 
-let routes = {
-  dmUsers: {},
-  channels: {},
-  requireMention: new Set(),  // channel IDs where only @mentions (+ thread follow-ups) are forwarded
-  streamingAgents: new Set(), // agent names with streaming: true in slack.json
-  default: null,
-};
+// NO ROUTES TABLE. Routing is DERIVATION: the scope id contains the Slack source, so `mintAgentName`
+// answers "which agent serves this event" with no stored state at all (agent-scope.js).
+//
+// There WAS a table here, built from AGENT#<scope>/META via the routing GSI. It was redundant:
+// `assertSingleSource` caps every agent at <=1 DM and <=1 channel, so a lookup could only ever return
+// what the formula returns. Proven against the config repo before deletion — 215 of 216 routing
+// entries agreed with derivation, the one exception being `agent-83l3pa`, the only agent fleet-wide
+// with both a DM and a channel, whose channel now derives its own `ch-` scope by decision.
+//
+// `require_mention` survived the table and moved to AGENT#<scope>/CONFIG (requiresMention below).
+// `streaming` did not survive: it was parsed and never gated anything (see buildAgentPayload).
 
 // The dispatcher-owned cron subsystem (Option B) — the sole scheduler for every agent.
 // Forward-declared here; assigned once, below, where its collaborators exist.
@@ -385,24 +405,11 @@ setInterval(() => {
 // Reload mutex: serialises concurrent POST /reload so overlapping DDB re-reads don't race.
 const reloadMutex = new Mutex();
 
-async function loadRoutes() {
-  // Collect per-agent routing from the DynamoDB routing GSI, then aggregate.
-  const agentConfigs = await routingBuild.collectFromDdb(configDoc(), AGENT_CONFIG_TABLE, { log });
-  log.info({ count: agentConfigs.length, table: AGENT_CONFIG_TABLE }, 'routing source: DynamoDB');
-  routes = routingBuild.buildRoutes(agentConfigs, { extraStreamingAgents, log });
-
-  log.info(
-    {
-      dm_users: Object.keys(routes.dmUsers).length,
-      channels: Object.keys(routes.channels).length,
-      require_mention_channels: routes.requireMention.size,
-      streaming_agents: [...routes.streamingAgents],
-    },
-    'routes loaded',
-  );
-
-  // Load marketplace data (skill catalog + install state) from DynamoDB — same aggregate shape
-  // the old git files produced, so App Home is unchanged.
+async function loadFleetConfig() {
+  // WAS ALSO loadRoutes(). The routing half is gone — routing is derived per event, so there is
+  // nothing fleet-wide to load for it. What remains is the fleet-wide SKILL catalogue, which App Home
+  // renders from. (The per-agent installs half of this aggregate is no longer read by the view path
+  // either; buildSkillsTab and friends take the agent's own MARKETPLACE row per render.)
   const mktResult = await marketplace.loadMarketplaceDataFromDdb(configDoc(), AGENT_CONFIG_TABLE, { log });
   if (mktResult.error) {
     log.error({ err: mktResult.error }, 'marketplace data load failed');
@@ -411,9 +418,9 @@ async function loadRoutes() {
   }
 }
 
-async function reloadRoutes() {
+async function reloadFleetConfig() {
   return reloadMutex.runExclusive(async () => {
-    await loadRoutes();
+    await loadFleetConfig();
   });
 }
 
@@ -487,14 +494,41 @@ setInterval(() => {
 // duplicated in config-resolver/rekey-to-scope.mjs under a "keep in lockstep" comment. Three copies
 // of an id derivation that MUST agree is three chances for the same human to become two agents.
 
+/**
+ * Does this agent only answer when @mentioned?
+ *
+ * Reads `AGENT#<scope>/CONFIG` per channel message. That is a DynamoDB GetItem on the message path,
+ * including for chatter this is about to drop, and it is deliberate: the flag used to live in an
+ * in-memory set built at boot from the routing GSI, and every in-memory view of DynamoDB in this
+ * codebase has eventually served a stale answer. No cache. If the latency ever matters it becomes a
+ * measured decision with a number attached.
+ *
+ * 54 of every agent in the fleet in the config repo carry this, all of them `archie-*` agents in shared channels
+ * where answering every message would be unbearable. Absent means off, which is what a minted agent
+ * gets and what it already did.
+ *
+ * Fails OPEN (returns false → the agent answers) on a read error, matching the previous behaviour for
+ * an agent missing from the routes table. Failing closed would silence an agent on a transient
+ * DynamoDB error, which is the worse of the two.
+ */
+async function requiresMention(agentId) {
+  if (!AGENT_CONFIG_TABLE || !agentId) return false;
+  try {
+    const { GetCommand } = require('@aws-sdk/lib-dynamodb');
+    const r = await configDoc().send(new GetCommand({
+      TableName: AGENT_CONFIG_TABLE, Key: { pk: `AGENT#${agentId}`, sk: 'CONFIG' },
+    }));
+    if (!r.Item || !r.Item.data) return false;
+    return Boolean(JSON.parse(r.Item.data).require_mention);
+  } catch (err) {
+    log.warn({ agent: agentId, err: err.message }, 'require_mention read failed — treating as not required');
+    return false;
+  }
+}
+
 function resolveAgent(event) {
   const isDM = event.channel_type === 'im';
-  if (isDM) {
-    if (event.user && routes.dmUsers[event.user]) return routes.dmUsers[event.user];
-  } else {
-    if (event.channel && routes.channels[event.channel]) return routes.channels[event.channel];
-  }
-  // No explicit route → spawn/route a dedicated agent for this channel/DM.
+  // DERIVATION, and nothing else. There is no table to consult first: the scope id IS the route.
   return (isDM ? event.user : event.channel) ? mintAgentName(event) : null;
 }
 
@@ -505,12 +539,10 @@ function resolveAgent(event) {
 // is impossible on this path (Slack always supplies the viewer); if it ever happens we fail LOUD
 // rather than guess a persona.
 function homeAgentFor(userId, surface) {
-  const explicit = routes.dmUsers[userId];
-  if (explicit) return explicit;
   if (userId) return mintAgentName({ channel_type: 'im', user: userId });
   // The tripwire is the log + throw. It used to also emit a `DefaultRouteHit` metric, which was
-  // removed with the default-route concept: the metric reported `routes.default`, a field that no
-  // longer exists, and nothing graphed or alarmed on it. The throw is the signal that matters.
+  // removed with the default-route concept: the metric reported a field that no longer exists, and
+  // nothing graphed or alarmed on it. The throw is the signal that matters.
   log.error({ surface, userId }, 'homeAgentFor: no userId — refusing to guess an agent (§8.10 fail-closed)');
   throw new Error(`homeAgentFor: no userId for surface=${surface} — refusing to fall back to a shared default agent (§8.10 fail-closed)`);
 }
@@ -559,8 +591,8 @@ function agentcoreSessionId(sessionKey) {
 // DEFAULT was `false`: any second caller that forgot the flag would have silently produced a turn
 // instructing the agent to use a non-existent tool, and the user would have got nothing at all.
 // A dead branch guarded by an opt-IN is a trap; every AgentCore turn streams, so the branch is gone.
-// (`routes.streamingAgents` is still parsed from config but is only ever echoed in two debug
-// responses — it has never gated a routing decision.)
+// (`streaming` was also parsed from slack.json and echoed in two debug responses; it never gated a
+// routing decision, and it went with the routes table.)
 function buildAgentPayload(event, userProfile, { priorContext = '' } = {}) {
   const type = event.type || 'unknown';
   const channel = event.channel || '';
@@ -994,6 +1026,15 @@ async function forwardToAgentCore(agent, event, child, opts = {}) {
 // point — a p50 35s turn, plus anything queued behind it — is ours to lose on a restart. Handing the
 // event to SQS makes the queue the system of record from the moment it lands.
 async function forwardToAgent(agent, event, child) {
+  // THE MINT HOOK. Every turn funnels through here — message, app_mention and /simulate — so this is
+  // the one place that sees an agent come into existence, and it is why the selector's list needs no
+  // polling: the gateway IS the minter (resolveAgent → mintAgentName), so a new agent is known the
+  // instant it exists rather than at the next refresh.
+  //
+  // Fire-and-forget, and swallowing: this is the turn path. A directory that cannot name a new scope
+  // must never delay or fail a message.
+  agentDirectory.noteMinted(agent).catch((err) => child.warn({ err: err.message, agent }, 'agent directory: noteMinted failed — the agent selector may not list this agent until the next restart'));
+
   if (!turnQueue.enabled) return forwardToAgentCore(agent, event, child);
 
   const sessionId = agentcoreSessionId(buildSessionKey(event));
@@ -1079,7 +1120,9 @@ if (!NO_SOCKET_MODE) {
     // If we mark it processed here and then drop it, the app_mention
     // handler's dedup check would also skip it — silently losing the @mention.
     const isThreadReply = event.thread_ts && event.thread_ts !== event.ts;
-    if (event.channel_type !== 'im' && routes.requireMention.has(event.channel)) {
+    // The flag is per-AGENT now, read from its CONFIG row — it was a channel-keyed in-memory set
+    // built from the routing GSI. Same meaning: the agent for a channel message IS `ch-<channel>`.
+    if (event.channel_type !== 'im' && await requiresMention(resolveAgent(event))) {
       if (!isThreadReply) {
         log.info({ channel: event.channel, user: event.user, ts: event.ts }, 'message skipped: channel requires mention (deferring to app_mention)');
         return;
@@ -1125,9 +1168,26 @@ if (!NO_SOCKET_MODE) {
           userId: event.user,
           text: event.text,
         }, bedrockRuntimeClient);
-        // Push updated App Home so the Conversations tab reflects the new entry
-        if (userActiveTab.get(event.user) === 'conversations' || !userActiveTab.has(event.user)) {
-          const view = marketplace.buildHomeView(agent, 'conversations', { teamId: slackTeamId });
+        // Push updated App Home so the Conversations tab reflects the new entry.
+        //
+        // THE ONE PUBLISH THAT IS NOT SELECTION-AWARE, and the one that must not become so. It renders
+        // `agent` — resolveAgent's answer, i.e. the viewer's OWN scope — because this fires on an
+        // inbound DM rather than on a Home click, and message routing is deliberately selection-blind.
+        //
+        // So it is SKIPPED outright while a selection is active. Publishing here would replace the
+        // selected agent's tab (banner and all) with the viewer's own, while userSelectedAgent still
+        // said otherwise: the rows on screen would belong to one agent and every button on the page to
+        // another. With no authorization gate in phase 1 that is a mis-targeted WRITE behind a
+        // misleading UI, which is strictly worse than a tab that refreshes one click later.
+        //
+        // `has`, not a comparison of `agent` against homeTargetFor: those are equal exactly when no
+        // selection exists, so the membership check states the intent directly.
+        //
+        // recordConversation above is untouched — it correctly records against the agent that actually
+        // received the DM, which is `agent` whatever the viewer happens to be looking at.
+        const homeHijacked = userSelectedAgent.has(event.user);
+        if (!homeHijacked && (userActiveTab.get(event.user) === 'conversations' || !userActiveTab.has(event.user))) {
+          const view = marketplace.buildHomeView(agent, 'conversations', homeViewOptions(event.user, agent));
           slack.views.publish({ user_id: event.user, view })
             .catch(err => child.warn({ err: err.message }, 'failed to refresh app home after new conversation'));
         }
@@ -1204,13 +1264,65 @@ if (bolt) {
 // Track which tab each user is viewing (default: skills)
 const userActiveTab = new Map();
 
+// WHICH AGENT each viewer is currently pointed at, when it is not their own.
+//
+// Absent = the viewer's own agent, which is what homeAgentFor derives. So an empty map is exactly
+// today's behaviour, and that is the point: the selector is a layer ON TOP of the derivation, not a
+// replacement for it. homeAgentFor keeps its fail-closed throw and is untouched.
+//
+// APP HOME SURFACES ONLY. Nothing on the message path consults this — resolveAgent must stay
+// selection-blind, because routing a DM to a selected agent would deliver one person's message into
+// another agent's session and memory. The selector changes what you are *configuring*, never where
+// your conversations go.
+//
+// IN-MEMORY AND DELIBERATELY NOT PERSISTED, mirroring userActiveTab above. A restart drops every
+// selection back to the viewer's own agent, which is the fail-safe direction: phase 1 ships with no
+// authorization gate (see the note on agent_gtxe3a), so "forgets you were pointed at someone
+// else's agent" is the failure mode we want, not "silently still pointed there tomorrow".
+const userSelectedAgent = new Map();
+
+/**
+ * The agent an App Home surface should render and write to: the viewer's selection if they have one,
+ * otherwise their own derived scope.
+ *
+ * Every App Home handler calls THIS, not homeAgentFor. The one exception is the Conversations push in
+ * the message handler, which deliberately does not — see the comment there.
+ */
+function homeTargetFor(userId, surface) {
+  const selected = userSelectedAgent.get(userId);
+  if (selected) return selected;
+  return homeAgentFor(userId, surface);
+}
+
+/** The options every buildHomeView call needs so the selector renders on every tab. */
+function homeViewOptions(userId, agentId, extra = {}) {
+  return {
+    teamId: slackTeamId,
+    targetLabel: agentDirectory.labelFor(agentId),
+    ...extra,
+  };
+}
+
+/**
+ * homeViewOptions plus the agent's MARKETPLACE row, read fresh.
+ *
+ * Every App Home render goes through here, because the Skills / Connected Apps / Model tabs all read
+ * that row and all three were previously served from a boot-time snapshot — so any agent minted after
+ * the gateway started rendered as if it had installed and connected nothing. One GetItem on a
+ * human-triggered render, no cache; see marketplace.fetchAgentMarketplace for the full account.
+ */
+async function homeViewOptionsAsync(userId, agentId, extra = {}) {
+  const mkt = await marketplace.fetchAgentMarketplace(configDoc(), AGENT_CONFIG_TABLE, agentId);
+  return homeViewOptions(userId, agentId, { marketplace: mkt, ...extra });
+}
+
 if (bolt) bolt.event('app_home_opened', async ({ event, client }) => {
   const userId = event.user;
-  const agentId = homeAgentFor(userId, 'app_home');
+  const agentId = homeTargetFor(userId, 'app_home');
   const activeTab = userActiveTab.get(userId) || 'conversations';
   const child = log.child({ event_type: 'app_home_opened', user: userId, agent: agentId });
   try {
-    const opts = { teamId: slackTeamId };
+    const opts = await homeViewOptionsAsync(userId, agentId);
     if (activeTab === 'jobs' && agentId) {
       opts.jobs = await fetchAgentCronJobs(agentId);
       opts.cronRunner = await fetchCronRunner(agentId);
@@ -1223,6 +1335,90 @@ if (bolt) bolt.event('app_home_opened', async ({ event, client }) => {
     child.info('app home published');
   } catch (err) {
     child.error({ err: err.message }, 'failed to publish app home');
+  }
+});
+
+// ---------- Agent selector ----------
+
+// THE OPTIONS LOAD. Slack sends a `block_suggestion` payload when the select opens and on each
+// keystroke past min_query_length; Bolt routes it here (SocketModeReceiver forwards every payload to
+// processEvent, and helpers.js classifies block_suggestion as an Options payload — so no "Options Load
+// URL" is needed, that requirement is HTTP-mode only). This is the first bolt.options handler in the
+// app.
+//
+// Purely in-memory: the directory list is built at boot, so a keystroke costs no I/O.
+if (bolt) bolt.options(marketplace.AGENT_SELECT_ACTION, async ({ options, ack }) => {
+  const query = (options && options.value) || '';
+  try {
+    await ack({ option_groups: marketplace.buildAgentOptionGroups(agentDirectory.search(query)) });
+  } catch (err) {
+    log.error({ err: err.message, query }, 'agent selector: options load failed');
+    await ack({ options: [] });
+  }
+});
+
+// THE SELECTION. Points this viewer's App Home at another agent.
+//
+// PHASE 1 HAS NO AUTHORIZATION GATE — deliberately, and temporarily. Anyone can select any agent and
+// change its skills, connectors, model, cron jobs and capability grants. Two things bound that: the
+// selection is App Home only (message routing never consults userSelectedAgent, so nobody's
+// conversations move), and provenance still names the actor — grants record `manual:<slackUserId>`,
+// marketplace writes record installedBy/connectedBy/selectedBy. Phase 2 replaces the check below;
+// nothing else here needs to change when it does.
+//
+// THE VALUE IS UNTRUSTED. Slack echoes back whatever was in the view, so it is normalised and then
+// checked against the directory before being stored — the same treatment handleGrantChange gives a
+// capability, and for the same reason: a value that arrived over the wire is an assertion, not a fact.
+if (bolt) bolt.action(marketplace.AGENT_SELECT_ACTION, async ({ ack, body, client }) => {
+  await ack();
+  const userId = body.user.id;
+  const selectedRaw = body.actions[0].selected_option && body.actions[0].selected_option.value;
+  const child = log.child({ action: 'agent_gtxe3a', user: userId, selected: selectedRaw });
+
+  // UNREACHABLE THROUGH THE UI, and treated as such. Every option in the select was built from the
+  // directory, so a value that is not in the directory did not come from a real interaction — it is a
+  // bug in how options are built, or a hand-crafted payload. Throwing surfaces it in the logs as an
+  // error; a `return` would swallow the first case, and a message to the user would be answering for
+  // a situation the UI is supposed to make impossible.
+  const scopeId = selectedRaw ? normaliseScopeId(selectedRaw) : null;
+  if (!scopeId || !agentDirectory.has(scopeId)) {
+    throw new Error(`agent_gtxe3a: '${selectedRaw}' is not a known agent`);
+  }
+
+  userSelectedAgent.set(userId, scopeId);
+  child.info({ target: scopeId }, 'agent selector: target changed');
+
+  // Re-render whatever tab they are on. The selection is already stored, so the existing refreshers
+  // resolve the new agent themselves through homeTargetFor — nothing here passes an agent id.
+  // Jobs and Tools have their own refreshers because those tabs need data fetched; every other tab
+  // renders from state buildHomeView already has.
+  const tab = userActiveTab.get(userId) || 'conversations';
+  if (tab === 'jobs') await refreshJobsTab(userId, client);
+  else if (tab === 'tools') await refreshToolsTab(userId, client);
+  else await refreshHome(userId, scopeId, tab, client, child);
+});
+
+// ---------- Directory freshness: Slack's own rename events ----------
+//
+// These are the ONLY invalidation the label cache has, and they are push. Renaming a channel or
+// changing a display name corrects the entry in place; nothing polls, and there is no TTL. A relabel
+// does NOT republish anyone's Home — the next render picks it up, and pushing an unrequested view at
+// every viewer because someone renamed a channel would be worse than a stale label until next click.
+if (bolt) bolt.event('channel_rename', async ({ event }) => {
+  if (agentDirectory.applyChannelRename(event && event.channel)) {
+    log.info({ channel: event.channel.id, name: event.channel.name }, 'agent directory: relabelled after channel_rename');
+  }
+});
+
+if (bolt) bolt.event('group_rename', async ({ event }) => {
+  if (agentDirectory.applyChannelRename(event && event.channel)) {
+    log.info({ channel: event.channel.id, name: event.channel.name }, 'agent directory: relabelled after group_rename');
+  }
+});
+
+if (bolt) bolt.event('user_change', async ({ event }) => {
+  if (agentDirectory.applyUserChange(event && event.user)) {
+    log.info({ user: event.user.id }, 'agent directory: relabelled after user_change');
   }
 });
 
@@ -1242,10 +1438,10 @@ if (bolt) bolt.action('marketplace_detail', async ({ ack, body, client }) => {
 if (bolt) bolt.action('marketplace_tab_skills', async ({ ack, body, client }) => {
   await ack();
   const userId = body.user.id;
-  const agentId = homeAgentFor(userId, 'app_home');
+  const agentId = homeTargetFor(userId, 'app_home');
   userActiveTab.set(userId, 'skills');
   try {
-    const view = marketplace.buildHomeView(agentId, 'skills', { teamId: slackTeamId });
+    const view = marketplace.buildHomeView(agentId, 'skills', await homeViewOptionsAsync(userId, agentId));
     await client.views.publish({ user_id: userId, view });
   } catch (err) {
     log.error({ err: err.message }, 'failed to switch to skills tab');
@@ -1255,14 +1451,14 @@ if (bolt) bolt.action('marketplace_tab_skills', async ({ ack, body, client }) =>
 if (bolt) bolt.action('marketplace_tab_connectors', async ({ ack, body, client }) => {
   await ack();
   const userId = body.user.id;
-  const agentId = homeAgentFor(userId, 'app_home');
+  const agentId = homeTargetFor(userId, 'app_home');
   userActiveTab.set(userId, 'connectors');
   // Refresh Connector cache if needed
   if (CONNECTOR_API_KEY) {
     await marketplace.fetchConnectorToolkits(CONNECTOR_API_KEY, { log });
   }
   try {
-    const view = marketplace.buildHomeView(agentId, 'connectors', { teamId: slackTeamId });
+    const view = marketplace.buildHomeView(agentId, 'connectors', await homeViewOptionsAsync(userId, agentId));
     await client.views.publish({ user_id: userId, view });
   } catch (err) {
     log.error({ err: err.message }, 'failed to switch to connectors tab');
@@ -1273,12 +1469,12 @@ if (bolt) bolt.action('marketplace_tab_connectors', async ({ ack, body, client }
 if (bolt) bolt.action('marketplace_tab_models', async ({ ack, body, client }) => {
   await ack();
   const userId = body.user.id;
-  const agentId = homeAgentFor(userId, 'app_home');
+  const agentId = homeTargetFor(userId, 'app_home');
   userActiveTab.set(userId, 'models');
   // Refresh Bedrock cache if needed
   await marketplace.fetchBedrockModels(bedrockClient, { log });
   try {
-    const view = marketplace.buildHomeView(agentId, 'models', { teamId: slackTeamId });
+    const view = marketplace.buildHomeView(agentId, 'models', await homeViewOptionsAsync(userId, agentId));
     await client.views.publish({ user_id: userId, view });
   } catch (err) {
     log.error({ err: err.message }, 'failed to switch to models tab');
@@ -1289,10 +1485,10 @@ if (bolt) bolt.action('marketplace_tab_models', async ({ ack, body, client }) =>
 if (bolt) bolt.action('marketplace_tab_conversations', async ({ ack, body, client }) => {
   await ack();
   const userId = body.user.id;
-  const agentId = homeAgentFor(userId, 'app_home');
+  const agentId = homeTargetFor(userId, 'app_home');
   userActiveTab.set(userId, 'conversations');
   try {
-    const view = marketplace.buildHomeView(agentId, 'conversations', { teamId: slackTeamId });
+    const view = marketplace.buildHomeView(agentId, 'conversations', await homeViewOptionsAsync(userId, agentId));
     await client.views.publish({ user_id: userId, view });
   } catch (err) {
     log.error({ err: err.message }, 'failed to switch to conversations tab');
@@ -1307,11 +1503,11 @@ if (bolt) bolt.action('marketplace_tab_conversations', async ({ ack, body, clien
 const handleConversationsPage = async ({ ack, body, client }) => {
   await ack();
   const userId = body.user.id;
-  const agentId = homeAgentFor(userId, 'app_home');
+  const agentId = homeTargetFor(userId, 'app_home');
   const page = Math.max(0, parseInt(body.actions[0].value, 10) || 0);
   if (!agentId) return;
   try {
-    const view = marketplace.buildHomeView(agentId, 'conversations', { teamId: slackTeamId, page });
+    const view = marketplace.buildHomeView(agentId, 'conversations', await homeViewOptionsAsync(userId, agentId, { page }));
     await client.views.publish({ user_id: userId, view });
   } catch (err) {
     log.error({ err: err.message }, 'failed to page conversations');
@@ -1328,12 +1524,12 @@ if (bolt) bolt.action('conversations_open_thread', async ({ ack }) => { await ac
 if (bolt) bolt.action('conversations_toggle_pin', async ({ ack, body, client }) => {
   await ack();
   const userId = body.user.id;
-  const agentId = homeAgentFor(userId, 'app_home');
+  const agentId = homeTargetFor(userId, 'app_home');
   const threadTs = body.actions[0].value;
   if (!agentId || !threadTs) return;
   conversations.togglePin(agentId, threadTs);
   try {
-    const view = marketplace.buildHomeView(agentId, 'conversations', { teamId: slackTeamId });
+    const view = marketplace.buildHomeView(agentId, 'conversations', await homeViewOptionsAsync(userId, agentId));
     await client.views.publish({ user_id: userId, view });
   } catch (err) {
     log.error({ err: err.message }, 'failed to toggle pin on conversation');
@@ -1344,12 +1540,12 @@ if (bolt) bolt.action('conversations_toggle_pin', async ({ ack, body, client }) 
 const handleConversationsMove = (direction) => async ({ ack, body, client }) => {
   await ack();
   const userId = body.user.id;
-  const agentId = homeAgentFor(userId, 'app_home');
+  const agentId = homeTargetFor(userId, 'app_home');
   const threadTs = body.actions[0].value;
   if (!agentId || !threadTs) return;
   conversations.moveConversation(agentId, threadTs, direction);
   try {
-    const view = marketplace.buildHomeView(agentId, 'conversations', { teamId: slackTeamId });
+    const view = marketplace.buildHomeView(agentId, 'conversations', await homeViewOptionsAsync(userId, agentId));
     await client.views.publish({ user_id: userId, view });
   } catch (err) {
     log.error({ err: err.message, direction }, 'failed to reorder conversation');
@@ -1362,11 +1558,11 @@ if (bolt) bolt.action('conversations_move_down', handleConversationsMove('down')
 if (bolt) bolt.action('conversations_reset_order', async ({ ack, body, client }) => {
   await ack();
   const userId = body.user.id;
-  const agentId = homeAgentFor(userId, 'app_home');
+  const agentId = homeTargetFor(userId, 'app_home');
   if (!agentId) return;
   conversations.resetRecentOrder(agentId);
   try {
-    const view = marketplace.buildHomeView(agentId, 'conversations', { teamId: slackTeamId });
+    const view = marketplace.buildHomeView(agentId, 'conversations', await homeViewOptionsAsync(userId, agentId));
     await client.views.publish({ user_id: userId, view });
   } catch (err) {
     log.error({ err: err.message }, 'failed to reset conversation order');
@@ -1387,7 +1583,7 @@ if (bolt) bolt.action('conversations_search_open', async ({ ack, body, client })
 // Conversation search submit — replaces the modal with the results in-place
 if (bolt) bolt.view('conversations_search_submit', async ({ ack, body, view }) => {
   const userId = body.user.id;
-  const agentId = homeAgentFor(userId, 'app_home');
+  const agentId = homeTargetFor(userId, 'app_home');
   const query = (view.state.values.search_block.search_query.value || '').trim();
   if (!query || !agentId) {
     await ack();
@@ -1401,7 +1597,7 @@ if (bolt) bolt.view('conversations_search_submit', async ({ ack, body, view }) =
 if (bolt) bolt.action('marketplace_tab_jobs', async ({ ack, body, client }) => {
   await ack();
   const userId = body.user.id;
-  const agentId = homeAgentFor(userId, 'app_home');
+  const agentId = homeTargetFor(userId, 'app_home');
   userActiveTab.set(userId, 'jobs');
   let jobs = null;
   let cronRunner = null;
@@ -1410,7 +1606,7 @@ if (bolt) bolt.action('marketplace_tab_jobs', async ({ ack, body, client }) => {
     cronRunner = await fetchCronRunner(agentId);
   }
   try {
-    const view = marketplace.buildHomeView(agentId, 'jobs', { teamId: slackTeamId, jobs, cronRunner });
+    const view = marketplace.buildHomeView(agentId, 'jobs', await homeViewOptionsAsync(userId, agentId, { jobs, cronRunner }));
     await client.views.publish({ user_id: userId, view });
   } catch (err) {
     log.error({ err: err.message }, 'failed to switch to jobs tab');
@@ -1455,11 +1651,11 @@ async function fetchToolPermissions(agentId) {
 if (bolt) bolt.action('marketplace_tab_tools', async ({ ack, body, client }) => {
   await ack();
   const userId = body.user.id;
-  const agentId = homeAgentFor(userId, 'app_home');
+  const agentId = homeTargetFor(userId, 'app_home');
   userActiveTab.set(userId, 'tools');
   const tools = await fetchToolPermissions(agentId);
   try {
-    const view = marketplace.buildHomeView(agentId, 'tools', { teamId: slackTeamId, tools });
+    const view = marketplace.buildHomeView(agentId, 'tools', await homeViewOptionsAsync(userId, agentId, { tools }));
     await client.views.publish({ user_id: userId, view });
   } catch (err) {
     log.error({ err: err.message }, 'failed to switch to tools tab');
@@ -1467,10 +1663,10 @@ if (bolt) bolt.action('marketplace_tab_tools', async ({ ack, body, client }) => 
 });
 
 async function refreshToolsTab(userId, client) {
-  const agentId = homeAgentFor(userId, 'app_home');
+  const agentId = homeTargetFor(userId, 'app_home');
   if (!agentId) return;
   const tools = await fetchToolPermissions(agentId);
-  const view = marketplace.buildHomeView(agentId, 'tools', { teamId: slackTeamId, tools });
+  const view = marketplace.buildHomeView(agentId, 'tools', await homeViewOptionsAsync(userId, agentId, { tools }));
   await client.views.publish({ user_id: userId, view });
 }
 
@@ -1488,7 +1684,7 @@ async function handleGrantChange(kind, { ack, body, client }) {
   await ack();
   const userId = body.user.id;
   const capability = body.actions[0].value;
-  const agentId = homeAgentFor(userId, 'app_home');
+  const agentId = homeTargetFor(userId, 'app_home');
   if (!agentId) return;
   const child = log.child({ action: `tools_${kind}`, user: userId, agent: agentId, capability });
   if (!AGENT_CONFIG_TABLE) { child.error('no AGENT_CONFIG_TABLE — cannot change grants'); return; }
@@ -1521,11 +1717,11 @@ if (bolt) bolt.action('tools_revoke', (args) => handleGrantChange('revoke', args
 
 // Helper to refresh the Jobs tab for a user
 async function refreshJobsTab(userId, client) {
-  const agentId = homeAgentFor(userId, 'app_home');
+  const agentId = homeTargetFor(userId, 'app_home');
   if (!agentId) return;
   const jobs = await fetchAgentCronJobs(agentId);
   const cronRunner = await fetchCronRunner(agentId);
-  const view = marketplace.buildHomeView(agentId, 'jobs', { teamId: slackTeamId, jobs, cronRunner });
+  const view = marketplace.buildHomeView(agentId, 'jobs', await homeViewOptionsAsync(userId, agentId, { jobs, cronRunner }));
   await client.views.publish({ user_id: userId, view });
 }
 
@@ -1534,7 +1730,7 @@ if (bolt) bolt.action('jobs_detail', async ({ ack, body, client }) => {
   await ack();
   const jobId = body.actions[0].value;
   const userId = body.user.id;
-  const agentId = homeAgentFor(userId, 'app_home');
+  const agentId = homeTargetFor(userId, 'app_home');
   if (!agentId) return;
   // Straight from the service — this read the (never-populated) cronCache until 2026-08-11, so the
   // detail modal never opened under AgentCore either.
@@ -1553,7 +1749,7 @@ if (bolt) bolt.action('jobs_detail', async ({ ack, body, client }) => {
 if (bolt) bolt.action('jobs_run', async ({ ack, body, client }) => {
   await ack();
   const userId = body.user.id;
-  const agentId = homeAgentFor(userId, 'app_home');
+  const agentId = homeTargetFor(userId, 'app_home');
   const jobId = body.actions[0].value;
   if (!agentId) return;
   try {
@@ -1568,7 +1764,7 @@ if (bolt) bolt.action('jobs_run', async ({ ack, body, client }) => {
 if (bolt) bolt.action('jobs_toggle', async ({ ack, body, client }) => {
   await ack();
   const userId = body.user.id;
-  const agentId = homeAgentFor(userId, 'app_home');
+  const agentId = homeTargetFor(userId, 'app_home');
   let jobId, enabled;
   try {
     const parsed = JSON.parse(body.actions[0].value);
@@ -1595,7 +1791,7 @@ if (bolt) bolt.action('jobs_toggle', async ({ ack, body, client }) => {
 if (bolt) bolt.action('jobs_runner_set', async ({ ack, body, client }) => {
   await ack();
   const userId = body.user.id;
-  const agentId = homeAgentFor(userId, 'app_home');
+  const agentId = homeTargetFor(userId, 'app_home');
   if (!agentId) return;
   const runner = body.actions[0].value;
   try {
@@ -1613,7 +1809,7 @@ if (bolt) bolt.action('jobs_delete', async ({ ack, body, client }) => {
   const jobId = body.actions[0].value;
   // Find job name from the current cached data
   const userId = body.user.id;
-  const agentId = homeAgentFor(userId, 'app_home');
+  const agentId = homeTargetFor(userId, 'app_home');
   let jobName = jobId;
   if (agentId) {
     const job = cronHome && cronHome.get(agentId, jobId);
@@ -1631,7 +1827,7 @@ if (bolt) bolt.action('jobs_delete', async ({ ack, body, client }) => {
 if (bolt) bolt.view('jobs_delete_confirm', async ({ ack, body, client, view }) => {
   await ack();
   const userId = body.user.id;
-  const agentId = homeAgentFor(userId, 'app_home');
+  const agentId = homeTargetFor(userId, 'app_home');
   if (!agentId) return;
   let jobId;
   try {
@@ -1651,8 +1847,9 @@ if (bolt) bolt.action('model_detail', async ({ ack, body, client }) => {
   await ack();
   const modelId = body.actions[0].value;
   const userId = body.user.id;
-  const agentId = homeAgentFor(userId, 'app_home');
-  const modal = marketplace.buildModelDetailModal(modelId, agentId);
+  const agentId = homeTargetFor(userId, 'app_home');
+  const modal = marketplace.buildModelDetailModal(modelId, agentId,
+    await marketplace.fetchAgentMarketplace(configDoc(), AGENT_CONFIG_TABLE, agentId));
   if (!modal) return;
   try {
     await client.views.open({ trigger_id: body.trigger_id, view: modal });
@@ -1666,8 +1863,9 @@ if (bolt) bolt.action('connector_detail', async ({ ack, body, client }) => {
   await ack();
   const slug = body.actions[0].value;
   const userId = body.user.id;
-  const agentId = homeAgentFor(userId, 'app_home');
-  const modal = marketplace.buildConnectorDetailModal(slug, agentId);
+  const agentId = homeTargetFor(userId, 'app_home');
+  const modal = marketplace.buildConnectorDetailModal(slug, agentId,
+    await marketplace.fetchAgentMarketplace(configDoc(), AGENT_CONFIG_TABLE, agentId));
   if (!modal) {
     log.warn({ slug }, 'connector detail modal unavailable (app not in Connector cache)');
     return;
@@ -1700,14 +1898,15 @@ if (bolt) bolt.action('connector_search_open', async ({ ack, body, client }) => 
 // Connector search submit (view callback) — responds with update to replace modal in-place
 if (bolt) bolt.view('connector_search_submit', async ({ ack, body, view }) => {
   const userId = body.user.id;
-  const agentId = homeAgentFor(userId, 'app_home');
+  const agentId = homeTargetFor(userId, 'app_home');
   const query = (view.state.values.search_block.search_query.value || '').trim();
   if (!query) {
     await ack();
     return;
   }
 
-  const resultsModal = marketplace.buildConnectorSearchResultsModal(query, agentId);
+  const resultsModal = marketplace.buildConnectorSearchResultsModal(query, agentId,
+    await marketplace.fetchAgentMarketplace(configDoc(), AGENT_CONFIG_TABLE, agentId));
   await ack({ response_action: 'update', view: resultsModal });
 });
 
@@ -1722,7 +1921,7 @@ const NO_AGENT_MSG = 'You don\'t have a personal agent set up yet. Ask in *#sand
 
 async function refreshHome(userId, agentId, tab, client, child) {
   try {
-    const view = marketplace.buildHomeView(agentId, tab, { teamId: slackTeamId });
+    const view = marketplace.buildHomeView(agentId, tab, await homeViewOptionsAsync(userId, agentId));
     await client.views.publish({ user_id: userId, view });
   } catch (err) {
     child.warn({ err: err.message }, 'failed to refresh app home');
@@ -1733,7 +1932,7 @@ bolt.action('marketplace_install', async ({ ack, body, client }) => {
   await ack();
   const userId = body.user.id;
   const skillId = body.actions[0].value;
-  const agentId = homeAgentFor(userId, 'app_home');
+  const agentId = homeTargetFor(userId, 'app_home');
   const child = log.child({ action: 'marketplace_install', user: userId, agent: agentId, skill: skillId });
   if (!agentId) { await client.chat.postMessage({ channel: userId, text: NO_AGENT_MSG }); return; }
 
@@ -1779,7 +1978,7 @@ if (bolt) bolt.action('marketplace_uninstall', async ({ ack, body, client }) => 
   await ack();
   const userId = body.user.id;
   const skillId = body.actions[0].value;
-  const agentId = homeAgentFor(userId, 'app_home');
+  const agentId = homeTargetFor(userId, 'app_home');
   const child = log.child({ action: 'marketplace_uninstall', user: userId, agent: agentId, skill: skillId });
   if (!agentId) { await client.chat.postMessage({ channel: userId, text: NO_AGENT_MSG }); return; }
 
@@ -1799,7 +1998,7 @@ if (bolt) bolt.action('marketplace_uninstall', async ({ ack, body, client }) => 
 if (bolt) bolt.action('connector_install', async ({ ack, body, client }) => {
   await ack();
   const userId = body.user.id;
-  const agentId = homeAgentFor(userId, 'app_home');
+  const agentId = homeTargetFor(userId, 'app_home');
   let slug, name;
   try {
     const val = JSON.parse(body.actions[0].value);
@@ -1830,7 +2029,7 @@ if (bolt) bolt.action('connector_uninstall', async ({ ack, body, client }) => {
   await ack();
   const userId = body.user.id;
   const slug = body.actions[0].value;
-  const agentId = homeAgentFor(userId, 'app_home');
+  const agentId = homeTargetFor(userId, 'app_home');
   const child = log.child({ action: 'connector_uninstall', user: userId, agent: agentId, slug });
   if (body.view?.id) {
     try { await client.views.update({ view_id: body.view.id, view: marketplace.buildConnectorInstallingModal(slug, 'uninstall') }); } catch { /* best-effort */ }
@@ -1853,7 +2052,7 @@ if (bolt) bolt.action('connector_uninstall', async ({ ack, body, client }) => {
 if (bolt) bolt.action('model_select', async ({ ack, body, client }) => {
   await ack();
   const userId = body.user.id;
-  const agentId = homeAgentFor(userId, 'app_home');
+  const agentId = homeTargetFor(userId, 'app_home');
   let modelId, modelName;
   try {
     const val = JSON.parse(body.actions[0].value);
@@ -1961,10 +2160,10 @@ function resolvePhaseStatus(data) {
 // `dm-<userId>` mint pattern is deliberately NOT reverse-mapped: a user id is not a DM channel id
 // (resolving it needs conversations.open, which is I/O this must not do).
 function routedChannelFor(agentId) {
-  const owned = Object.entries(routes.channels || {})
-    .filter(([, a]) => a === agentId)
-    .map(([channel]) => channel);
-  return owned.length === 1 ? owned[0] : null;
+  // DERIVED, not reverse-scanned. A `ch-` scope is minted from exactly one channel, so the channel is
+  // the suffix uppercased — no table, and the "more than one channel is ambiguous" case cannot exist.
+  const ref = slackRefFromScopeId(agentId);
+  return ref && ref.kind === 'channel' ? ref.id : null;
 }
 
 const cronAlerts = createCronAlertEmitter({ log });
@@ -2195,7 +2394,7 @@ web.post('/simulate', async (req, res) => {
 // overlapping requests wait instead of racing on the clone dir.
 web.post('/reload', async (_req, res) => {
   try {
-    await reloadRoutes();
+    await reloadFleetConfig();
     res.json({ ok: true, routes: summariseRoutes() });
   } catch (err) {
     log.error({ err: err.message }, 'reload failed');
@@ -2211,13 +2410,10 @@ web.get('/debug/streaming', (_req, res) => {
   res.json({ ok: true, sessions: streaming.debugSnapshot(), sessionCount: streaming.sessionCount });
 });
 
+// Routing has no fleet-wide state to summarise any more — it is derived per event. What an operator
+// can still usefully see is which agents exist, which is what the directory holds.
 function summariseRoutes() {
-  return {
-    dm_users: routes.dmUsers,
-    channels: routes.channels,
-    require_mention: [...routes.requireMention],
-    streaming_agents: [...routes.streamingAgents],
-  };
+  return { routing: 'derived per event (dm-<userId> / ch-<channelId>)', agents: agentDirectory.size() };
 }
 
 // ---------- Startup ----------
@@ -2229,7 +2425,7 @@ let slackBotUserId = null;
 
 (async () => {
   try {
-    await reloadRoutes();
+    await reloadFleetConfig();
   } catch (err) {
     log.fatal({ err: err.message }, 'initial config pull failed');
     process.exit(1);
@@ -2252,6 +2448,14 @@ let slackBotUserId = null;
   } catch (err) {
     log.warn({ err: err.message }, 'auth.test failed — streaming may not work in channels');
   }
+
+  // The App Home agent selector's list. Loaded ONCE here; from this point it is maintained by push
+  // only — the mint hook in forwardToAgent, and Slack's channel_rename/group_rename/user_change
+  // events. There is deliberately no refresh interval: see the header of agent-directory.js.
+  //
+  // Non-fatal and not awaited-into-failure: `load` swallows its own errors, and an empty selector
+  // degrades App Home to exactly today's behaviour (your own agent) rather than breaking it.
+  await agentDirectory.load();
 
   if (bolt) {
     await bolt.start();

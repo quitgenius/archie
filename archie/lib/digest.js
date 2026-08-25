@@ -128,7 +128,6 @@ const IMAGES = {
       { path: 'archie-gateway/agentcore-provisioning.js' },
       { path: 'archie-gateway/dispatcher-metrics.js' },
       { path: 'archie-gateway/tracing.js' },
-      { path: 'archie-gateway/routing-build.js' },
       { path: 'archie-gateway/backpressure.js' },
       { path: 'archie-gateway/connector-credential.js' },
       { path: 'archie-gateway/session-tracker.js' },
@@ -137,6 +136,14 @@ const IMAGES = {
       { path: 'archie-gateway/spec-diff.js' },
       { path: 'archie-gateway/cron-home.js' },
       { path: 'archie-gateway/grants.js' },
+      // agent-scope.js is the scope-id rule (and its inverse, slackRefFromScopeId); agent-directory.js
+      // is the App Home agent selector's list. Both are on the Dockerfile's COPY line. They were
+      // missing here, which is worse than it sounds: the tag is a content digest of THIS list, so a
+      // change confined to a file the list omits produces an unchanged tag, `deploy` reports "inputs
+      // unchanged", skips the build and rolls onto the OLD image — a silent stale deploy, which is the
+      // exact failure the Dockerfile's own allowlist comment warns about from the other direction.
+      { path: 'archie-gateway/agent-scope.js' },
+      { path: 'archie-gateway/agent-directory.js' },
       { path: 'archie-gateway/semaphore.js' },
       { path: 'archie-gateway/sdk-http.js' },
       { path: 'archie-gateway/runtime-registry.js' },

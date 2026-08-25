@@ -37,7 +37,6 @@ const DISPATCHER = path.join(DOCKER_ROOT, 'archie-gateway');
 const SCRIPTS = {
   hydrate: path.join(CONFIG_RESOLVER, 'hydrate.mjs'),
   validateRequires: path.join(CONFIG_RESOLVER, 'validate-requires.mjs'),
-  routesParity: path.join(CONFIG_RESOLVER, 'routes-parity.mjs'),
   seedRoundtrip: path.join(CONFIG_RESOLVER, 'seed-roundtrip.mjs'),
   skillRoundtrip: path.join(CONFIG_RESOLVER, 'skill-roundtrip.mjs'),
   hydrateConversations: path.join(DISPATCHER, 'hydrate-conversations.mjs'),
@@ -243,7 +242,48 @@ async function configHydrate(ctx, args, out, deps) {
 
   if (ctx.dryRun) {
     out.progress(`would run: node ${SCRIPTS.hydrate}`);
-    return { dryRun: true, table, source, consequences: HYDRATE_CONSEQUENCES, ...(agents.length ? { agents } : {}) };
+    if (!args.values['skip-cron']) {
+      out.progress('would then fold in per-agent cron (`cron hydrate` per agent) — hydrate means hydrate. '
+        + 'Each agent PURGES its owner\'s dispatcher store then re-seeds from EFS. --skip-cron opts out.');
+    }
+    return {
+      dryRun: true, table, source, consequences: HYDRATE_CONSEQUENCES,
+      cron: args.values['skip-cron'] ? { skipped: true } : { wouldHydrate: agents.length || 'every agent with a META.efsRoot' },
+      ...(agents.length ? { agents } : {}),
+    };
+  }
+
+  // CONNECTOR ADOPTION ENV, resolved here rather than left to the operator's shell.
+  //
+  // hydrate.mjs runs connector-adopt so a torn-down agent comes back pointing at the SAME Connector
+  // project — the alternative is minting a fresh one and orphaning every OAuth connection the human
+  // authorised, silently. It needs four facts, and they come from three different places for a reason:
+  //
+  //   SECRET_BASE          derived from --name, like every other archie resource
+  //   CONNECTOR_ORG_SECRET  an SSM fact: the org key lives in another account, so it is an ARN
+  //   OPENCLAW_CLUSTER     SSM facts, and NOT derivable from --name: both belong to the OpenClaw
+  //   SHARED_SECRET        stack. Same argument as METRICS_TABLE_NAME (modules/archie/ssm.tf).
+  //
+  // ABSENT IS A VALUE. An environment with no OpenClaw stack publishes neither of the last two, and
+  // hydrate then SKIPS adoption and names the consequence. Guessing them is the failure that matters:
+  // a wrong cluster finds no task definition, which reads as "this agent has no key".
+  //
+  // Read through the same deployment-facts path the task-definition composition uses, so there is one
+  // parameter prefix and one set of semantics rather than a second opinion about where facts live.
+  // SECRET_BASE is set OUTSIDE the try, because it is derived from --name and cannot fail. It was inside,
+  // and a failed parameter read then dropped it too — turning one missing fact into three.
+  const adoptEnv = { SECRET_BASE: ctx.resources.credentialSecret };
+  try {
+    const { readGatewayConfig } = deps.facts || require('../lib/deployment-facts');
+    const cfg = await readGatewayConfig(ctx, deps);
+    const v = (cfg && cfg.values) || {};
+    if (v.CONNECTOR_ADOPT_CLUSTER) adoptEnv.OPENCLAW_CLUSTER = v.CONNECTOR_ADOPT_CLUSTER;
+    if (v.CONNECTOR_ADOPT_SHARED_SECRET) adoptEnv.SHARED_SECRET = v.CONNECTOR_ADOPT_SHARED_SECRET;
+    if (v.CONNECTOR_ORG_API_KEY_SECRET) adoptEnv.CONNECTOR_ORG_SECRET = v.CONNECTOR_ORG_API_KEY_SECRET;
+  } catch (e) {
+    // NOT FATAL, and the same reasoning as the step itself: adoption is a recovery, and a parameter
+    // read must not stop the config write. hydrate.mjs reports the skip with the missing names.
+    out.warn(`could not read the SSM facts for Connector adoption (${e.message}) — hydrate will skip it`);
   }
 
   const { stdout } = await run({
@@ -256,9 +296,90 @@ async function configHydrate(ctx, args, out, deps) {
       SANDRA_REF: ref,
       ...(sandraDir ? { SANDRA_DIR: sandraDir } : {}),
       ...(agents.length ? { HYDRATE_AGENTS: agents.join(',') } : {}),
+      ...adoptEnv,
     },
   }, out, deps);
-  return { table, source, ...(agents.length ? { agents } : {}), log: tail(stdout, 2) };
+
+  // ── CRON, because HYDRATE MEANS HYDRATE ──────────────────────────────────────────────────────
+  //
+  // This command used to write config and stop, leaving an agent's cron store empty. That is not a
+  // partial success, it is a WRONG ANSWER to the question asked: `agent teardown` purges the
+  // dispatcher's cron store and its own output says "hydrate to bring it back", so the operation
+  // named hydrate has to bring back everything teardown removed. It did not, and the gap was invisible
+  // — config looked right, the agent came back, and its schedules were simply gone.
+  //
+  // WHY IT WAS SPLIT AT ALL: no reason that survives inspection. `config hydrate` and `cron hydrate`
+  // were both drawn in the first CLI commit (f59eea8e5, "CLI skeleton and the command contract") along
+  // storage lines — config is DynamoDB, cron is a file on EFS reachable only from inside the VPC — so
+  // the command set mirrored the plumbing instead of the intent. The complete operation then ended up
+  // filed under `agent migrate`, which reads like a one-off, while the word "hydrate" belonged to two
+  // commands that each did part of the job.
+  //
+  // The cron step is `cron hydrate` per agent, unchanged and not reimplemented — it already handles
+  // the awkward part (with MOUNT_PATH it runs in-process; without, it composes an ephemeral Fargate
+  // task around the parent access point and deregisters it). It takes the LEGACY DIRECTORY name, not
+  // the scope id: HYDRATE_AGENT is a path, and handing it a scope id wipes the store and seeds nothing.
+  //
+  // COSTS, both inherited from that step rather than introduced here: ~30-60s per agent from a laptop,
+  // sequential, and it PURGES the owner's store before re-seeding, so an archie-created job absent
+  // from the agent's EFS jobs.json does not survive. `--skip-cron` is the way out.
+  const cron = args.values['skip-cron']
+    ? { skipped: true }
+    : await (deps.hydrateCron || hydrateCron)(ctx, { agents, table }, out, deps);
+
+  return { table, source, ...(agents.length ? { agents } : {}), cron, log: tail(stdout, 2) };
+}
+
+/**
+ * The cron half of a hydrate: fold each agent's EFS cron store into the dispatcher's.
+ *
+ * The roster is CONFIG-REPO NAMES, which is exactly what `efsRoot` is — so a scoped run already has
+ * them in `--agents`, and an unscoped run reads them back off the META rows hydrate just wrote. That
+ * second path deliberately uses `legacyEfsRootOf`, the same reader the dispatcher and `fleet drift`
+ * use, rather than forming a second opinion about which directory an agent owns.
+ *
+ * Never throws: a cron failure must not retract a completed config write. Each agent's failure is
+ * reported and counted, and the summary says how many did not make it, because "hydrated 2 of 3" is
+ * the sentence whose absence caused this bug in the first place.
+ */
+async function hydrateCron(ctx, { agents, table }, out, deps) {
+  let roster = agents.slice();
+  if (!roster.length) {
+    try {
+      // Injectable, like every other collaborator here — `node --test` must touch neither credentials
+      // nor the network, which is this file's stated contract.
+      const { scanAgentScopes } = deps.agentScopes || require('../../archie-gateway/agent-directory');
+      const { legacyEfsRootOf } = deps.efsRoot || require('../lib/efs-root');
+      const { makeClient } = require('../lib/aws');
+      const { DynamoDBDocumentClient } = require('@aws-sdk/lib-dynamodb');
+      const doc = deps.doc || DynamoDBDocumentClient.from(makeClient(ctx, '@aws-sdk/client-dynamodb', 'DynamoDBClient'));
+      const aws = { doc: () => doc };
+      for (const scope of await scanAgentScopes(doc, table)) {
+        const legacy = await legacyEfsRootOf(aws, ctx, scope);
+        if (legacy) roster.push(legacy);
+        else out.warn(`cron: ${scope} has no META.efsRoot — no EFS cron store to fold in, skipping`);
+      }
+    } catch (e) {
+      out.warn(`cron: could not read the agent roster (${e.message}) — config was written, cron was NOT`);
+      return { hydrated: 0, failed: 0, rosterFailed: true };
+    }
+  }
+  if (!roster.length) return { hydrated: 0, failed: 0 };
+
+  out.progress(`cron: folding in per-agent cron for ${roster.length} agent(s). Each PURGES its owner's `
+    + 'dispatcher store then re-seeds from EFS; without MOUNT_PATH this is one ephemeral Fargate task per agent.');
+  let hydrated = 0; const failed = [];
+  for (const efsRoot of roster) {
+    try {
+      await module.exports['cron hydrate'](ctx, { positionals: [efsRoot], values: {} }, out, deps);
+      hydrated += 1;
+    } catch (e) {
+      failed.push(efsRoot);
+      out.warn(`cron: ${efsRoot} failed (${e.message}) — its config IS written; re-run \`archie cron hydrate ${efsRoot}\``);
+    }
+  }
+  out.progress(`cron: hydrated ${hydrated} of ${roster.length}${failed.length ? ` — FAILED: ${failed.join(', ')}` : ''}`);
+  return { hydrated, failed: failed.length, ...(failed.length ? { failedAgents: failed } : {}) };
 }
 
 async function configHydrateConversations(ctx, args, out, deps) {
@@ -409,11 +530,10 @@ async function configParity(ctx, args, out, deps) {
   if (!agentsDir) out.warn('AGENT_VE2BNZS_DIR unset — seed round-trip degrades to self-consistency (DDB vs items/), not git parity');
   if (!skillsDir) out.warn('SANDRA_SKILLS_DIR unset — skill round-trip degrades to self-consistency (DDB vs items/), not git parity');
 
+  // NO routes-parity GATE. It compared the routes table built from DynamoDB against the one built from
+  // git, and there is no routes table any more: routing is derived per event from the scope id, so
+  // there is nothing to hold in parity. Deleted with routing-build.js.
   const gates = [
-    await gate({
-      name: 'routes-parity', script: SCRIPTS.routesParity, cwd: CONFIG_RESOLVER, env,
-      requires: [path.join(CONFIG_RESOLVER, 'items', 'routing')],
-    }, out, deps),
     await gate({
       name: 'seed-roundtrip', script: SCRIPTS.seedRoundtrip, cwd: CONFIG_RESOLVER, env,
       argv: agentsDir ? [agentsDir] : [],
@@ -720,7 +840,7 @@ async function cronList(ctx, args, out, deps) {
 async function cronHydrate(ctx, args, out, deps) {
   const agentId = oneAgent(args);
   const mountDir = deps.env.MOUNT_PATH;
-  const ownerAgentId = await resolveCronOwner(ctx, args, out, deps, agentId);
+  const ownerAgentId = await resolveScopeOwner(ctx, args, out, deps, agentId);
 
   out.progress(`${agentId}: WIPES ${ownerAgentId}'s cron store, then seeds from ${agentId}'s EFS directory`);
   return mountDir
@@ -729,7 +849,14 @@ async function cronHydrate(ctx, args, out, deps) {
 }
 
 /**
- * Which archie identity OWNS the jobs — §8.10 identity=scope.
+ * Which archie identity a legacy OpenClaw name resolves to — §8.10 identity=scope.
+ *
+ * SHARED, not cron-specific, and exported for that reason. `agent migrate`'s RUNTIME phase needs the
+ * identical answer: it used `--agents` verbatim as the agent id, so `--agents agent-xx9aff`
+ * provisioned a role, access point, Connector secret and runtime under the legacy name while the config
+ * phase had correctly written `dm-ux0mz5ckp2r` — a phantom scope no Slack event can reach, and the real
+ * one left without a runtime binding. Measured live 2026-08-21. A second copy of this link is how the
+ * two phases came to disagree in the first place, so there is one.
  *
  * The legacy OpenClaw name is a PATH on EFS, not an identity here. Storing jobs under it produces an
  * agent no Slack event resolves to: the jobs run, but the owner's App Home is empty and the agent has
@@ -749,7 +876,7 @@ async function cronHydrate(ctx, args, out, deps) {
  *                   Connector adopt path resolve through, so there is one link, not three.
  *   otherwise       REFUSE. Guessing is what created the split identity in the first place.
  */
-async function resolveCronOwner(ctx, args, out, deps, agentId) {
+async function resolveScopeOwner(ctx, args, out, deps, agentId) {
   const explicit = args.values.as;
   if (explicit) {
     out.progress(`owner       ${explicit}  (--as, not derived from routing)`);
@@ -813,30 +940,20 @@ async function readAgentRouting(ctx, deps, agentId) {
  * the dispatcher's `legacyAgentIdFor` reads to decide an agent is not new. Resolving through it
  * here means the legacy→scope link has ONE definition rather than one per command.
  *
- * Routed agents only, via the routing GSI: an agent with no routing has no scope identity to own
- * jobs, which is the case the caller below refuses anyway. That also bounds this to the fleet size
- * rather than a full table scan.
+ * EVERY agent (`AGENT#` keys), then their META rows. This was the routing GSI, on the reasoning that
+ * "routed agents only… bounds this to the fleet size rather than a full table scan" — but the index
+ * cannot see a MINTED agent, so an agent whose legacy root was being looked up could be silently
+ * absent. `scanAgentScopes` is one Scan of a table in the low thousands of items, off any hot path.
  */
 async function findAgentByEfsRoot(ctx, deps, legacyName) {
   if (deps.agentByEfsRoot) return deps.agentByEfsRoot(legacyName);
   const { makeClient } = require('../lib/aws');
-  const { DynamoDBDocumentClient, QueryCommand, BatchGetCommand } = require('@aws-sdk/lib-dynamodb');
+  const { DynamoDBDocumentClient, BatchGetCommand } = require('@aws-sdk/lib-dynamodb');
+  const { scanAgentScopes } = require('../../archie-gateway/agent-directory');
   const doc = deps.doc || DynamoDBDocumentClient.from(makeClient(ctx, '@aws-sdk/client-dynamodb', 'DynamoDBClient'));
   const table = ctx.resources.configTable;
 
-  const ids = [];
-  let ExclusiveStartKey;
-  do {
-    const r = await doc.send(new QueryCommand({
-      TableName: table,
-      IndexName: 'routing',
-      KeyConditionExpression: 'gsi1pk = :p',
-      ExpressionAttributeValues: { ':p': 'ROUTING' },
-      ExclusiveStartKey,
-    }));
-    for (const it of r.Items || []) if (it.gsi1sk) ids.push(it.gsi1sk);
-    ExclusiveStartKey = r.LastEvaluatedKey;
-  } while (ExclusiveStartKey);
+  const ids = await scanAgentScopes(doc, table);
 
   for (let i = 0; i < ids.length; i += 100) { // BatchGetItem caps at 100 keys
     const Keys = ids.slice(i, i + 100).map((id) => ({ pk: `AGENT#${id}`, sk: 'META' }));
@@ -1228,6 +1345,17 @@ async function metricsQuery(ctx, args, out, deps) {
 // Full command keys — see the header for why these are not verb-keyed.
 
 module.exports = {
+  // NOT a command — the shared §8.10 legacy-name -> scope-id resolver, used by `cron hydrate` here and
+  // by `agent migrate`'s runtime phase (cmd/agent.js agentRoster).
+  //
+  // WRAPPED IN withDefaults LIKE EVERY COMMAND BELOW, and for the same reason: an external caller has no
+  // `wrapperDeps` to hand it (cmd/agent.js's own withDefaults does not build one), so the raw function
+  // would dereference `deps.modules` on undefined. The command exports hide that because each applies
+  // withDefaults itself; exporting this one bare made it the single entry point that did not.
+  resolveScopeOwner: (ctx, args, out, deps, agentId) => (
+    resolveScopeOwner(ctx, args, out, withDefaults(deps), agentId)
+  ),
+
   'config hydrate': (ctx, args, out, deps) => configHydrate(ctx, args, out, withDefaults(deps)),
   'config hydrate-conversations': (ctx, args, out, deps) => configHydrateConversations(ctx, args, out, withDefaults(deps)),
   'config validate': (ctx, args, out, deps) => configValidate(ctx, args, out, withDefaults(deps)),
@@ -1261,5 +1389,9 @@ module.exports = {
     HYDRATE_CONSEQUENCES, SCOPED_QUERIES, SCRIPTS, DEFAULT_WINDOW_SECONDS,
     lastJson, oneAgent, tail, describeSource, observabilityEnv, childAwsEnv, withDefaults, run, grantClients,
     readStoredGrant, resolveSandraSource, finishGates,
+    // Shared with `agent teardown`'s cron purge, which runs the same image against the same manager
+    // API. Exported rather than re-expressed there so the two cannot disagree about which build of
+    // the gateway they are talking to.
+    readDeployedGatewayImage,
   },
 };

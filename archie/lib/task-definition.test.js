@@ -4,7 +4,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const {
   CONSTANTS, SSM_PARAMETERS, PORT, SSM_PREFIX, dispatcherBaseUrl,
-  composeEnvironment, composeTaskDefinition,
+  composeEnvironment, composeTaskDefinition, composeCronPurgeTaskDefinition,
 } = require('./task-definition');
 const { resourcesFor } = require('./context');
 
@@ -229,4 +229,42 @@ test('the measured constants carry their measurement, not a preference', () => {
   // Zone IDS, never names: us-east-1a is use1-az4 in dev and use1-az6 in the sandbox.
   assert.equal(CONSTANTS.AGENTCORE_SUPPORTED_AZ_IDS, 'use1-az1,use1-az2,use1-az4');
   assert.match(CONSTANTS.AGENTCORE_SUPPORTED_AZ_IDS, /^use1-az[0-9](,use1-az[0-9])*$/);
+});
+
+// ── cron purge (teardown, §E2) ──────────────────────────────────────────────────────────────────
+
+const purge = (over = {}) => composeCronPurgeTaskDefinition({
+  resources: RESOURCES, region: REGION, facts: { ...FACTS, dispatcherSharedSecretArn: 'arn:...shared' },
+  image: 'repo/archie-gateway:tag', ownerAgentId: 'dm-ux0mz5ckp2r', ...over,
+});
+
+test('cron purge mounts NO filesystem — a purge reads no jobs.json, so it gets no fleet-wide read', () => {
+  const td = purge();
+  // The security property is the ABSENCE. The hydrator holds an access point over <prefix>/agents,
+  // which is "can read every agent's workspace"; a purge needs "can call one HTTP endpoint".
+  assert.equal(td.volumes, undefined);
+  assert.equal(td.containerDefinitions[0].mountPoints, undefined);
+  assert.equal(envMap(td.containerDefinitions[0].environment).MOUNT_PATH, undefined);
+});
+
+test('cron purge is keyed on the SCOPE, and carries no legacy name at all', () => {
+  const env = envMap(purge().containerDefinitions[0].environment);
+  assert.equal(env.CRON_PURGE_ONLY, '1');
+  assert.equal(env.HYDRATE_OWNER_AGENT, 'dm-ux0mz5ckp2r');
+  // The store is keyed by owner: a purge by legacy name deletes nothing and reports success, so the
+  // legacy name must not be reachable from this path even by accident.
+  assert.equal(env.HYDRATE_AGENT, undefined);
+});
+
+test('cron purge runs the gateway image with its own entry and its own log stream', () => {
+  const c = purge().containerDefinitions[0];
+  assert.deepEqual(c.entryPoint, ['node']);
+  assert.deepEqual(c.command, ['cron-hydrator.js']);
+  assert.equal(c.logConfiguration.options['awslogs-stream-prefix'], 'cron-purge');
+  assert.equal(c.secrets[0].name, 'DISPATCHER_SHARED_SECRET');
+});
+
+test('cron purge refuses without an owner — purging "whatever" has no safe reading', () => {
+  assert.throws(() => purge({ ownerAgentId: undefined }), /needs an ownerAgentId/);
+  assert.throws(() => purge({ image: undefined }), /needs an image/);
 });

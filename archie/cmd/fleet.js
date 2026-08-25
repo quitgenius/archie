@@ -37,7 +37,7 @@ const path = require('node:path');
 const { spawn, execFileSync } = require('node:child_process');
 
 const {
-  CliError, EXIT, usage, refused, partial, drift, drift: driftExit,
+  CliError, EXIT, usage, refused, partial, drift, drift: driftExit, preflight,
 } = require('../lib/exit');
 const {
   digestFor, tagFor, assertPure, dirtyWarning, ROOT: DIGEST_ROOT,
@@ -53,7 +53,7 @@ const {
 } = require('../lib/spec');
 const { describeImage, assertArm64 } = require('../lib/ecr');
 const { diffObserved } = require('../../archie-gateway/spec-diff');
-const { adoptedRootFor } = require('../lib/efs-root');
+const { adoptedRootFor, legacyEfsRootOf } = require('../lib/efs-root');
 const { runtimeIdOf } = require('../../archie-gateway/runtime-registry');
 
 // AgentCore microVMs are arm64. Not overridable — §2.6, Makefile:59-68.
@@ -364,19 +364,30 @@ async function fleetDeploy(ctx, args, out, deps = {}) {
     scanBindings(aws, ctx),
   ]);
   const rows = byTag(bindings).get(plan.imageTag) || [];
+  // THE AGENT COUNT the bypass turns on, from the roster staging ALREADY enumerated rather than a
+  // second query — `plan.stage.agents` is `agents.length` at cmd/stage.js:943. Re-reading the routing
+  // GSI here would let the gate and the thing it is gating disagree about how many agents exist.
+  const fleetAgents = plan.stage && typeof plan.stage.agents === 'number' ? plan.stage.agents : null;
   const refusal = imageCmd.publishRefusal({
     tag: plan.imageTag,
     found,
     taint,
     stats: bindingStats(rows),
     imageUri: imageUriFor(ctx, account, plan.imageTag),
+    fleetAgents,
   });
   if (refusal) {
     out.progress(`step 3/4  gate        REFUSED — nothing was published, ${plan.imageTag} is not live`);
     publish(ctx, out, plan, renderDeploy);
     throw refusal;
   }
-  out.progress(`step 4/5  gate        passed — ${rows.length} binding(s), every healthcheck ok`);
+  if (fleetAgents === 0) {
+    plan.healthcheckSkipped = true;
+    out.warn(imageCmd.emptyFleetWarning(plan.imageTag, ctx.resources.configTable));
+    out.progress(`step 4/5  gate        SKIPPED — no agents to stage or healthcheck; publishing ${plan.imageTag} unverified`);
+  } else {
+    out.progress(`step 4/5  gate        passed — ${rows.length} binding(s), every healthcheck ok`);
+  }
 
   // ── 5. the flip ────────────────────────────────────────────────────────────────────────────────
   const released = await runStep(steps.publish, ctx, {
@@ -407,6 +418,18 @@ async function resolveCanary(ctx, values, aws, deps, out) {
     return agents[0];
   }
   const { roster } = await stageCmd.enumerateAgents(aws, ctx, {}, deps);
+  // AN EMPTY ROSTER IS STILL FATAL HERE, unlike in a full stage. `enumerateAgents` stopped throwing on
+  // one so an empty deployment can publish (cmd/stage.js), but `--hotfix` means "stage exactly one
+  // agent and healthcheck it" — with no agents there is nothing to canary, and the sort below would
+  // pick `undefined` and stage a runtime for an identity that does not exist. Refuse instead: a hotfix
+  // with nothing to fix is a mistake about which deployment this is, not a releasable state.
+  if (!roster.length) {
+    throw preflight(`--hotfix needs an agent to canary, and ${ctx.resources.configTable} has none`, {
+      detail: 'either --name points at the wrong deployment (one knob derives every resource name, '
+        + 'lib/context.js) or the config has never been hydrated (`archie config hydrate`). Without '
+        + '--hotfix this deploy stages nothing and publishes unverified, which IS supported.',
+    });
+  }
   const pick = [...roster].sort()[0];
   out.progress(`canary      ${pick} (first in sorted order; --canary <agent> to choose another)`);
   return pick;
@@ -484,35 +507,6 @@ function defaultRunNode(args, { env, cwd }) {
   });
 }
 
-/**
- * The agent's legacy EFS root, from the item the dispatcher itself reads.
- *
- * THE BLIND SPOT THIS CLOSES. A §8.10-rekeyed agent (`dm-u01…`) carries `AGENT#<id>/META.efsRoot` =
- * its FORMER name, and the provisioning saga mounts THAT directory so the rekeyed agent keeps its
- * workspace, memory and sessions (`agentcore-client.js:621-630,862-868`). Derivation cannot know
- * that — `derivedSpecFor` always derives `efsRootDir(agent, prefix)` — so a comparison would report a
- * phantom `efsRoot` change for every rekeyed agent, and this command BLOCKS on `efsRoot` changes.
- * Left unhandled it would turn the loudest refusal in the CLI into a false alarm that operators learn
- * to route around, which is worse than not having it. `cmd/stage.js:516-529` does exactly this, for
- * exactly this reason, on the same item.
- */
-async function legacyEfsRootOf(aws, ctx, agent) {
-  const { GetCommand } = require('@aws-sdk/lib-dynamodb');
-  try {
-    const r = await aws.doc().send(new GetCommand({
-      TableName: ctx.resources.configTable,
-      Key: { pk: `AGENT#${agent}`, sk: 'META' },
-    }));
-    if (!r.Item || !r.Item.data) return null;
-    const meta = JSON.parse(r.Item.data);
-    return meta && typeof meta.efsRoot === 'string' && meta.efsRoot ? meta.efsRoot : null;
-  } catch {
-    // Best effort BY CONSTRUCTION, and the direction of the failure is the point: an unreadable META
-    // means we cannot PROVE the difference is a legacy adopt, and an unproven `efsRoot` difference
-    // stays data loss and stays blocking.
-    return null;
-  }
-}
 
 /** Does `root` look like the adopted legacy directory `<prefix>/<legacyName>`? */
 const isLegacyAdopt = (root, legacy) => Boolean(root && legacy && String(root).endsWith(`/${legacy}`));

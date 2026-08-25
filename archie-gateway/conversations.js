@@ -343,12 +343,34 @@ function buildConversationsTab(agentId, teamId, { page = 0 } = {}) {
   });
   const recentTotal = getConversations(agentId, { limit: 0, pinnedOnly: false }).total;
 
-  // Empty state
+  // Empty state.
+  //
+  // TWO empty states, because there are two reasons to be empty and only one of them is "yet".
+  // This store is DM-ONLY BY CONSTRUCTION: recordConversation/updateActivity have a single call site
+  // each (index.js, inside `if (event.channel_type === 'im')`), and the app_mention handler records
+  // nothing — so a `ch-` scope can never accumulate an entry no matter how busy its channel is.
+  // Verified live 2026-08-24: /efs/conversations.json held exactly one key, a dm- scope.
+  //
+  // The generic message told a channel agent's viewer to "send a DM to get started", which is advice
+  // that cannot work — the agent's entire existence is a channel — and so reads as a broken tab
+  // rather than an empty one. That was invisible until App Home could target another agent: before
+  // the selector, this tab only ever rendered the viewer's own dm- scope, so a DM-only store was only
+  // ever seen through a DM-only lens.
+  // The special-case is `ch-` SPECIFICALLY, not "anything that is not dm-". Only a channel scope is
+  // known to be unable to accumulate entries; a scope of some other shape (`bdd-tests`, or any
+  // non-Slack-minted id) is not something this function can classify, so it keeps the generic message
+  // rather than being told something about itself that may be false.
   if (pinned.items.length === 0 && recentTotal === 0) {
+    const isChannelScope = typeof agentId === 'string' && /^ch-/.test(agentId);
     blocks.push({ type: 'header', text: { type: 'plain_text', text: 'Conversations' } });
     blocks.push({
       type: 'section',
-      text: { type: 'mrkdwn', text: '_No conversations yet. Send a DM to get started!_' },
+      text: {
+        type: 'mrkdwn',
+        text: isChannelScope
+          ? '_Conversations are only tracked for DM agents. This agent answers in its channel, and channel threads are not recorded here._'
+          : '_No conversations yet. Send a DM to get started!_',
+      },
     });
     return blocks;
   }

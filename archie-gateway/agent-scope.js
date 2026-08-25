@@ -76,4 +76,45 @@ function scopeIdForRouting(meta) {
   return null;
 }
 
-module.exports = { normaliseScopeId, mintAgentName, scopeIdForRouting };
+// Slack ids are an uppercase-only alphabet, which is the whole reason the inverse below is possible.
+// {8,} not {6,}: real ids are 9-11 chars, and {6,} false-ACCEPTED ordinary words — 'current'
+// uppercases to CURRENT = C + URRENT, which matched. See the same note on
+// cron-inventory-metrics.js's SLACK_CHANNEL_ID, where that false accept was observed live.
+const SLACK_USER_ID = /^U[A-Z0-9]{6,}$/;
+const SLACK_CHANNEL_ID = /^[CDG][A-Z0-9]{8,}$/;
+
+/**
+ * THE INVERSE of the rule above: a scope id → the Slack thing it was minted from.
+ *
+ * `dm-ux0mz5ckp2r` → `{ kind: 'user', id: 'UX0MZ5CKP2R' }`
+ * `ch-cr89fluhion` → `{ kind: 'channel', id: 'CR89FLUHION' }`
+ * `bdd-tests`      → `null`  (a real scope, but not one minted from Slack)
+ *
+ * WHY IT LIVES HERE. This file's header exists because the FORWARD rule was written out three times
+ * and kept in step by a comment. The inverse is the same hazard: `cron-inventory-metrics.js:114
+ * userFromScopeId` already spells out the `dm-` half for cron delivery, and a second free-hand copy
+ * elsewhere is how the two drift. Put it next to the rule it inverts. (That cron copy is deliberately
+ * NOT collapsed into this one here — it sits on the cron delivery path and refactoring it belongs in
+ * a change that can verify that path, not in an App Home feature.)
+ *
+ * CASE RECOVERY IS LOSSLESS, and that is a property of the forward rule, not luck: `normaliseScopeId`
+ * lowercases, and there is nothing in the uppercase-only Slack alphabet for it to have destroyed. The
+ * uppercasing is not cosmetic — `conversations.info` rejects a lowercased id with `channel_not_found`
+ * (observed live 2026-08-09, see cron-delivery.js), so a caller that skips it gets a silent miss.
+ *
+ * Returns null rather than guessing for anything that does not validate, so a caller renders the raw
+ * scope id instead of inventing a Slack object that does not exist.
+ *
+ * @param {string} scopeId
+ * @returns {{kind: 'user'|'channel', id: string} | null}
+ */
+function slackRefFromScopeId(scopeId) {
+  if (typeof scopeId !== 'string') return null;
+  const m = scopeId.match(/^(dm|ch)-([a-z0-9]+)$/i);
+  if (!m) return null;
+  const id = m[2].toUpperCase();
+  if (m[1].toLowerCase() === 'dm') return SLACK_USER_ID.test(id) ? { kind: 'user', id } : null;
+  return SLACK_CHANNEL_ID.test(id) ? { kind: 'channel', id } : null;
+}
+
+module.exports = { normaliseScopeId, mintAgentName, scopeIdForRouting, slackRefFromScopeId };

@@ -11,6 +11,7 @@ import { createRequire } from 'node:module';
 import { createHash } from 'node:crypto';
 import { registerBedrock, getModel, runTurn, withModel, pca } from './pi-runtime.mjs';
 import { resolveSessionPath, writeIndexEntry } from './session-store.mjs';
+import { outcomeAttributes } from './tool-outcome.mjs';
 import { resolveModelSpec, resolveAllowedTools, buildBuiltinTools, buildCustomTools, readBootstrapContext, makeResourceLoader, resolvePluginManifest, findUnavailablePlugins } from './config-map.mjs';
 import { loadAgentConfig } from './agent-config.mjs';
 import { buildCompatPlugins, prewarmCompatPlugins } from './openclaw-compat/plugin-host.mjs';
@@ -354,6 +355,20 @@ async function emitToolSpans(parent, toolCalls, sessionId) {
       const ts = otel.startSpan(`execute_tool ${tc.name || 'tool'}`, {
         traceId: parent.traceId, parentSpanId: parent.spanId, kind: 1, startTimeMs: tc.startMs,
       });
+      // WHICH connector action(s), and whether the call actually worked. Both were missing, and the
+      // pair is what makes a tool span answer a question rather than raise one:
+      //
+      //   slugs   `agent_i32pz9.tool.name` for every connector call is one of six generic wrappers, so a
+      //           batched CONNECTOR_MULTI_EXECUTE_TOOL recorded as one anonymous span. Same field the
+      //           PEP already emits (permissions-extension.mjs:59), comma-joined for Insights.
+      //   result  outcome only, never the payload — see tool-outcome.mjs.
+      //
+      // THE SPAN GOES RED ON A DECLARED FAILURE, not only on a thrown one. A connector call that fails
+      // returns HTTP 200 with `{successful:false}`, so before this a failed Gmail lookup and a working
+      // one were both green: measured 2026-08-21 on gmail-count-every-10min, one 755ms tool span with
+      // no error flag and a 43-character answer. `ok === false` is the assertion; `ok == null` (no
+      // envelope) deliberately does NOT fail the span.
+      const failed = tc.outcome && tc.outcome.ok === false;
       await otel.end(ts, {
         attributes: {
           'agent_i32pz9.operation.name': 'execute_tool',
@@ -361,8 +376,12 @@ async function emitToolSpans(parent, toolCalls, sessionId) {
           'agent_i32pz9.tool.call.id': tc.id,
           'agent_i32pz9.conversation.id': sessionId,
           'session.id': sessionId,
+          ...(tc.slugs ? { 'agent_i32pz9.tool.connector.slugs': tc.slugs } : {}),
+          ...outcomeAttributes(tc.outcome),
         },
-        error: tc.isError ? 'tool execution error' : undefined,
+        error: tc.isError
+          ? 'tool execution error'
+          : (failed ? `tool reported failure${tc.outcome.code ? ` (${tc.outcome.code})` : ''}` : undefined),
         endTimeMs: tc.endMs,
       });
     } catch { /* telemetry must never break a turn */ }
@@ -519,7 +538,7 @@ const sessions = new Map(); // sessionKey -> { session, turnCtx, skillFp } (per-
 // `model` rides here so a FAILED skill read does not silently drop the picked model out of the
 // config fingerprint — dropping it would flip the fp, force a re-resolve, then flip it back on the
 // next successful read: two needless re-resolves from one transient DynamoDB error.
-let skillState = { fp: null, model: null }; // last skill-fingerprint materialized onto SKILLS_DIR (this microVM)
+let skillState = { fp: null, marketplace: null }; // last skill-fingerprint materialized onto SKILLS_DIR (this microVM)
 let configState = { fp: null }; // last config-fingerprint bound into this microVM's live config
 
 // Bind the resolved config for AGENT_NAME -> model + tool allow-set + plugin routing.
@@ -1011,9 +1030,9 @@ function ensureEfsReady() {
  */
 export { configFingerprint };
 
-async function readConfigState(io, model) {
+async function readConfigState(io, marketplace) {
   const { agent } = await io.readConfigItems();
-  return { fp: configFingerprint(agent, model) };
+  return { fp: configFingerprint(agent, marketplace) };
 }
 
 // Re-read the config items and re-bind. `force` bypasses agent-config's memo (the whole point of the
@@ -1051,12 +1070,16 @@ async function readSkillState(io, allowedSkills = null, governedSkills = null) {
     onPermissionSignal({ capability: `skill:${skillId}`, surface: 'skill', tool: skillId, reason: 'policy-denied', decision: 'deny' });
   });
   const { fp, names } = skillFingerprint(filtered, man);
-  // `models` rides back with the skill read because it lives on the SAME item and the App Home
-  // model picker writes it (marketplace.js setModel). It is deliberately NOT folded into the skill
-  // fingerprint — that one keys the /tmp skill materialisation, and a model change must not force
-  // a needless re-hydrate. It goes to the CONFIG fingerprint instead, which is what re-resolves the
-  // config. See readConfigState.
-  return { fp, names, manifest: man, model: (mkt && mkt.models) || null };
+  // THE WHOLE MARKETPLACE ITEM rides back, not a slice of it. It lives on the same item this read
+  // already fetched, so carrying all of it costs nothing, and every field on it that config
+  // resolution consumes — `.models` (the picker), `.connectors` (connector toolkits, plugin-slice.mjs:100),
+  // `.customMcp` — reaches the CONFIG fingerprint by construction rather than by someone remembering
+  // to add it. Two silent outages came from that list being hand-maintained; see config-fingerprint.mjs.
+  //
+  // It is still NOT folded into the SKILL fingerprint: that one keys the /tmp skill materialisation,
+  // and a model or connector change must not force a needless re-hydrate. The split stays; only the
+  // config half's input selection changed.
+  return { fp, names, manifest: man, marketplace: mkt || null };
 }
 
 // (Re)materialize the agent's installed skills onto /tmp (scoped: installs written, others pruned),
@@ -1103,16 +1126,16 @@ async function getSession(key, seed = {}) {
     console.error(JSON.stringify({ level: 'warn', component: 'pi-adapter', msg: 'skill fingerprint read failed — using cached session / current skills', key, err: e.message }));
     const cachedOnErr = sessions.get(key);
     if (cachedOnErr) return cachedOnErr;
-    skill = { fp: skillState.fp, names: [], manifest: { skills: {} }, model: skillState.model };
+    skill = { fp: skillState.fp, names: [], manifest: { skills: {} }, marketplace: skillState.marketplace };
   }
   // Remember the picked model on EVERY successful read, not inside hydrateSkills — that early-returns
   // whenever the skill fingerprint is unchanged, which is exactly the case where only the model moved.
-  if (skill.model !== undefined) skillState.model = skill.model;
+  if (skill.marketplace !== undefined) skillState.marketplace = skill.marketplace;
   // Same discipline as the skill read: a config-fingerprint failure keeps whatever is already
   // resolved rather than dropping the turn or re-resolving blindly.
   let cfg = { fp: configState.fp };
   try {
-    cfg = await readConfigState(io, skill.model);
+    cfg = await readConfigState(io, skill.marketplace);
   } catch (e) {
     console.error(JSON.stringify({ level: 'warn', component: 'pi-adapter', msg: 'config fingerprint read failed — keeping current config', key, err: e.message }));
   }

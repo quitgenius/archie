@@ -23,7 +23,7 @@ const { runSourceChecks, capabilityUniverse, diffDecisions, checkSkillHolders } 
 const codegen = require('../lib/policy-codegen');
 const seed = require('../lib/policy-seed');
 const { scanBindings } = require('../lib/bindings');
-const { collectFromDdb } = require('../../archie-gateway/routing-build');
+const { listAgents } = require('../lib/agents');
 
 const POLICY_PK = 'CONFIG#policy';
 const FLEET_SK = 'FLEET';
@@ -65,25 +65,27 @@ function sourcesForAccount(account, deps = {}) {
 }
 
 /**
- * Every scope we can enumerate, as two columns rather than one merged number.
+ * Every agent, plus any orphaned runtime bindings.
  *
- * ROUTING is what `archie deploy` stages. RUNTIME# partitions are the scopes that have actually SERVED,
- * which includes minted ones the roster has never contained. Neither is a superset: measured in the
- * sandbox 2026-08-18, routing held 2 and runtimes held 4 — and the two it lacked included
- * ch-cr89fluhion, the scope every sandbox pin is attached to.
+ * `agents` is `AGENT#` partition keys — the complete list, see lib/agents.js. This used to be the
+ * routing GSI merged with the `RUNTIME#` partitions, on the reasoning that "neither is a superset:
+ * routing held 2 and runtimes held 4". That was evidence BOTH were wrong, not that both were needed:
+ * the GSI cannot see a minted agent at all, and `RUNTIME#` is image-binding state that says nothing
+ * about which agents exist. `AGENT#` answers it outright and the merge is gone.
  *
- * Reporting them separately is the point: a scope in `minted` and not in `routing` is invisible to every
- * other fleet command, and an operator should see that rather than have it averaged away.
+ * `orphans` is kept as a DIAGNOSTIC, not as part of the roster: a `RUNTIME#` partition with no `AGENT#`
+ * sibling is residue (a torn-down agent, an interrupted provision), and it should be visible rather
+ * than averaged into a count. It is expected to be empty.
  */
 async function enumerateScopes(aws, ctx) {
-  const [routingRows, bindings] = await Promise.all([
-    collectFromDdb(aws.doc(), ctx.resources.configTable),
+  const [rows, bindings] = await Promise.all([
+    listAgents(aws.doc(), ctx.resources.configTable),
     scanBindings(aws, ctx),
   ]);
-  const routing = [...new Set(routingRows.map((r) => r.agent).filter(Boolean))].sort();
+  const agents = [...new Set(rows.map((r) => r.agent).filter(Boolean))].sort();
   const served = [...new Set(bindings.map((b) => b.agent).filter(Boolean))].sort();
-  const minted = served.filter((s) => !routing.includes(s));
-  return { routing, minted, all: [...new Set([...routing, ...served])].sort() };
+  const orphans = served.filter((s) => !agents.includes(s));
+  return { routing: agents, minted: orphans, all: agents };
 }
 
 /**
@@ -154,8 +156,8 @@ async function publish(ctx, args, out, deps = {}) {
   const { routing, minted, all } = await enumerateScopes(aws, ctx);
   if (!all.length) {
     throw preflight(`no scopes found in ${table}`, {
-      detail: 'nothing in the routing GSI and no RUNTIME# bindings — either --name points at the wrong '
-        + 'deployment or the config has never been hydrated (`archie config hydrate`).',
+      detail: 'no AGENT# items — either --name points at the wrong deployment or the config has never '
+        + 'been hydrated (`archie config hydrate`).',
     });
   }
 
@@ -210,8 +212,8 @@ async function publish(ctx, args, out, deps = {}) {
 
   const head = [
     `env       ${sources.env}  account ${account}  digest ${artifact.policyDigest}`,
-    `scopes    ${routing.length} routed + ${minted.length} minted-only = ${all.length}`
-    + (minted.length ? `  (minted-only: ${minted.join(', ')})` : ''),
+    `scopes    ${all.length} agent(s)`
+    + (minted.length ? `  · WARNING ${minted.length} orphaned runtime binding(s) with no AGENT# row: ${minted.join(', ')}` : ''),
     `verified  ${checked} scope(s) — membership derivation matches Cedar`,
     `pinned    ${withPins.length} scope(s) hold at least one pinned capability:`,
     ...withPins.map((r) => `            ${r.scope}  ${allowsFor(r).join(', ')}`),

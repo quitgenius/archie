@@ -60,7 +60,7 @@ function healthyAws(overrides = {}) {
     async callerIdentity() { calls.push({ name: 'callerIdentity' }); return { Account: ACCOUNT, Arn: `arn:aws:sts::${ACCOUNT}:assumed-role/AdminRole/sandbox` }; },
     async describeTable(name) {
       calls.push({ name: 'describeTable', args: [name] });
-      return { TableStatus: 'ACTIVE', GlobalSecondaryIndexes: [{ IndexName: 'routing', IndexStatus: 'ACTIVE' }] };
+      return { TableStatus: 'ACTIVE' };
     },
     async getItem(table, key, opts) {
       calls.push({ name: 'getItem', args: [table, key, opts] });
@@ -225,12 +225,16 @@ test('check 2: an absent table is named, with the operation', async () => {
   assert.match(stdout, /dynamodb:DescribeTable agent-gn0p84-config in us-east-1: table does not exist/);
 });
 
-test('check 2: the routing GSI is checked by NAME — routing-build.js queries it literally', async () => {
+// The GSI requirement is GONE, and this asserts the absence rather than deleting the case silently.
+// It used to demand a `routing` GSI and exit PREFLIGHT without one, because "routing-build.js queries
+// IndexName 'routing' literally — agent enumeration returns nothing without it". routing-build.js is
+// deleted and enumeration is a Scan of `AGENT#` keys, so a table with no GSI at all is now correct.
+test('check 2 passes on a table with NO secondary index — none is required any more', async () => {
   const { code, stdout } = await run({ checks: '2' }, {
-    async describeTable() { return { TableStatus: 'ACTIVE', GlobalSecondaryIndexes: [{ IndexName: 'gsi1', IndexStatus: 'ACTIVE' }] }; },
+    async describeTable() { return { TableStatus: 'ACTIVE' }; },
   });
-  assert.equal(code, EXIT.PREFLIGHT);
-  assert.match(stdout, /no "routing" GSI \(has: gsi1\)/);
+  assert.equal(code, 0);
+  assert.doesNotMatch(stdout, /routing/);
 });
 
 // The retired number must not silently select nothing and report success — `--checks 3` in an old

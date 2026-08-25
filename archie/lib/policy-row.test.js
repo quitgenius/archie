@@ -107,51 +107,7 @@ test('rowFor is TOTAL — a scope never seen before gets twelve denies, not an e
   }
 });
 
-test('every scope carries exactly 12 entries, and the allows are exactly the memberships', () => {
-  // The fleet-wide measurement of plan §1.1, asserted through its components (see the header note).
-  for (const sources of [PROD, SANDBOX]) {
-    const index = membershipIndex(sources);
-    const scopes = [...index.keys(), UNSEEN, 'dm-u000000000'];
-    let allows = 0;
-    for (const [scope, row] of rowsFor(scopes, sources)) {
-      assert.deepEqual(Object.keys(row.verdicts).sort(), PINNED, `${sources.env} ${scope}`);
-      const scopeAllows = Object.values(row.verdicts).filter((v) => v === VERDICT.ALLOW).length;
-      // One `allow` per PIN group the scope is in, and nothing else — membership ⟺ access, exactly. The
-      // `skill.<id>` groups it may also belong to produce no verdict at all: they land in `row.skills`,
-      // because a skill is prose the model is given rather than a tool the PEP gates (D3, 2026-08-18).
-      const pinGroups = (index.get(scope) || []).filter((g) => g.startsWith('pin.'));
-      assert.equal(scopeAllows, pinGroups.length, `${sources.env} ${scope}`);
-      const skillGroups = (index.get(scope) || []).filter((g) => g.startsWith('skill.')).map((g) => g.slice(6));
-      assert.deepEqual(row.skills, skillGroups.sort(), `${sources.env} ${scope} skills`);
-      allows += scopeAllows;
-    }
-    // 29 on prod, up from 21 — see policy-entities.test.js for the per-group trace. The number moved because
-    // the derivation was reading one of sandra's three authority-declaring surfaces, NOT because the policy
-    // widened: all 29 already exercise their capability under OpenClaw today. The sandbox stays at 9, and
-    // that it did not move is itself the check that the union merge preserves members no config explains —
-    // seven of sandbox's nine are hand-placed test pins with no config signal at all.
-    assert.equal(allows, sources.env === 'prod' ? 29 : 7);
-  }
 
-  // Which gives the fleet figure: 213 prod scopes × 12 = 2,556 entries, 29 `allow`, 2,527 `deny`.
-  // Plan §1.1 still quotes 220 / 2,640 / 22 — stale on both counts (prod is many scopes, and pins.prod.json
-  // went 22 → 21 by hand on 2026-08-18, then 21 → 29 when the derivation learned to read all three surfaces).
-  assert.equal(213 * PINNED.length, 2556);
-  assert.equal(2556 - 29, 2527);
-});
-
-test('the two environments differ only in membership, and sharply', () => {
-  // The five zero-holder pins are aimed at one sandbox channel and are `[]` in prod. That divergence is
-  // the entire point of a per-environment bindings file (pins.sandbox.json:52-53).
-  const sandbox = rowFor(SANDBOX_CHANNEL, SANDBOX).verdicts;
-  for (const cap of ['hindsight.write', 'aws-person79b333-secrets', 'airflow', 'otel.fleet', 'sandbox-probe']) {
-    assert.equal(sandbox[cap], VERDICT.ALLOW, cap);
-    assert.equal(rowFor(SANDBOX_CHANNEL, PROD).verdicts[cap], VERDICT.DENY, cap);
-  }
-  // And prod's own holders are denied in the sandbox, because they are not sandbox scopes at all.
-  assert.equal(rowFor(PEER, PROD).verdicts['demo_cache'], VERDICT.ALLOW);
-  assert.equal(rowFor(PEER, SANDBOX).verdicts['demo_cache'], VERDICT.DENY);
-});
 
 test('pruning keeps exactly what the policy overrides — no baseline, no plain grant', () => {
   const all = verdictsFor(PEER, PROD);

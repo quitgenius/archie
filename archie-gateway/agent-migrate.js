@@ -24,7 +24,6 @@ const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
 const { DynamoDBDocumentClient } = require('@aws-sdk/lib-dynamodb');
-const routingBuild = require('./routing-build');
 const { createAgentCoreClient } = require('./agentcore-client');
 const agentCore = createAgentCoreClient();
 const cronHydrator = require('./cron-hydrator');
@@ -60,8 +59,9 @@ async function phaseConfig() {
 
 async function agentList() {
   if (agentsArg) return agentsArg.split('=')[1].split(',').map((s) => s.trim()).filter(Boolean);
-  const configs = await routingBuild.collectFromDdb(doc, TABLE, { log: { info() {}, warn() {}, error() {} } });
-  return configs.map((c) => c.agent);
+  // `AGENT#` keys are the complete agent list. Was the routing GSI, which cannot see a minted agent.
+  const { scanAgentScopes } = require('./agent-directory');
+  return scanAgentScopes(doc, TABLE);
 }
 
 async function phaseRuntimes(agents) {

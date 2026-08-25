@@ -470,8 +470,8 @@ const CHECKS = [
 
   {
     n: 2,
-    titleFor: (ctx) => `${ctx.resources.configTable} + routing GSI`,
-    title: 'config table + routing GSI',
+    titleFor: (ctx) => `${ctx.resources.configTable} exists and is ACTIVE`,
+    title: 'config table',
     async run(w) {
       const table = w.ctx.resources.configTable;
       let described;
@@ -488,21 +488,11 @@ const CHECKS = [
           detail: 'created by modules/archie/agent_config.tf — this is Terraform, not something the CLI creates',
         };
       }
-      const gsis = described.GlobalSecondaryIndexes || [];
-      // 'routing' is a literal in routing-build.js's IndexName, so the NAME is load-bearing
-      // (agent_config.tf:35-41).
-      const routing = gsis.find((g) => g.IndexName === 'routing');
-      if (!routing) {
-        return {
-          status: FAIL,
-          note: `${table} exists but has no "routing" GSI (has: ${gsis.map((g) => g.IndexName).join(', ') || 'none'})`,
-          detail: 'routing-build.js queries IndexName "routing" literally — agent enumeration returns nothing without it',
-        };
-      }
-      if (routing.IndexStatus && routing.IndexStatus !== 'ACTIVE') {
-        return { status: FAIL, note: `${table} routing GSI is ${routing.IndexStatus}, not ACTIVE` };
-      }
-      return { status: PASS, note: `${table} ${described.TableStatus || 'ACTIVE'}, routing GSI ACTIVE` };
+      // NO GSI CHECK. This used to require a `routing` GSI and FAIL without it, on the grounds that
+      // "routing-build.js queries IndexName 'routing' literally — agent enumeration returns nothing
+      // without it". Both halves of that are now false: routing-build.js is deleted, and enumeration
+      // is a Scan of `AGENT#` keys, which needs no index. The table's pk/sk are all that is required.
+      return { status: PASS, note: `${table} ${described.TableStatus || 'ACTIVE'}` };
     },
   },
 
