@@ -78,7 +78,9 @@ WORKDIR /app
 # arm64 prebuilt for every release. node-pre-gyp uses a prebuilt when available and only
 # falls back to compiling. (Kept in the image; this is a migration PoC, size is secondary.)
 # python3/make/g++ are for duckdb's node-gyp source build (no guaranteed arm64 prebuilt).
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates python3 make g++ \
+# curl is for the agent's own exec tool — lets a turn diagnose network reachability (e.g. an
+# internal MCP server ALB) from inside the actual runtime, not just from an external test task.
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates python3 make g++ curl \
   && rm -rf /var/lib/apt/lists/*
 
 COPY agentcore-pi/package.json ./
