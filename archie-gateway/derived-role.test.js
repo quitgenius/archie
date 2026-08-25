@@ -60,18 +60,39 @@ describe('readAgentCaps', () => {
     expect(await readAgentCaps(fakeDoc({ capabilities: ['aws-readonly', 'datadog'] }), TABLE, 'a')).toEqual(['aws-readonly', 'datadog']);
   });
   // SECURITY REGRESSION GUARD. Grants must live in their OWN partition (GRANT#<id>/SCOPE#*), not
-  // under the agent's own partition. Every AgentCore runtime role holds dynamodb:PutItem/UpdateItem
-  // on this table (it persists its own AGENT#<id>/SEED) and IAM has NO sort-key condition key — so
-  // if grants sat at AGENT#<id>/GRANT#*, the write scope that lets an agent save its SEED would also
-  // let it rewrite the grants that police it, and an agent holding `bash` could escalate its own
-  // tool surface using the runtime's credentials. The IAM write condition (LeadingKeys AGENT#*, in
-  // config-resolver/agentcore-base-policy.cjs) can only exclude grants while this key holds.
+  // under the agent's own partition, so that no table write a runtime might hold can reach the grants
+  // that police it — an agent able to rewrite its own grants escalates its own tool surface.
+  //
+  // CORRECTION (2026-08-25). This comment used to assert as fact that "every AgentCore runtime role
+  // holds dynamodb:PutItem/UpdateItem on this table (it persists its own AGENT#<id>/SEED)", pinned by
+  // LeadingKeys AGENT#*. The deployed IAM says otherwise: `archie-agentcore-base` — the only managed
+  // policy attached to a derived role — has ZERO dynamodb statements, and the inline `grants` document
+  // carries only DdbReadOwnScope (GetItem/Query/BatchGetItem). A derived role cannot write this table
+  // at all today. The claim is left recorded rather than deleted because believing it is what almost
+  // blocked the POLICY read below as a self-escalation path.
+  //
+  // The partition split is still right, and the guard still earns its place — it is defence for the
+  // day a write IS added, which is the event that would make it load-bearing again.
   it('reads the agent-wide grant from its OWN partition — never AGENT#<id> (self-escalation guard)', async () => {
     const doc = fakeDoc({ 'aws-readonly': { sources: ['skill:x'] } });
     await readAgentCaps(doc, TABLE, 'dm-u123');
-    expect(doc.keys).toEqual([{ pk: 'GRANT#dm-u123', sk: 'SCOPE#*' }]);
-    // Explicitly NOT the agent's own partition — that is the write scope the runtime already holds.
-    expect(doc.keys[0].pk).not.toBe('AGENT#dm-u123');
+    // THE GRANT still comes from its own partition. That is the load-bearing assertion and it is
+    // unchanged: the grant read must never be AGENT#<id>, whose sort keys sit inside whatever write
+    // scope a runtime holds.
+    expect(doc.keys).toContainEqual({ pk: 'GRANT#dm-u123', sk: 'SCOPE#*' });
+    expect(doc.keys.some((k) => k.pk === 'AGENT#dm-u123' && k.sk.startsWith('GRANT'))).toBe(false);
+    // The POLICY row is read too, and it IS in the agent's own partition — which is safe only because
+    // a derived role cannot write this table AT ALL. Verified against the deployed IAM (2026-08-25):
+    // `archie-agentcore-base`, the only managed policy attached, has ZERO dynamodb statements, and the
+    // inline `grants` document carries just DdbReadOwnScope (GetItem/Query/BatchGetItem). An earlier
+    // version of this comment claimed a `DdbWriteOwnAgentPartition` write pinned to LeadingKeys
+    // AGENT#* — that statement is not in the deployed policy, and reasoning from it is what nearly
+    // made this read look like a self-escalation path.
+    //
+    // SO THE CHECK THAT MATTERS IS NOT THE KEY, IT IS THE WRITE SCOPE. If a runtime ever gains a table
+    // write, this read becomes an escalation: an agent could grant itself sts:AssumeRole on a
+    // cross-account reader by writing one item. Re-verify the base policy before adding any write.
+    expect(doc.keys).toContainEqual({ pk: 'AGENT#dm-u123', sk: 'POLICY' });
   });
   it('missing item / no data / bad JSON → []', async () => {
     expect(await readAgentCaps(fakeDoc(undefined), TABLE, 'a')).toEqual([]);
@@ -398,5 +419,64 @@ describe('putDerivedGrants — live update must PRESERVE the scoped config read'
     };
     const r = await putDerivedGrants({ clients: clientsWith(iam), ...args({ caps: [] }) });
     expect(r).toEqual({ roleName: 'a', applied: false, reason: 'role-absent' });
+  });
+});
+
+// ---------- pinned capabilities reach IAM ----------
+//
+// The bug this closes, seen live: person79b333 holds `aws-readonly` by PIN, its runtime resolved the tool and
+// the PEP allowed the call, and the assume failed —
+//   AccessDenied: .../assumed-role/ch-c66pp782t9k/... is not authorized to perform: sts:AssumeRole
+//   on .../role/clawdbot-cross-account-readonly-reader
+// because hydration strips policy-owned caps from GRANT#* (migrate-to-ddb R1) and this function fed
+// IAM from the grant row alone. Correct for the PEP, which reads the policy; fatal for IAM, which has
+// no policy to read.
+
+function fakeDocRows({ grant, policy }) {
+  const keys = [];
+  return {
+    keys,
+    async send(cmd) {
+      const k = cmd.input && cmd.input.Key;
+      keys.push(k);
+      const row = k.sk === 'POLICY' ? policy : grant;
+      return row === undefined ? {} : { Item: { data: JSON.stringify(row) } };
+    },
+  };
+}
+
+describe('readAgentCaps: the effective set is grant ∪ policy-allowed', () => {
+  it('a PINNED cap absent from the grant row still reaches IAM', async () => {
+    const caps = await readAgentCaps(fakeDocRows({
+      grant: { 'fs.write': { sources: ['agent-base'] } },          // exactly what hydration leaves
+      policy: { verdicts: { 'aws-readonly': 'allow', airflow: 'deny' } },
+    }), TABLE, 'ch-c66pp782t9k');
+    expect(caps).toEqual(['aws-readonly', 'fs.write']);
+  });
+
+  it('a DENIED cap contributes nothing — no IAM for a capability the policy refuses', async () => {
+    // The direction that matters for blast radius: a deny must not hand out sts:AssumeRole on a
+    // cross-account reader. Every capability in CAP_IAM_REQUIREMENTS is an assume except datadog.
+    const caps = await readAgentCaps(fakeDocRows({
+      grant: {},
+      policy: { verdicts: { 'aws-readonly': 'deny', 'cloudwatch-logs': 'deny' } },
+    }), TABLE, 'a');
+    expect(caps).toEqual([]);
+  });
+
+  it('a cap in BOTH rows appears once', async () => {
+    const caps = await readAgentCaps(fakeDocRows({
+      grant: { 'aws-readonly': { sources: ['skill:x'] } },
+      policy: { verdicts: { 'aws-readonly': 'allow' } },
+    }), TABLE, 'a');
+    expect(caps).toEqual(['aws-readonly']);
+  });
+
+  it('a missing or unreadable POLICY row leaves the grant caps intact', async () => {
+    // Provisioning must not become dependent on a published policy: a scope minted before the first
+    // publish has no POLICY row, and it still has to get a role.
+    expect(await readAgentCaps(fakeDocRows({
+      grant: { 'fs.write': { sources: ['agent-base'] } }, policy: undefined,
+    }), TABLE, 'a')).toEqual(['fs.write']);
   });
 });

@@ -53,16 +53,52 @@ async function schema() {
 // shared base role). Key comes from the schema module — grants live in their OWN partition
 // (GRANT#<id>/SCOPE#*) so agent roles can be IAM-denied write access to them.
 async function readAgentCaps(doc, tableName, agentId) {
-  const { agentGrantKey } = await schema();
-  const r = await doc.send(new GetCommand({ TableName: tableName, Key: agentGrantKey(agentId, '*') }));
-  if (!r.Item || !r.Item.data) return [];
-  try {
-    const d = JSON.parse(r.Item.data);
-    // §8.4 grant shape { <cap>: { sources } } → caps are the keys; legacy { capabilities: [] } still
-    // read (mirrors config-resolver grantedCaps / schema.grantedCaps).
-    if (Array.isArray(d.capabilities)) return d.capabilities;
-    return Object.keys(d).filter((k) => d[k] && typeof d[k] === 'object' && Array.isArray(d[k].sources));
-  } catch { return []; }
+  const { agentGrantKey, agentPolicyKey } = await schema();
+  const [g, p] = await Promise.all([
+    doc.send(new GetCommand({ TableName: tableName, Key: agentGrantKey(agentId, '*') })),
+    // TWO SOURCES, because a PINNED capability is deliberately ABSENT from the grant row.
+    //
+    // Hydration strips any policy-owned capability from GRANT#* (migrate-to-ddb R1: "never hydrate a
+    // capability the Cedar policy owns" — the policy's forbid beats a grant-row permit, so the row
+    // would confer nothing while making the Tools tab claim otherwise). That is correct for the PEP,
+    // which reads the policy. But this function also feeds the agent's IAM (deriveGrantStatements →
+    // CAP_IAM_REQUIREMENTS), and IAM has no policy row to consult — so a capability that is both
+    // pinned AND needs IAM could never get its statement.
+    //
+    // That is every IAM-needing capability there is except `datadog` (API keys, no IAM) and the
+    // test-only probe: aws-readonly, aws-person79b333-secrets, cloudwatch-logs, airflow. Observed live —
+    // person79b333 holds aws-readonly by pin, its runtime resolved the tool and the PEP allowed the call,
+    // and the assume failed with "not authorized to perform: sts:AssumeRole" because the role carried
+    // no such statement. The @aws-ports BDD passed only because its fixture writes the cap straight
+    // into the grant row, bypassing the strip.
+    doc.send(new GetCommand({ TableName: tableName, Key: agentPolicyKey(agentId) })),
+  ]);
+  const caps = new Set();
+  if (g && g.Item && g.Item.data) {
+    try {
+      const d = JSON.parse(g.Item.data);
+      // §8.4 grant shape { <cap>: { sources } } → caps are the keys; legacy { capabilities: [] } still
+      // read (mirrors config-resolver grantedCaps / schema.grantedCaps).
+      if (Array.isArray(d.capabilities)) for (const c of d.capabilities) caps.add(c);
+      else for (const k of Object.keys(d)) if (d[k] && typeof d[k] === 'object' && Array.isArray(d[k].sources)) caps.add(k);
+    } catch (err) {
+      // CLASSIFY, don't swallow. Unparseable JSON is the one failure this tolerates (and its
+      // pre-existing contract — see the "bad JSON → []" test): a corrupt row must not stop the agent
+      // getting a role, because a role that cannot be built is a boot failure. Anything else is a bug
+      // in this reader and must surface rather than silently under-permission the role, which would
+      // present as an opaque AccessDenied inside a turn.
+      if (!(err instanceof SyntaxError)) throw err;
+    }
+  }
+  if (p && p.Item && p.Item.data) {
+    try {
+      const v = (JSON.parse(p.Item.data) || {}).verdicts || {};
+      for (const [cap, verdict] of Object.entries(v)) if (verdict === 'allow') caps.add(cap);
+    } catch (err) {
+      if (!(err instanceof SyntaxError)) throw err;
+    }
+  }
+  return [...caps].sort();
 }
 
 /**
