@@ -785,16 +785,17 @@ async function grantsApply(ctx, args, out, deps) {
  * why the service runs at desired_count = 1); a direct `/efs/cron` write is silently overwritten.
  * So this file has no filesystem path to the store at all — only HTTP.
  *
- * The URL is not derivable: it is a Cloud Map internal name (`http://dispatcher.<ns>:9090`,
- * main.tf:26) reachable only from inside the VPC. Env, or a clear refusal.
+ * The URL is not derivable: it is the internal load balancer's AWS-GENERATED hostname
+ * (dispatcher_lb.tf, `local.dispatcher_internal_url` in main.tf), reachable only from inside the
+ * VPC. Env, or a clear refusal.
  */
 async function managerApi(ctx, out, deps) {
   if (deps.managerApi) return deps.managerApi;
   const baseUrl = deps.env.MANAGER_API_URL || deps.env.DISPATCHER_BASE_URL;
   if (!baseUrl) {
     throw refused('no manager API URL — set MANAGER_API_URL (or DISPATCHER_BASE_URL)', {
-      detail: 'The cron store has exactly one writer (the dispatcher). Its URL is the Cloud Map internal '
-        + 'name http://dispatcher.<namespace>:<port> (main.tf:26) and is only reachable from inside the VPC.',
+      detail: 'The cron store has exactly one writer (the dispatcher). Its URL is the internal load '
+        + "balancer's generated hostname (modules/archie/dispatcher_lb.tf), only reachable from inside the VPC.",
     });
   }
   let secret = deps.env.DISPATCHER_SHARED_SECRET;

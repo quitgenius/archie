@@ -846,7 +846,7 @@ async function convergeDeploymentShape(ecs, ctx, out, deployed, target) {
  */
 async function createService(ecs, ctx, facts, config, taskDefinitionArn, deploymentConfiguration) {
   const { CreateServiceCommand } = require('@aws-sdk/client-ecs');
-  const { SERVICE } = require('../lib/task-definition');
+  const { SERVICE, PORT, CONTAINER_NAME } = require('../lib/task-definition');
   // PASSED IN, not re-read from SERVICE. The caller resolved one shape for the whole command; reading
   // the module constant here would let a create disagree with the wait that follows it — the same
   // mistake the roll's own comment describes, one function further along.
@@ -869,7 +869,14 @@ async function createService(ecs, ctx, facts, config, taskDefinitionArn, deploym
           assignPublicIp: SERVICE.assignPublicIp,
         },
       },
-      serviceRegistries: [{ registryArn: facts.serviceRegistryArn }],
+      // The internal NLB, not Cloud Map. Terraform owns the target group but NOT this service
+      // (dispatcher.tf), so registering into it is the CLI's job — an ECS service attaches to a
+      // target group only at creation or through an explicit update, never implicitly.
+      loadBalancers: [{
+        targetGroupArn: facts.dispatcherTargetGroupArn,
+        containerName: CONTAINER_NAME,
+        containerPort: PORT,
+      }],
       tags: [{ key: 'Deployment', value: ctx.resources.name }, { key: 'ManagedBy', value: 'archie' }],
       propagateTags: 'SERVICE',
     }));

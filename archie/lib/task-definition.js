@@ -79,8 +79,13 @@ const CONSTANTS = {
 
 // The container port. Separate from CONSTANTS because it is a number that appears in four places —
 // the env var, the port mapping, the healthcheck command and DISPATCHER_BASE_URL — and they must
-// agree. The only inbound caller is the agent's cron tool over Cloud Map.
+// agree. The inbound callers are the agent's cron tool and the cron hydrator, both via the NLB.
 const PORT = 9090;
+
+// The container's name inside the task definition. Shared because `archie deploy`'s CreateService
+// must name it in its `loadBalancers` entry, and a mismatch there is rejected by ECS as a container
+// that is not in the definition — a confusing error a long way from its cause.
+const CONTAINER_NAME = 'dispatcher';
 
 // Fargate sizing. Not in §4.3's SSM set: no environment has ever differed, and a task definition
 // that is too small fails visibly and immediately rather than subtly.
@@ -116,7 +121,7 @@ const SSM_PARAMETERS = [
 // it as AGENTCORE_EFS_FS_ID, and the access point id reaches only the volume definition.
 //
 // Everything else archie needs is resolved BY NAME, because Terraform names it from `--name`: roles,
-// security groups, queues, repositories, Cloud Map. These two cannot be, and the reason differs for
+// security groups, queues, repositories, the target group. These two cannot be, and the reason differs for
 // each — see the block comment in modules/archie/ssm.tf. Both are REQUIRED: a deployment with no
 // file system is not a deployment with a default file system.
 const SSM_HANDLES = [
@@ -257,11 +262,11 @@ function composeEnvironment({ resources, region, facts, ssm }) {
     CRON_METRIC_NAMESPACE: resources.cronNamespace,
     DISPATCHER_SHARED_SECRET_ID: resources.dispatcherSharedSecret,
 
-    // A pure function of the knob and the port, which is why it is NOT an SSM parameter: a
-    // parameter would add a resource, a read, an IAM grant and a failure mode to reproduce a string
-    // this line already computes. Plain HTTP over Cloud Map — that also keeps the gateway out of the
-    // runtime's TLS allow-list, because there is no certificate to relax verification for.
-    DISPATCHER_BASE_URL: dispatcherBaseUrl(resources.name),
+    // Plain HTTP to the internal load balancer, which keeps the gateway out of the runtime's TLS
+    // allow-list: there is no certificate to relax verification for. Still not an SSM parameter —
+    // the hostname arrives on `facts` from one elbv2 lookup the deploy already makes for the target
+    // group, so a parameter would add a resource, a read and an IAM grant for nothing.
+    DISPATCHER_BASE_URL: dispatcherBaseUrl(facts),
 
     // ── region, in the four places that need it saying so ───────────────────
     // metrics.js builds its DynamoDB client with NO region and inherits the task's, so AWS_REGION is
@@ -318,8 +323,16 @@ function composeEnvironment({ resources, region, facts, ssm }) {
   return Object.keys(env).sort().map((name) => ({ name, value: env[name] }));
 }
 
-/** `http://dispatcher.<name>.internal:<port>` — service_discovery.tf:22,29 as a pure function. */
-const dispatcherBaseUrl = (name) => `http://dispatcher.${name}.internal:${PORT}`;
+/**
+ * `http://<nlb-hostname>:<port>` — the internal load balancer (dispatcher_lb.tf) as a pure function
+ * of the discovered hostname and PORT.
+ *
+ * The hostname is DISCOVERED, not derived. This used to be `dispatcher.<name>.internal`, a pure
+ * function of the --name knob, because Cloud Map let us choose the name. A Cloud Map private DNS
+ * namespace cannot exist in a shared VPC (dispatcher_lb.tf), and the load balancer that replaced it
+ * has an AWS-generated hostname — so it has to come off `facts`.
+ */
+const dispatcherBaseUrl = (facts) => `http://${facts.dispatcherDnsName}:${PORT}`;
 
 /**
  * The full RegisterTaskDefinition input.
@@ -355,7 +368,7 @@ function composeTaskDefinition({ resources, region, facts, ssm, image, tags }) {
     }],
 
     containerDefinitions: [{
-      name: 'dispatcher',
+      name: CONTAINER_NAME,
       image,
       essential: true,
       environment: composeEnvironment({ resources, region, facts, ssm }),
@@ -477,7 +490,7 @@ function composeCronHydratorTaskDefinition({
         // identity no Slack event routes to.
         { name: 'HYDRATE_OWNER_AGENT', value: ownerAgentId || agentId },
         { name: 'MOUNT_PATH', value: mountPath },
-        { name: 'MANAGER_API_URL', value: dispatcherBaseUrl(resources.name) },
+        { name: 'MANAGER_API_URL', value: dispatcherBaseUrl(facts) },
         { name: 'AWS_REGION', value: region },
       ],
       secrets: [{ name: 'DISPATCHER_SHARED_SECRET', valueFrom: facts.dispatcherSharedSecretArn }],
@@ -539,7 +552,7 @@ function composeCronPurgeTaskDefinition({
       environment: [
         { name: 'CRON_PURGE_ONLY', value: '1' },
         { name: 'HYDRATE_OWNER_AGENT', value: ownerAgentId },
-        { name: 'MANAGER_API_URL', value: dispatcherBaseUrl(resources.name) },
+        { name: 'MANAGER_API_URL', value: dispatcherBaseUrl(facts) },
         { name: 'AWS_REGION', value: region },
       ],
       secrets: [{ name: 'DISPATCHER_SHARED_SECRET', valueFrom: facts.dispatcherSharedSecretArn }],
@@ -571,7 +584,7 @@ function requireFacts(facts, keys) {
 
 module.exports = {
   CONSTANTS, SSM_PARAMETERS, SSM_HANDLES, SSM_SERVICE, SERVICE, ROLLING, DEPLOYMENT_SHAPES,
-  PORT, CPU, MEMORY,
+  PORT, CONTAINER_NAME, CPU, MEMORY,
   SSM_PREFIX, dispatcherBaseUrl, healthCheckCommand,
   composeEnvironment, composeTaskDefinition, composeCronHydratorTaskDefinition,
   composeCronPurgeTaskDefinition,

@@ -54,7 +54,7 @@ function clientsFor(ctx, deps = {}) {
     sqs: makeClient(ctx, '@aws-sdk/client-sqs', 'SQSClient'),
     ssm: makeClient(ctx, '@aws-sdk/client-ssm', 'SSMClient'),
     secrets: makeClient(ctx, '@aws-sdk/client-secrets-manager', 'SecretsManagerClient'),
-    discovery: makeClient(ctx, '@aws-sdk/client-servicediscovery', 'ServiceDiscoveryClient'),
+    elbv2: makeClient(ctx, '@aws-sdk/client-elastic-load-balancing-v2', 'ElasticLoadBalancingV2Client'),
   };
 }
 
@@ -131,12 +131,12 @@ async function discoverFacts(ctx, config, deps = {}) {
   // `--account` was not passed — which is the case where it is most likely to be a surprise.
   const account = await callerAccount(clients, ctx);
 
-  const [agentRepoUri, turnQueueUrl, roles, efs, serviceRegistryArn, secrets] = await Promise.all([
+  const [agentRepoUri, turnQueueUrl, roles, efs, lb, secrets] = await Promise.all([
     repositoryUri(clients, r.agentRepo),
     queueUrl(clients, `${r.dispatcherService}-turns.fifo`),
     dispatcherRoles(clients, r),
     dispatcherFileSystem(clients, ctx, config, account),
-    dispatcherRegistry(clients, ctx),
+    dispatcherLoadBalancer(clients, ctx),
     dispatcherSecrets(clients, r),
   ]);
 
@@ -166,7 +166,11 @@ async function discoverFacts(ctx, config, deps = {}) {
     // problem: the gateway admits port 9090 only from the runtime and hydrator groups, so the
     // manager-API call comes back as a bare "fetch failed".
     cronHydratorSecurityGroupId,
-    serviceRegistryArn,
+    dispatcherTargetGroupArn: lb.targetGroupArn,
+    // NOT derivable, unlike everything else named from --name: AWS generates the load balancer's
+    // hostname. Cloud Map's `dispatcher.<name>.internal` used to be a pure function of the knob,
+    // which is why DISPATCHER_BASE_URL was computed rather than discovered.
+    dispatcherDnsName: lb.dnsName,
     executionRoleArn: roles.executionRoleArn,
     taskRoleArn: roles.taskRoleArn,
     secrets: secrets.list,
@@ -377,29 +381,67 @@ async function securityGroupId(clients, vpcId, groupName) {
   return group.GroupId;
 }
 
-/** The Cloud Map registration the service attaches to. `dispatcher` in the `<name>.internal` namespace. */
-async function dispatcherRegistry(clients, ctx) {
-  const { ListNamespacesCommand, ListServicesCommand } = require('@aws-sdk/client-servicediscovery');
-  const namespaceName = `${ctx.name}.internal`;
+/**
+ * The target group the gateway's ECS service registers into.
+ *
+ * Resolved BY NAME, like the roles, security groups and queues: Terraform names it from
+ * local.dispatcher_name (modules/archie/dispatcher_lb.tf), which is exactly this CLI's
+ * `<name>-dispatcher`. Nothing has to be published through SSM for it.
+ *
+ * THIS REPLACED A CLOUD MAP LOOKUP. A Cloud Map private DNS namespace creates a Route53 private
+ * hosted zone and associates it with the VPC in one atomic call, and a shared-VPC participant is not
+ * authorised to make that association — so the namespace could never exist in dev or prod, only in a
+ * sandbox that owns its own VPC.
+ */
+async function dispatcherLoadBalancer(clients, ctx) {
+  const {
+    DescribeTargetGroupsCommand, DescribeLoadBalancersCommand,
+  } = require('@aws-sdk/client-elastic-load-balancing-v2');
+  const name = ctx.resources.dispatcherService;
 
-  const namespaces = await clients.discovery.send(new ListNamespacesCommand({ MaxResults: 100 }));
-  const ns = (namespaces.Namespaces || []).find((n) => n.Name === namespaceName);
-  if (!ns) {
-    throw preflight(`Cloud Map namespace ${namespaceName} does not exist`, {
-      detail: 'Terraform owns service discovery (modules/archie/service_discovery.tf).',
+  // UNLIKE the other name lookups in this file, DescribeTargetGroups THROWS on an unknown name
+  // rather than returning an empty list, so the not-found case is a catch and not a falsy check.
+  let res;
+  try {
+    res = await clients.elbv2.send(new DescribeTargetGroupsCommand({ Names: [name] }));
+  } catch (e) {
+    if (e && e.name === 'TargetGroupNotFoundException') {
+      throw preflight(`target group ${name} does not exist`, {
+        detail: 'Terraform owns the internal load balancer (modules/archie/dispatcher_lb.tf).',
+      });
+    }
+    throw e;
+  }
+
+  const tg = (res.TargetGroups || [])[0];
+  if (!tg) {
+    throw preflight(`target group ${name} does not exist`, {
+      detail: 'Terraform owns the internal load balancer (modules/archie/dispatcher_lb.tf).',
     });
   }
 
-  const services = await clients.discovery.send(new ListServicesCommand({
-    Filters: [{ Name: 'NAMESPACE_ID', Values: [ns.Id], Condition: 'EQ' }], MaxResults: 100,
-  }));
-  const svc = (services.Services || []).find((s) => s.Name === 'dispatcher');
-  if (!svc) {
-    throw preflight(`Cloud Map service "dispatcher" does not exist in ${namespaceName}`, {
-      detail: 'Terraform owns service discovery (modules/archie/service_discovery.tf).',
+  // The load balancer carries the SAME name as its target group, so this is one more name lookup
+  // rather than a walk through tg.LoadBalancerArns — which would be ambiguous anyway, since a target
+  // group can be attached to several.
+  let lbRes;
+  try {
+    lbRes = await clients.elbv2.send(new DescribeLoadBalancersCommand({ Names: [name] }));
+  } catch (e) {
+    if (e && e.name === 'LoadBalancerNotFoundException') {
+      throw preflight(`load balancer ${name} does not exist`, {
+        detail: 'Terraform owns the internal load balancer (modules/archie/dispatcher_lb.tf).',
+      });
+    }
+    throw e;
+  }
+  const lb = (lbRes.LoadBalancers || [])[0];
+  if (!lb || !lb.DNSName) {
+    throw preflight(`load balancer ${name} has no DNS name`, {
+      detail: 'Terraform owns the internal load balancer (modules/archie/dispatcher_lb.tf).',
     });
   }
-  return svc.Arn;
+
+  return { targetGroupArn: tg.TargetGroupArn, dnsName: lb.DNSName };
 }
 
 /**

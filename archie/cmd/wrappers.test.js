@@ -534,9 +534,9 @@ function hydratorClients() {
     }),
     ec2: one({ DescribeSecurityGroupsCommand: ({ Filters }) => ({ SecurityGroups: [{ GroupId: `sg-${Filters.find((f) => f.Name === 'group-name').Values[0]}` }] }) }),
     secrets: one({ DescribeSecretCommand: ({ SecretId }) => ({ ARN: `arn:secret:${SecretId}` }) }),
-    discovery: one({
-      ListNamespacesCommand: () => ({ Namespaces: [{ Id: 'ns-1', Name: 'redacted-internal-host.example' }] }),
-      ListServicesCommand: () => ({ Services: [{ Name: 'dispatcher', Arn: 'arn:sd/1' }] }),
+    elbv2: one({
+      DescribeTargetGroupsCommand: ({ Names }) => ({ TargetGroups: [{ TargetGroupArn: `arn:elb:targetgroup/${Names[0]}` }] }),
+      DescribeLoadBalancersCommand: ({ Names }) => ({ LoadBalancers: [{ DNSName: `${Names[0]}-abc123.elb.us-east-1.amazonaws.com` }] }),
     }),
     ssm: one({
       GetParametersCommand: ({ Names }) => ({

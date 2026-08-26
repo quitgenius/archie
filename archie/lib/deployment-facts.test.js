@@ -67,9 +67,9 @@ function clients(over = {}) {
       },
     }),
     secrets: clientFrom({ DescribeSecretCommand: ({ SecretId }) => ({ ARN: `arn:secret:${SecretId}-AbCdEf` }) }),
-    discovery: clientFrom({
-      ListNamespacesCommand: () => ({ Namespaces: [{ Id: 'ns-1', Name: 'redacted-internal-host.example' }] }),
-      ListServicesCommand: () => ({ Services: [{ Name: 'dispatcher', Arn: 'arn:servicediscovery:svc/1' }] }),
+    elbv2: clientFrom({
+      DescribeTargetGroupsCommand: ({ Names }) => ({ TargetGroups: [{ TargetGroupArn: `arn:elb:targetgroup/${Names[0]}` }] }),
+      DescribeLoadBalancersCommand: ({ Names }) => ({ LoadBalancers: [{ DNSName: `${Names[0]}-abc123.elb.us-east-1.amazonaws.com` }] }),
     }),
     ssm: clientFrom({
       GetParametersCommand: ({ Names }) => ({
@@ -111,7 +111,11 @@ test('discoverFacts resolves the whole set from one name', async () => {
   assert.equal(facts.cronHydratorSecurityGroupId, 'sg-agent-gn0p84-dispatcher-cron-hydrator-sg');
   assert.equal(facts.executionRoleArn, 'arn:aws:iam::543510375323:role/agent-gn0p84-dispatcher-execution-role');
   assert.equal(facts.taskRoleArn, 'arn:aws:iam::543510375323:role/agent-gn0p84-dispatcher-task-role');
-  assert.equal(facts.serviceRegistryArn, 'arn:servicediscovery:svc/1');
+  // The internal NLB replaced Cloud Map (a private DNS namespace cannot exist in a shared VPC), so
+  // both of these come off elbv2. The target group is resolved BY NAME like the roles and groups
+  // above; the hostname is the one value here AWS generates and archie cannot derive.
+  assert.equal(facts.dispatcherTargetGroupArn, 'arn:elb:targetgroup/agent-gn0p84-dispatcher');
+  assert.equal(facts.dispatcherDnsName, 'agent-gn0p84-dispatcher-abc123.elb.us-east-1.amazonaws.com');
 });
 
 test('the file system and access point are TOLD to archie, not looked up by tag', async () => {

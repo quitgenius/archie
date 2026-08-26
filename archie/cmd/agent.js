@@ -1215,7 +1215,7 @@ async function rekey(ctx, args, out, deps) {
  * WHY THIS NEEDS A TASK AT ALL. The store is not in DynamoDB — it is one file per owner on the
  * dispatcher's own EFS mount (`/efs/cron/<agentId>.json`, cron-store.js:4) with exactly one writer.
  * So teardown cannot delete it the way it deletes table items; it has to ask the manager API, and
- * that API is a Cloud Map internal name reachable only from inside the VPC. An ephemeral Fargate task
+ * that API is behind an internal load balancer reachable only from inside the VPC. An ephemeral Fargate task
  * is the same mechanism `archie cron hydrate` already uses to reach it.
  *
  * WHY IT RUNS FIRST, BEFORE THE RUNTIMES GO. A job is an ARMED TIMER in the dispatcher. Deleting the

@@ -212,9 +212,9 @@ function discoveryClients(over = {}) {
     }),
     ec2: one({ DescribeSecurityGroupsCommand: ({ Filters }) => ({ SecurityGroups: [{ GroupId: `sg-${Filters.find((f) => f.Name === 'group-name').Values[0]}` }] }) }),
     secrets: one({ DescribeSecretCommand: ({ SecretId }) => ({ ARN: `arn:secret:${SecretId}` }) }),
-    discovery: one({
-      ListNamespacesCommand: () => ({ Namespaces: [{ Id: 'ns-1', Name: 'redacted-internal-host.example' }] }),
-      ListServicesCommand: () => ({ Services: [{ Name: 'dispatcher', Arn: 'arn:servicediscovery:svc/1' }] }),
+    elbv2: one({
+      DescribeTargetGroupsCommand: ({ Names }) => ({ TargetGroups: [{ TargetGroupArn: `arn:elb:targetgroup/${Names[0]}` }] }),
+      DescribeLoadBalancersCommand: ({ Names }) => ({ LoadBalancers: [{ DNSName: `${Names[0]}-abc123.elb.us-east-1.amazonaws.com` }] }),
     }),
     ssm: one({
       GetParametersCommand: ({ Names }) => ({
@@ -267,7 +267,8 @@ const COMPOSED_FACTS = {
   subnetIds: ['subnet-a', 'subnet-b'],
   runtimeSecurityGroupId: 'sg-agent-gn0p84-runtime-sg',
   dispatcherSecurityGroupId: 'sg-agent-gn0p84-dispatcher-sg',
-  serviceRegistryArn: 'arn:servicediscovery:svc/1',
+  dispatcherTargetGroupArn: 'arn:elb:targetgroup/agent-gn0p84-dispatcher',
+  dispatcherDnsName: 'agent-gn0p84-dispatcher-abc123.elb.us-east-1.amazonaws.com',
   executionRoleArn: `arn:aws:iam::${ACCOUNT}:role/agent-gn0p84-dispatcher-execution-role`,
   taskRoleArn: `arn:aws:iam::${ACCOUNT}:role/agent-gn0p84-dispatcher-task-role`,
   credentialSecretName: 'agent-gn0p84-connector-api-key',

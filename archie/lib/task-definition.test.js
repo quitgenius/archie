@@ -23,6 +23,7 @@ const FACTS = {
   dispatcherAccessPointId: 'fsap-REDACTED',
   vpcId: 'vpc-REDACTED',
   runtimeSecurityGroupId: 'sg-REDACTED',
+  dispatcherDnsName: 'agent-gn0p84-dispatcher-abc123.elb.us-east-1.amazonaws.com',
   executionRoleArn: 'arn:aws:iam::203366135563:role/agent-gn0p84-dispatcher-execution-role',
   taskRoleArn: 'arn:aws:iam::203366135563:role/agent-gn0p84-dispatcher-task-role',
   credentialSecretName: 'agent-gn0p84-connector-api-key',
@@ -69,11 +70,22 @@ test('the environment is sorted, so the §6 diff is never noisy with reorderings
   assert.deepEqual(names, names.slice().sort());
 });
 
-test('DISPATCHER_BASE_URL is computed, never configured — one knob and the port', () => {
-  assert.equal(dispatcherBaseUrl('agent-gn0p84'), `http://redacted-internal-host.example:${PORT}`);
-  assert.equal(envMap(compose()).DISPATCHER_BASE_URL, 'http://redacted-internal-host.example:9090');
-  // The name is the ONLY input. A second deployment must not resolve to the first one's gateway.
-  assert.equal(dispatcherBaseUrl('agent-6guk92'), 'http://redacted-internal-host.example:9090');
+test('DISPATCHER_BASE_URL is the DISCOVERED load balancer host and the port — never configured', () => {
+  // It used to be a pure function of --name, because Cloud Map let archie choose the hostname.
+  // The NLB that replaced it (a private DNS namespace cannot exist in a shared VPC) has an
+  // AWS-generated hostname, so the input is now a discovered fact rather than the knob.
+  const facts = { dispatcherDnsName: 'agent-gn0p84-dispatcher-abc123.elb.us-east-1.amazonaws.com' };
+  assert.equal(dispatcherBaseUrl(facts), `http://${facts.dispatcherDnsName}:${PORT}`);
+  assert.equal(
+    envMap(compose()).DISPATCHER_BASE_URL,
+    'http://agent-gn0p84-dispatcher-abc123.elb.us-east-1.amazonaws.com:9090',
+  );
+  // Still no second input. A different deployment's load balancer is a different hostname, so two
+  // stacks cannot resolve to one gateway.
+  assert.equal(
+    dispatcherBaseUrl({ dispatcherDnsName: 'agent-6guk92-dispatcher-def456.elb.us-east-1.amazonaws.com' }),
+    'http://agent-6guk92-dispatcher-def456.elb.us-east-1.amazonaws.com:9090',
+  );
 });
 
 test('a missing REQUIRED parameter refuses, and names the exact path to fix', () => {
