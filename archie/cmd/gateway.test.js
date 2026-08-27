@@ -162,9 +162,12 @@ function service({
   // one. The extra fields are here on purpose: `DescribeServices` returns more than `UpdateService`
   // accepts, so a deep-equal comparison would report a difference forever.
   deploymentConfiguration = { minimumHealthyPercent: 100, maximumPercent: 200 },
+  // ECS keeps a DELETED service describable for a while, as INACTIVE then briefly DRAINING. Those
+  // are not deployable states and the deploy path has to tell them apart from a live service.
+  status = 'ACTIVE',
 } = {}) {
   return {
-    status: 'ACTIVE',
+    status,
     serviceName: 'agent-gn0p84-dispatcher',
     taskDefinition: taskDefinitionArn,
     desiredCount: 1,
@@ -754,6 +757,46 @@ test('deploy (from scratch): reports startup, not downtime, and does not date it
   assert.deepEqual(created.input.deploymentConfiguration, { minimumHealthyPercent: 100, maximumPercent: 200 });
   assert.match(gateway.renderDeploy(result), /startup     0s to HEALTHY — nothing was interrupted/);
   assert.doesNotMatch(out.text(), /dropped Slack events|overlap /);
+});
+
+test('deploy: a DELETED service still described as INACTIVE is absent, and is created over', async () => {
+  // THE CUTOVER CASE. Converting the gateway from Cloud Map to the internal NLB means deleting the
+  // service and creating it again — an ECS service's load balancer registration is set at creation.
+  // ECS keeps the deleted service describable as INACTIVE for a while, and readDeployed deliberately
+  // falls back to it so `gateway status` can still report the last thing that ran. If deploy shared
+  // that view it would send UpdateService to a deleted service, and the only way forward would be to
+  // wait for AWS to stop listing it.
+  const ecs = ecsFor({
+    services: sequence([
+      [service({ status: 'INACTIVE', runningCount: 0 })],                              // deleted -> create
+      [service({ runningCount: 1, taskDefinitionArn: TD_70, deployments: [{ status: 'PRIMARY', taskDefinition: TD_70, runningCount: 1 }] })],
+    ]),
+  });
+  const out = makeOut();
+  const result = await gateway.deploy(makeCtx(), makeArgs({ tag: 'archie-0.2.23' }), out, {
+    clients: discoveryClients(), ecr: ecrFor({ image: true }), ecs, sts: stsOk(),
+    ...fakeClock('2026-08-14T20:12:53Z'), pollIntervalMs: 47000,
+  });
+
+  assert.equal(result.created, true);
+  assert.ok(ecs.calls.find((c) => c.name === 'CreateServiceCommand'), 'expected CreateService');
+  assert.equal(ecs.calls.find((c) => c.name === 'UpdateServiceCommand'), undefined, 'must not update a deleted service');
+  assert.match(out.text(), /absent/);
+});
+
+test('deploy: a service still DRAINING refuses, rather than failing inside CreateService', async () => {
+  // DRAINING is deletion in flight, NOT a free name: CreateService over it fails with an error about
+  // the name being taken, a long way from the delete that caused it. Folding it in with INACTIVE
+  // would produce exactly that second-hand error.
+  const ecs = ecsFor({ services: sequence([[service({ status: 'DRAINING', runningCount: 0 })]]) });
+  await assert.rejects(
+    () => gateway.deploy(makeCtx(), makeArgs({ tag: 'archie-0.2.23' }), makeOut(), {
+      clients: discoveryClients(), ecr: ecrFor({ image: true }), ecs, sts: stsOk(),
+      ...fakeClock('2026-08-14T20:12:53Z'), pollIntervalMs: 47000,
+    }),
+    (e) => /is DRAINING/.test(e.message) && /reach INACTIVE/.test(e.detail || ''),
+  );
+  assert.equal(ecs.calls.find((c) => c.name === 'CreateServiceCommand'), undefined);
 });
 
 test('deploy: an unchanged image STILL converges a stale deployment shape, without replacing a task', async () => {

@@ -786,7 +786,24 @@ const deployTags = (ctx) => [
 /** `readDeployed`, but an absent service is `null` rather than an error — the from-scratch case. */
 async function readDeployedOrNull(ecs, ctx) {
   try {
-    return await readDeployed(ecs, ctx);
+    const deployed = await readDeployed(ecs, ctx);
+
+    // AN INACTIVE SERVICE IS AN ABSENT ONE, for this caller only. ECS keeps a deleted service
+    // visible for a while, and readDeployed deliberately falls back to it so `gateway status` can
+    // still report the last thing that ran. A deploy must not: UpdateService on an INACTIVE service
+    // fails, and the name is free to create over. Without this the only route back from a deleted
+    // service is to wait for AWS to stop listing it.
+    //
+    // DRAINING is NOT the same and must not be folded in — deletion is still in flight and
+    // CreateService over the name would fail. Say so rather than producing that error second-hand.
+    const status = deployed.svc && deployed.svc.status;
+    if (status === 'INACTIVE') return null;
+    if (status === 'DRAINING') {
+      throw preflight(`ECS service ${ctx.resources.dispatcherService} is DRAINING`, {
+        detail: 'A delete is still in flight. Wait for it to reach INACTIVE, then deploy again.',
+      });
+    }
+    return deployed;
   } catch (e) {
     // Only "the service is not there" becomes null. A missing CLUSTER is still an error: Terraform
     // owns it, so its absence means the account was never prepared, and creating a service would
