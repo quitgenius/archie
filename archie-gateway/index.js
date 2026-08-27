@@ -526,6 +526,68 @@ async function requiresMention(agentId) {
   }
 }
 
+// ALPHA GATE (temporary — sandbox, 2026-08-27). Refuse a Slack event whose scope does not already
+// exist, so no message can bring a fleet member into being.
+//
+// WHAT IT STOPS. Routing is derivation, so an @mention in any unfamiliar channel — or any DM — is
+// currently enough to mint: the turn proceeds on the derived id and the provisioning saga creates an
+// AgentCore runtime, an EFS access point, a workspace SEED, a Connector project and POLICY/MARKETPLACE
+// rows for a scope nobody asked for. Alpha runs against a hydrated subset, so the default inverts:
+// existing scopes work, new ones are not created.
+//
+// A CONSTANT, not a deleted call. It is one character to reverse, it says why in place, and unlike a
+// commented-out block it cannot be quietly lost. Deliberately not an env var: that means an SSM
+// parameter in modules/archie, and this branch's infra pathspec is byte-identical to master — adding
+// one would break that invariant for a setting we intend to delete.
+const ALPHA_REFUSE_UNKNOWN_SCOPES = true;
+
+/**
+ * Does this scope exist AT ALL — any row under `AGENT#<scope>`?
+ *
+ * EXISTENCE, NOT HYDRATION, and the distinction is the whole point. A scope minted before this gate
+ * carries CONNECTOR/MARKETPLACE/POLICY/SEED but no CONFIG or META; it still exists and must keep
+ * working. Testing for CONFIG would refuse it and turn a gate on creation into a gate on provenance.
+ * `AGENT#` IS the source of truth for what an agent is — the same rule agent-directory.js states.
+ *
+ * READS DYNAMODB, never the in-memory directory. `agentDirectory.has()` is the right shape and the
+ * wrong source: that map is Scanned once at boot for the App Home selector and refreshed only by push,
+ * so an agent hydrated by the `archie` CLI is invisible to it until the dispatcher restarts — which is
+ * exactly the alpha workflow. A cached answer here fails by refusing a real agent.
+ *
+ * No alias handling needed: the CRON-only `{alias}` partitions are keyed by config-repo directory
+ * names (`agent-xx9aff`), and resolveAgent only ever yields `dm-<user>` / `ch-<channel>`.
+ *
+ * Fails CLOSED, unlike requiresMention above. That one fails open because the cost of guessing wrong
+ * is a silent agent; here the cost of guessing wrong is creating the thing this exists to prevent. A
+ * table error would fail the turn moments later anyway (registry read, policy row), so refusing early
+ * costs nothing beyond the log line.
+ */
+async function scopeExists(agentId) {
+  if (!AGENT_CONFIG_TABLE || !agentId) return false;
+  try {
+    const { QueryCommand } = require('@aws-sdk/lib-dynamodb');
+    const r = await configDoc().send(new QueryCommand({
+      TableName: AGENT_CONFIG_TABLE,
+      KeyConditionExpression: '#pk = :pk',
+      // Never a bare attribute name in an expression — the house rule, see scanAgentScopes.
+      ExpressionAttributeNames: { '#pk': 'pk' },
+      ExpressionAttributeValues: { ':pk': `AGENT#${agentId}` },
+      ProjectionExpression: '#pk',
+      Limit: 1,
+    }));
+    return (r.Count || 0) > 0;
+  } catch (err) {
+    log.warn({ agent: agentId, err: err.message }, 'scope existence read failed — refusing (alpha gate fails closed)');
+    return false;
+  }
+}
+
+/** True when the event must be dropped because its scope does not exist yet. */
+async function refuseUnknownScope(agentId) {
+  if (!ALPHA_REFUSE_UNKNOWN_SCOPES) return false;
+  return !(await scopeExists(agentId));
+}
+
 function resolveAgent(event) {
   const isDM = event.channel_type === 'im';
   // DERIVATION, and nothing else. There is no table to consult first: the scope id IS the route.
@@ -1150,6 +1212,13 @@ if (!NO_SOCKET_MODE) {
       return;
     }
 
+    // BEFORE recordMessage/emitMessageReceived on purpose: a refused scope must not open a per-agent
+    // metric series, or the dashboard grows agents that were declined into existence.
+    if (await refuseUnknownScope(agent)) {
+      child.info({ agent }, 'scope does not exist — refusing to mint (alpha)');
+      return;
+    }
+
     // Message volume, counted TWICE on purpose and in ONE place: the DDB counter carries the
     // user×agent×day detail, the EMF metric makes per-agent/fleet volume visible on the CloudWatch
     // dashboard (the DDB table's only reader is the ALB-fronted archie service). Emitting them
@@ -1223,6 +1292,12 @@ if (bolt) bolt.event('app_mention', async ({ event }) => {
   const agent = resolveAgent(event);
   if (!agent) {
     child.warn('no route matched; dropping');
+    return;
+  }
+
+  // See the message handler: gate before any per-agent metric is emitted.
+  if (await refuseUnknownScope(agent)) {
+    child.info({ agent }, 'scope does not exist — refusing to mint (alpha)');
     return;
   }
 
@@ -2375,6 +2450,13 @@ web.post('/simulate', async (req, res) => {
   if (!agent) {
     child.warn('no route matched');
     return res.status(404).json({ ok: false, error: 'no route matched' });
+  }
+
+  // Gated too. This harness exists to exercise the SAME path as production, so leaving it open would
+  // let it mint what Slack no longer can — and a test that can do what the product cannot is not a test.
+  if (await refuseUnknownScope(agent)) {
+    child.info({ agent }, 'scope does not exist — refusing to mint (alpha)');
+    return res.status(403).json({ ok: false, error: 'scope does not exist', agent });
   }
 
   const sessionKey = buildSessionKey(event);
