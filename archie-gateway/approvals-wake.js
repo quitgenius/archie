@@ -20,12 +20,45 @@
 // what to expect on approval. Change the wording here and an approved send stops being
 // retried. They are built by the caller (index.js) so this module stays transport-only.
 
-/** Recover {channel, threadTs} from a Slack thread session key, or null if it is not one. */
+/**
+ * Recover {channel, threadTs} from a session key, or null if it names no Slack thread.
+ *
+ * MIRRORS extractSlackThreadTarget (connector-session-plugin/src/config.ts), and must stay in
+ * lockstep with it — the plugin uses that function to decide the reply-in-place exemption, this
+ * one to decide where an approved send's turn streams back to. They read the same key.
+ * Duplicated rather than imported because nothing in archie-gateway may import from the plugin
+ * tree (separate build contexts), the same reason scopeIdFor/scopeIdForRouting exist twice.
+ *
+ * TWO THINGS AN EARLIER VERSION OF THIS GOT WRONG, both caught live on 2026-09-01 when an
+ * APPROVED send was never retried:
+ *
+ * 1. IT IS NOT ANCHORED. The real key is
+ *    `agent:agent-xx9aff:slack:thread:dl1ha3ii6v6:1788271402.303009:dm:ux0mz5ckp2r` —
+ *    OpenClaw-style, with an `agent:<name>:` prefix the runtime inherits with its legacy EFS
+ *    root. A `^slack:thread:` regex rejects it, so the wake was skipped and the approval became
+ *    a dead end. Find the marker anywhere.
+ *
+ * 2. THE CHANNEL MUST BE UPPERCASED. Session keys lowercase conversation ids; Slack's API
+ *    rejects the lowercase form with invalid_arguments. Streaming into `dl1ha3ii6v6` would have
+ *    failed even once the key parsed.
+ */
 function parseSlackThreadKey(sessionKey) {
-  // Shape: slack:thread:<channel>:<threadTs>[:dm:<peer>]
-  const m = /^slack:thread:([^:]+):([^:]+)/.exec(String(sessionKey || ''));
-  if (!m) return null;
-  return { channel: m[1], threadTs: m[2] };
+  if (!sessionKey) return null;
+  const marker = 'slack:thread:';
+  const idx = String(sessionKey).indexOf(marker);
+  if (idx < 0) return null;
+  const parts = String(sessionKey).slice(idx + marker.length).split(':');
+  // dm-first shape: slack:thread:dm:<channel>:<sender>
+  if (parts[0] === 'dm') {
+    return parts[1] ? { channel: parts[1].toUpperCase() } : null;
+  }
+  // channel-thread shape: slack:thread:<channel>:<threadTs>[:dm:<sender>]
+  const channel = parts[0];
+  if (!channel) return null;
+  const threadTs = parts[1] && /^\d+\.\d+$/.test(parts[1]) ? parts[1] : undefined;
+  return threadTs
+    ? { channel: channel.toUpperCase(), threadTs }
+    : { channel: channel.toUpperCase() };
 }
 
 /**

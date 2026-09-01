@@ -54,6 +54,33 @@ describe('parseSlackThreadKey', () => {
     expect(parseSlackThreadKey('agent:x:cron:job-1:run:abc')).toBeNull();
     expect(parseSlackThreadKey(undefined)).toBeNull();
   });
+
+  // ── The two live regressions, 2026-09-01. An APPROVED send was never retried because the
+  // wake was skipped: the key did not match, and would not have worked if it had.
+
+  test('tolerates the agent:<name>: PREFIX — the shape real sessions actually carry', () => {
+    // Verified against a real record in /efs/approvals.json. The runtime inherits the
+    // OpenClaw-style key with its legacy EFS root, so anchoring on ^slack:thread: rejects
+    // every genuine DM thread and turns the approval into a dead end.
+    expect(parseSlackThreadKey(
+      'agent:agent-xx9aff:slack:thread:dl1ha3ii6v6:1788271402.303009:dm:ux0mz5ckp2r',
+    )).toEqual({ channel: 'DL1HA3II6V6', threadTs: '1788271402.303009' });
+  });
+
+  test('UPPERCASES the channel — Slack rejects the lowercase form the key stores', () => {
+    // Session keys lowercase conversation ids; the API answers invalid_arguments. Parsing
+    // correctly but streaming into `dl1ha3ii6v6` would have failed at the next step.
+    expect(parseSlackThreadKey('slack:thread:dl1ha3ii6v6:1788.0').channel).toBe('DL1HA3II6V6');
+    expect(parseSlackThreadKey('slack:thread:dm:dl1ha3ii6v6:u1').channel).toBe('DL1HA3II6V6');
+  });
+
+  test('handles the dm-first shape, which carries no threadTs', () => {
+    expect(parseSlackThreadKey('slack:thread:dm:D1:u1')).toEqual({ channel: 'D1' });
+  });
+
+  test('ignores a non-timestamp second segment rather than passing it as threadTs', () => {
+    expect(parseSlackThreadKey('slack:thread:C1:notats')).toEqual({ channel: 'C1' });
+  });
 });
 
 test('sends the wake string as the ENTIRE bare prompt', async () => {
