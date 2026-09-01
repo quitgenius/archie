@@ -57,7 +57,7 @@ WORKDIR /app
 COPY --chown=dispatcher:dispatcher archie-gateway/package.json archie-gateway/package-lock.json* ./
 RUN npm install --omit=dev --no-fund --no-audit
 
-COPY --chown=dispatcher:dispatcher archie-gateway/index.js archie-gateway/marketplace.js archie-gateway/approvals-store.js archie-gateway/approvals-routes.js archie-gateway/approvals-wake.js archie-gateway/opt-toggle-auth.js archie-gateway/derived-role.js archie-gateway/streaming.js archie-gateway/conversations.js archie-gateway/metrics.js archie-gateway/file-ref.js archie-gateway/agentcore-client.js archie-gateway/agentcore-provisioning.js archie-gateway/dispatcher-metrics.js archie-gateway/tracing.js archie-gateway/backpressure.js archie-gateway/connector-credential.js archie-gateway/session-tracker.js archie-gateway/image-source.js archie-gateway/turn-queue.js archie-gateway/spec-diff.js archie-gateway/cron-home.js archie-gateway/grants.js archie-gateway/agent-scope.js archie-gateway/agent-directory.js archie-gateway/semaphore.js archie-gateway/sdk-http.js archie-gateway/runtime-registry.js archie-gateway/runtime-quota-metrics.js archie-gateway/session-tracker.js \
+COPY --chown=dispatcher:dispatcher archie-gateway/index.js archie-gateway/marketplace.js archie-gateway/approvals-store.js archie-gateway/approvals-routes.js archie-gateway/approvals-wake.js archie-gateway/opt-toggle-auth.js archie-gateway/owners.js archie-gateway/routes-owners.js archie-gateway/derived-role.js archie-gateway/streaming.js archie-gateway/conversations.js archie-gateway/metrics.js archie-gateway/file-ref.js archie-gateway/agentcore-client.js archie-gateway/agentcore-provisioning.js archie-gateway/dispatcher-metrics.js archie-gateway/tracing.js archie-gateway/backpressure.js archie-gateway/connector-credential.js archie-gateway/session-tracker.js archie-gateway/image-source.js archie-gateway/turn-queue.js archie-gateway/spec-diff.js archie-gateway/cron-home.js archie-gateway/grants.js archie-gateway/agent-scope.js archie-gateway/agent-directory.js archie-gateway/semaphore.js archie-gateway/sdk-http.js archie-gateway/runtime-registry.js archie-gateway/runtime-quota-metrics.js archie-gateway/session-tracker.js \
     archie-gateway/cron-service.js archie-gateway/cron-runner.js archie-gateway/cron-store.js archie-gateway/cron-fire.js archie-gateway/cron-delivery.js archie-gateway/cron-api.js archie-gateway/cron-hydrator.js archie-gateway/cron-metrics.js archie-gateway/cron-runner-flag.js archie-gateway/cron-inventory-metrics.js archie-gateway/peer-synth-fixture.js archie-gateway/hydrate-e2e.js archie-gateway/delivery-e2e.js archie-gateway/registry-e2e.js \
     archie-gateway/policy-derive.js ./
 
@@ -108,7 +108,7 @@ COPY --chown=dispatcher:dispatcher archie-runner/agentcore-pi/permissions/capabi
 #    yet.
 RUN node -e "\
 const fs=require('fs'),path=require('path');\
-const entry=['index.js','cron-api.js','marketplace.js','grants.js','derived-role.js','agentcore-client.js','cron-runner-flag.js','approvals-routes.js','approvals-wake.js'];\
+const entry=['index.js','cron-api.js','marketplace.js','grants.js','derived-role.js','agentcore-client.js','cron-runner-flag.js','approvals-routes.js','approvals-wake.js','owners.js'];\
 const missing=[];\
 for(const f of entry){\
   if(!fs.existsSync(f)){missing.push(f+' (entrypoint itself not copied)');continue;}\

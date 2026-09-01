@@ -62,6 +62,7 @@ const { createSessionTracker } = require('./session-tracker');
 const { createCronHome } = require('./cron-home');
 const { mintAgentName, normaliseScopeId, slackRefFromScopeId } = require('./agent-scope');
 const { createAgentDirectory } = require('./agent-directory');
+const { createOwnersDirectory } = require('./owners');
 const { diffObserved, specDiff } = require('./spec-diff');
 const { createDispatcherMetrics } = require('./dispatcher-metrics');
 const { createRuntimeQuotaSampler } = require('./runtime-quota-metrics');
@@ -259,6 +260,15 @@ const agentDirectory = createAgentDirectory({
   logger: log,
 });
 
+// Per-agent owners: who may turn the comms-approval gate off for an agent that is not their
+// own DM agent. Two readers with different freshness — a boot-time list for rendering, a
+// fresh GetItem for the authorization decision. See owners.js for why they are split.
+const ownersDirectory = createOwnersDirectory({
+  tableName: AGENT_CONFIG_TABLE,
+  doc: () => configDoc(),
+  log,
+});
+
 // Bedrock — used to list available models for the marketplace model selector.
 const bedrockClient = new BedrockClient({ region: process.env.AWS_REGION || 'us-east-1' });
 // Bedrock Runtime — used for conversation title summarization via Claude Haiku.
@@ -426,6 +436,10 @@ async function loadFleetConfig() {
 async function reloadFleetConfig() {
   return reloadMutex.runExclusive(async () => {
     await loadFleetConfig();
+    // The owners LIST is push-only (no TTL); this is its push signal, the same one the
+    // OpenClaw dispatcher uses after a config-repo change. Authorization does not depend on
+    // it — isOwner always reads fresh — so a failure here degrades rendering, not access.
+    await ownersDirectory.load();
   });
 }
 
@@ -1413,6 +1427,7 @@ if (bolt) bolt.event('app_home_opened', async ({ event, client }) => {
     if (activeTab === 'approvals') {
       opts.approvalsStore = approvalsStore;
       opts.approverUserId = userId;
+      opts.canToggle = await canToggleApprovals(userId, agentId);
     }
     const view = marketplace.buildHomeView(agentId, activeTab, opts);
     await client.views.publish({ user_id: userId, view });
@@ -1758,8 +1773,24 @@ async function publishApprovalsTab(userId, client) {
   const view = marketplace.buildHomeView(agentId, 'approvals', homeViewOptions(userId, agentId, {
     approvalsStore,
     approverUserId: userId,
+    canToggle: await canToggleApprovals(userId, agentId),
   }));
   await client.views.publish({ user_id: userId, view });
+}
+
+/**
+ * May this viewer turn the comms-approval gate off for this agent?
+ *
+ * Used for RENDERING only — handleApprovalOptToggle re-derives it from the clicker's own id,
+ * because the button value is untrusted. Drawing a control that would refuse is the archie
+ * hazard specifically: unlike OpenClaw, whose in-tab picker only listed agents you manage,
+ * archie's global selector offers the whole fleet, so it is easy to land on someone else's
+ * agent and meet a button that silently does nothing.
+ */
+async function canToggleApprovals(userId, agentId) {
+  if (!userId || !agentId) return false;
+  if (agentId === homeAgentFor(userId, 'opt_toggle')) return true;
+  return ownersDirectory.isOwner(userId, agentId);
 }
 
 if (bolt) bolt.action('marketplace_tab_approvals', async ({ ack, body, client }) => {
@@ -1844,12 +1875,16 @@ async function handleApprovalOptToggle(optedOut, { ack, body, client }) {
   const userId = body.user.id;
   const targetAgent = body.actions[0].value;
 
-  const allowed = canToggleAgent({
-    userId,
-    targetAgent,
-    dmUsers: { [userId]: homeAgentFor(userId, 'opt_toggle') },
-    ownedAgents: {},
-  });
+  // TWO CHECKS, and the order matters. canToggleAgent answers from the boot-time list, which
+  // is cheap and covers the own-DM-agent leg by derivation. If it says no on the owners leg we
+  // still ask the table, because the list is push-only and an owner hydrated since the last
+  // reload would otherwise be refused. If it says yes on the OWNERS leg we re-ask anyway, so a
+  // REVOKED owner loses access at this click rather than at the next restart. The dmUsers leg
+  // needs no table read — homeAgentFor is a derivation, not a lookup.
+  const ownAgent = homeAgentFor(userId, 'opt_toggle');
+  const allowed = targetAgent === ownAgent
+    ? true
+    : await ownersDirectory.isOwner(userId, targetAgent);
   if (!allowed) {
     log.warn({ userId, targetAgent }, 'opt toggle rejected — not owner');
     return;
@@ -2721,6 +2756,13 @@ let slackBotUserId = null;
   // Non-fatal and not awaited-into-failure: `load` swallows its own errors, and an empty selector
   // degrades App Home to exactly today's behaviour (your own agent) rather than breaking it.
   await agentDirectory.load();
+
+  // Same contract as the directory above: non-fatal, and an empty result degrades the
+  // Approvals tab to agent-qg61c0-only rather than breaking it.
+  {
+    const r = await ownersDirectory.load();
+    log.info(r, 'owners directory loaded');
+  }
 
   if (bolt) {
     await bolt.start();
