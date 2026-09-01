@@ -2368,6 +2368,9 @@ const streaming = new StreamingManager({
 // inside a click, long after module evaluation, so declaring it late costs nothing.
 const approvalWake = createApprovalWake({
   agentCore,
+  // Needed to re-open DMs against THIS app's token: a `D…` id inherited from a migrated
+  // OpenClaw session names that app's conversation, not archie's.
+  slack,
   // The IMAGE-AWARE resolver. Passing agentCore.ensureRuntime here would silently pin the
   // woken agent to the dispatcher's baked image — see cron-fire.js:196-201.
   ensureRuntime: ensureCurrentRuntime,
@@ -2552,8 +2555,32 @@ const _notifyApprover = (record) => {
       : [record.approverUserId]
   ));
   const text = `:lock: *Approval needed* — your Archie wants to ${marketplace.approvalActionPhrase(record.toolSlug)} *${marketplace.formatApprovalDestination(record.destination)}*. Review it in the *Approvals* tab of the app's Home view.`;
-  return Promise.allSettled(ids.map((id) => slack.chat.postMessage({ channel: id, text }))).then((results) => {
-    results.forEach((result, i) => {
+  // PUSH THE APPROVALS TAB TOO, for anyone already looking at it.
+  //
+  // The App Home is not live: it republishes only on app_home_opened, a tab click, or after a
+  // decision. So an approver sitting on the Approvals tab watched an empty queue while the card
+  // existed in the store — observed 2026-09-01, where the record was created at 17:17:55 and
+  // only appeared minutes later when the tab was reopened.
+  //
+  // GATED ON THEM ALREADY BEING ON THAT TAB. views.publish replaces the whole Home view, so
+  // pushing unconditionally would yank someone off Conversations mid-read. Unknown tab means no
+  // push — the DM above is the signal for them.
+  //
+  // KNOWN GAP, stated rather than hidden: userActiveTab is in-memory, so a dispatcher restart
+  // forgets where everyone was and suppresses this until each person clicks a tab again. That is
+  // exactly the case that produced the observation above (restart at 17:14, approval at 17:17).
+  // Making it durable is not worth a table read per approval; the DM covers it.
+  const pushes = ids
+    .filter((id) => userActiveTab.get(id) === 'approvals')
+    .map((id) => publishApprovalsTab(id, slack).catch((err) => {
+      log.warn({ err: err.message, approverId: id }, 'approvals tab push failed');
+    }));
+
+  return Promise.allSettled([
+    ...ids.map((id) => slack.chat.postMessage({ channel: id, text })),
+    ...pushes,
+  ]).then((results) => {
+    results.slice(0, ids.length).forEach((result, i) => {
       if (result.status === 'rejected') {
         log.error({ err: result.reason?.message, approverId: ids[i] }, 'failed to DM approver');
       }

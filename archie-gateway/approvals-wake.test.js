@@ -176,3 +176,72 @@ test('a runtime-resolution failure does not invoke and still drains', async () =
   expect(r).toEqual({ ok: false, reason: 'ensure_runtime_failed' });
   expect(calls.drained).toBe(1);
 });
+
+// ── DM channel re-resolution (the cross-app identity fix, 2026-09-01) ──────────
+// A `D…` id is per-app. Sessions migrated from OpenClaw carry ITS DM channel, which
+// archie's bot cannot see — observed live as channel_not_found on every stream append.
+
+test('re-opens a DM against THIS app rather than trusting the inherited id', async () => {
+  const opened = [];
+  const { calls } = harness();
+  let usedChannel = null;
+  const w = createApprovalWake({
+    agentCore: {
+      runExclusiveForSession: (id, fn) => fn(),
+      makeStreamBridge: () => () => {},
+      invokeStreaming: async () => ({ ok: true }),
+    },
+    ensureRuntime: async () => 'arn:IMAGE-AWARE',
+    streaming: {
+      registerSession: (_k, o) => { usedChannel = o.channel; return 't'; },
+      findSession: () => ({ session: { stream: {} } }),
+      startStream: () => {}, stopStream: () => {}, drain: async () => {},
+    },
+    sessionIdFor: (k) => `ac-${k}`,
+    slack: { conversations: { open: async ({ users }) => { opened.push(users); return { channel: { id: 'D_ARCHIE_OWN' } }; } } },
+    log: silentLog,
+  });
+  await w({ ...RECORD, sessionKey: 'agent:legacy:slack:thread:dl1ha3ii6v6:1788.0:dm:u1' },
+          { text: 'x', userId: 'UX0MZ5CKP2R' });
+  expect(opened).toEqual(['UX0MZ5CKP2R']);
+  expect(usedChannel).toBe('D_ARCHIE_OWN');   // NOT the DL1HA3II6V6 from the key
+});
+
+test('leaves a CHANNEL id alone — those mean the same thing to both apps', async () => {
+  const opened = [];
+  let usedChannel = null;
+  const w = createApprovalWake({
+    agentCore: { runExclusiveForSession: (id, fn) => fn(), makeStreamBridge: () => () => {}, invokeStreaming: async () => ({}) },
+    ensureRuntime: async () => 'arn',
+    streaming: {
+      registerSession: (_k, o) => { usedChannel = o.channel; return 't'; },
+      findSession: () => ({ session: { stream: {} } }),
+      startStream: () => {}, stopStream: () => {}, drain: async () => {},
+    },
+    sessionIdFor: (k) => `ac-${k}`,
+    slack: { conversations: { open: async ({ users }) => { opened.push(users); return { channel: { id: 'D_X' } }; } } },
+    log: silentLog,
+  });
+  await w({ ...RECORD, sessionKey: 'slack:thread:c66pp782t9k:1788.0' }, { text: 'x', userId: 'U1' });
+  expect(opened).toEqual([]);                 // no DM open attempted
+  expect(usedChannel).toBe('C66PP782T9K');
+});
+
+test('falls back to the key channel when the DM re-open fails', async () => {
+  // No worse than before, and the invoke still runs — the send is the point.
+  let usedChannel = null;
+  const w = createApprovalWake({
+    agentCore: { runExclusiveForSession: (id, fn) => fn(), makeStreamBridge: () => () => {}, invokeStreaming: async () => ({}) },
+    ensureRuntime: async () => 'arn',
+    streaming: {
+      registerSession: (_k, o) => { usedChannel = o.channel; return 't'; },
+      findSession: () => ({ session: { stream: {} } }),
+      startStream: () => {}, stopStream: () => {}, drain: async () => {},
+    },
+    sessionIdFor: (k) => `ac-${k}`,
+    slack: { conversations: { open: async () => { throw new Error('not_allowed'); } } },
+    log: silentLog,
+  });
+  await w({ ...RECORD, sessionKey: 'slack:thread:d1:1788.0' }, { text: 'x', userId: 'U1' });
+  expect(usedChannel).toBe('D1');
+});

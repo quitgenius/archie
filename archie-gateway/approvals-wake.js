@@ -62,6 +62,40 @@ function parseSlackThreadKey(sessionKey) {
 }
 
 /**
+ * Resolve the channel this wake should stream into.
+ *
+ * A DM CHANNEL ID IS PER-APP, and the session key cannot be trusted for one. Sessions migrated
+ * from OpenClaw carry ITS DM channel (the runtime adopts the legacy EFS root, and pi-adapter
+ * reuses the matched OpenClaw index key), so the id names a conversation between the human and
+ * the *OpenClaw* app. archie is a different Slack app with a different bot user, so posting
+ * there fails `channel_not_found` — observed live 2026-09-01 as 14 `stream append failed` per
+ * wake, with the send itself still succeeding because a dead stream does not block the invoke.
+ *
+ * So: for a `D…` id, re-open the DM against THIS app's token and use whatever channel it
+ * returns. For `C…`/`G…` the id is workspace-wide and means the same thing to both apps, so it
+ * is used as-is (archie still needs to be in the channel, but that is a membership question
+ * with a sensible failure, not an identity mismatch).
+ *
+ * Falls back to the key's channel if the lookup fails: no worse than before, and the invoke
+ * still runs.
+ */
+async function resolveStreamChannel({ slack, channel, userId, log }) {
+  if (!/^D/i.test(channel)) return channel;
+  if (!slack || !userId) return channel;
+  try {
+    const r = await slack.conversations.open({ users: userId });
+    const resolved = r && r.channel && r.channel.id;
+    if (resolved && resolved !== channel) {
+      log.info({ from: channel, to: resolved, userId }, 'approval wake — re-resolved DM channel for this app');
+    }
+    return resolved || channel;
+  } catch (err) {
+    log.warn({ err: err.message, channel, userId }, 'approval wake — DM re-open failed, using the key channel');
+    return channel;
+  }
+}
+
+/**
  * @param deps.agentCore            the AgentCore client (invokeStreaming, makeStreamBridge,
  *                                  runExclusiveForSession)
  * @param deps.ensureRuntime        (agent, {logger}) => arn — MUST be the image-pointer-aware
@@ -75,7 +109,7 @@ function parseSlackThreadKey(sessionKey) {
  * @param deps.log                  pino-shaped logger
  */
 function createApprovalWake(deps) {
-  const { agentCore, ensureRuntime, streaming, sessionIdFor } = deps;
+  const { agentCore, ensureRuntime, streaming, sessionIdFor, slack } = deps;
   const log = deps.log || { info() {}, warn() {}, error() {} };
 
   /**
@@ -98,9 +132,12 @@ function createApprovalWake(deps) {
       return { ok: false, reason: 'unroutable_session_key' };
     }
 
-    const { channel, threadTs } = target;
+    const { threadTs } = target;
     const sessionId = sessionIdFor(sessionKey);
     const child = log.child ? log.child({ agent, sessionKey, trigger: 'approval' }) : log;
+
+    // Never trust a DM id inherited from the session key — see resolveStreamChannel.
+    const channel = await resolveStreamChannel({ slack, channel: target.channel, userId, log: child });
 
     // MANDATORY, not defensive: the approver may click Approve while the requester is
     // mid-turn in that same thread, and two concurrent invokes on one session is exactly the
