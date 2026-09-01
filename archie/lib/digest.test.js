@@ -434,3 +434,33 @@ test('without git the digest still works, and --pure refuses rather than guessin
   assert.equal(dirtyWarning(ALPHA, opts(root)), null);
   assert.throws(() => assertPure(ALPHA, opts(root)), (e) => e.exitCode === EXIT.REFUSED);
 });
+
+test('every archie-gateway module the Dockerfile COPYs is a DECLARED digest input', () => {
+  // THE MISSING DIRECTION, and the reason this failure keeps recurring.
+  //
+  // "every declared input exists in this tree" above catches a file deleted from under the list.
+  // It cannot catch the opposite — a file the Dockerfile COPYs that nobody declared — and that is
+  // the dangerous one: the tag is a content digest of the declared list, so editing an undeclared
+  // module leaves the tag unchanged, `gateway deploy` reports "inputs unchanged", skips the build,
+  // and rolls onto the OLD image. A green deploy that shipped nothing.
+  //
+  // It has now happened twice: agent-scope.js / agent-directory.js (see the note beside them in
+  // digest.js), and then the whole approvals module set on 2026-09-01. Twice is a pattern, and a
+  // comment did not stop the second one — so this asserts it instead.
+  const root = path.resolve(__dirname, '..', '..');
+  const dockerfile = fs.readFileSync(path.join(root, 'archie-gateway/Dockerfile'), 'utf8');
+
+  // Every archie-gateway/*.js path named on any COPY line, across continuations.
+  const copied = new Set();
+  for (const m of dockerfile.matchAll(/archie-gateway\/[A-Za-z0-9._-]+\.js\b/g)) copied.add(m[0]);
+
+  const declared = new Set(IMAGES.gateway.inputs.map((e) => e.path));
+  const undeclared = [...copied].filter((p) => !declared.has(p)).sort();
+
+  assert.deepEqual(
+    undeclared, [],
+    `COPYed by archie-gateway/Dockerfile but NOT declared in digest.js IMAGES.gateway.inputs — ` +
+    `edits to these would not change the tag, so deploy would silently skip the build:\n  ` +
+    undeclared.join('\n  '),
+  );
+});

@@ -144,6 +144,27 @@ const IMAGES = {
       // exact failure the Dockerfile's own allowlist comment warns about from the other direction.
       { path: 'archie-gateway/agent-scope.js' },
       { path: 'archie-gateway/agent-directory.js' },
+
+      // Outbound-comms approvals (P1/P2 of the comms-approval port). Added here the moment the
+      // omission bit: a change confined to approvals-routes.js produced an UNCHANGED tag, so
+      // `gateway deploy` reported "inputs unchanged" and skipped the build entirely — precisely
+      // the silent stale deploy the note above describes, recurring for the same reason. Three
+      // lists must agree for a new gateway module: the Dockerfile COPY allowlist, the Dockerfile
+      // preflight `entry` array when the module is a require-root, and THIS.
+      { path: 'archie-gateway/approvals-store.js' },
+      { path: 'archie-gateway/approvals-routes.js' },
+      { path: 'archie-gateway/approvals-wake.js' },
+      { path: 'archie-gateway/opt-toggle-auth.js' },
+      { path: 'archie-gateway/owners.js' },
+      { path: 'archie-gateway/routes-owners.js' },
+
+      // Found by the bidirectional test below, not by inspection: all three are on the Dockerfile's
+      // COPY line and were never declared here, so an edit to any of them produced an unchanged tag
+      // and a deploy that shipped nothing. Pre-existing — they predate the approvals work — and
+      // exactly why the assertion is worth more than the comment it replaces.
+      { path: 'archie-gateway/cron-runner-flag.js' },
+      { path: 'archie-gateway/policy-derive.js' },
+      { path: 'archie-gateway/runtime-quota-metrics.js' },
       { path: 'archie-gateway/semaphore.js' },
       { path: 'archie-gateway/sdk-http.js' },
       { path: 'archie-gateway/runtime-registry.js' },

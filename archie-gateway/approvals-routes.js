@@ -8,12 +8,31 @@ const REQUIRED = [
 ];
 
 function makeApprovalHandlers({ store, notifyApprover, log }) {
-  const _log = log || { info: () => {} };
+  // All three levels. The upstream stub had only `info`, so the first warn/error added to this
+  // module would throw TypeError inside a request handler — which is exactly what happened when
+  // the rejection log below was added. A partial stub is worse than none: it type-checks by
+  // duck-typing and fails only on the path you are adding.
+  const _log = log || { info: () => {}, warn: () => {}, error: () => {} };
   return {
     async create(req, res) {
       const body = req.body || {};
       const missing = REQUIRED.filter((k) => typeof body[k] !== 'string' || !body[k]);
-      if (missing.length) return res.status(400).json({ error: `missing: ${missing.join(', ')}` });
+      if (missing.length) {
+        // LOG THE REJECTION. Upstream returns this 400 before reaching the `approval create`
+        // log below, so a malformed payload leaves NOTHING in the dispatcher's logs — and the
+        // caller (approvals-client) collapses every failure into the same opaque
+        // "approvals_unavailable", which the model then reports as "the approvals service is
+        // unavailable". A field-name typo and a dead dispatcher are indistinguishable from
+        // both ends. Cost us a bisect on 2026-09-01; this line is what would have avoided it.
+        // agentId/toolSlug are logged when present so the line is attributable even though the
+        // payload is by definition incomplete. No destination or content — those may be PHI.
+        _log.warn({
+          missing,
+          agentId: typeof body.agentId === 'string' ? body.agentId : null,
+          toolSlug: typeof body.toolSlug === 'string' ? body.toolSlug : null,
+        }, 'approval create rejected — malformed payload');
+        return res.status(400).json({ error: `missing: ${missing.join(', ')}` });
+      }
       const fields = Object.fromEntries(REQUIRED.map((k) => [k, body[k]]));
       // Optional multi-approver set (owners-policy requests, e.g. SENSITIVE_ACTION).
       // Without this passthrough the store falls back to [approverUserId] and every
