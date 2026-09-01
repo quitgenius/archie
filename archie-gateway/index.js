@@ -44,6 +44,9 @@ const { StreamingManager } = require('./streaming');
 const { createAgentCoreClient } = require('./agentcore-client');
 const agentCore = createAgentCoreClient();
 
+const approvalsStore = require('./approvals-store');
+const { makeApprovalHandlers, registerApprovalRoutes } = require('./approvals-routes');
+
 const { createCronService } = require('./cron-service');
 const { createCronApi } = require('./cron-api');
 const { createDeliver } = require('./cron-delivery');
@@ -2350,6 +2353,42 @@ web.use((req, res, next) => {
 // writer of the cron store.
 web.use('/cron', createCronApi({ service: cronService, log }));
 
+// ── Outbound-comms approvals API (also behind the shared-secret gate above).
+//
+// The plugin half calls these three: POST /approvals when a send is gated, POST
+// /approvals/redeem on the retry after a human approves, and GET
+// /approvals/optout/:agentId every 60s to decide whether the gate runs at all.
+//
+// P1 ships the store and the endpoints with NO UI, deliberately. A pending approval
+// is therefore un-approvable until the Approvals tab lands in P2 — that is the
+// expected state, not a bug. The order is forced: the plugin fails closed, so if it
+// could block before these routes existed, every outbound send from every agent
+// would be blocked with no way to release it.
+const _notifyApprover = (record) => {
+  // DM every approver in the set, deduped. Falls back to the singular
+  // approverUserId for legacy records that have no approverUserIds array.
+  const ids = Array.from(new Set(
+    record.approverUserIds && record.approverUserIds.length
+      ? record.approverUserIds
+      : [record.approverUserId]
+  ));
+  const text = `:lock: *Approval needed* — your Archie wants to ${marketplace.approvalActionPhrase(record.toolSlug)} *${marketplace.formatApprovalDestination(record.destination)}*. Review it in the *Approvals* tab of the app's Home view.`;
+  return Promise.allSettled(ids.map((id) => slack.chat.postMessage({ channel: id, text }))).then((results) => {
+    results.forEach((result, i) => {
+      if (result.status === 'rejected') {
+        log.error({ err: result.reason?.message, approverId: ids[i] }, 'failed to DM approver');
+      }
+    });
+    return results;
+  });
+};
+
+registerApprovalRoutes({
+  web,
+  verifySecret,
+  handlers: makeApprovalHandlers({ store: approvalsStore, notifyApprover: _notifyApprover, log }),
+});
+
 // REMOVED 2026-08-11: `POST /api/:method`, the Slack proxy.
 //
 // It existed so an OpenClaw ECS agent could speak to Slack itself, via slack-reply-plugin's
@@ -2669,6 +2708,12 @@ async function shutdown(signal) {
 
   // 3. Flush conversation metadata to disk before exiting.
   conversations.saveSync();
+
+  // 3b. Flush approvals too. save() is debounce-only, so without this an approval
+  // decision or an opt-out toggle made in the last SAVE_DEBOUNCE_MS is lost on every
+  // deploy. Upstream flushes conversations here and not approvals; this is one of the
+  // two fixes applied to the archie copy (see approvals-store.js).
+  approvalsStore.saveSync();
 
   // 4. Close streaming state and HTTP server.
   streaming.destroy();
