@@ -46,6 +46,8 @@ const agentCore = createAgentCoreClient();
 
 const approvalsStore = require('./approvals-store');
 const { makeApprovalHandlers, registerApprovalRoutes } = require('./approvals-routes');
+const { canToggleAgent } = require('./opt-toggle-auth');
+const { createApprovalWake } = require('./approvals-wake');
 
 const { createCronService } = require('./cron-service');
 const { createCronApi } = require('./cron-api');
@@ -1408,6 +1410,10 @@ if (bolt) bolt.event('app_home_opened', async ({ event, client }) => {
     if (activeTab === 'tools' && agentId) {
       opts.tools = await fetchToolPermissions(agentId);
     }
+    if (activeTab === 'approvals') {
+      opts.approvalsStore = approvalsStore;
+      opts.approverUserId = userId;
+    }
     const view = marketplace.buildHomeView(agentId, activeTab, opts);
     await client.views.publish({ user_id: userId, view });
     child.info('app home published');
@@ -1739,6 +1745,128 @@ if (bolt) bolt.action('marketplace_tab_tools', async ({ ack, body, client }) => 
     log.error({ err: err.message }, 'failed to switch to tools tab');
   }
 });
+
+// ---------- Approvals tab ----------
+//
+// The SYNC homeViewOptions deliberately, not the async one: this tab reads the approvals
+// store and nothing from the agent's MARKETPLACE row, so homeViewOptionsAsync would buy a
+// DynamoDB GetItem per render for a value nothing on the tab looks at.
+
+/** Republish the viewer's Approvals tab. Used after every decision and every opt toggle. */
+async function publishApprovalsTab(userId, client) {
+  const agentId = homeTargetFor(userId, 'app_home');
+  const view = marketplace.buildHomeView(agentId, 'approvals', homeViewOptions(userId, agentId, {
+    approvalsStore,
+    approverUserId: userId,
+  }));
+  await client.views.publish({ user_id: userId, view });
+}
+
+if (bolt) bolt.action('marketplace_tab_approvals', async ({ ack, body, client }) => {
+  await ack();
+  const userId = body.user.id;
+  userActiveTab.set(userId, 'approvals');
+  try {
+    await publishApprovalsTab(userId, client);
+  } catch (err) {
+    log.error({ err: err.message }, 'failed to switch to approvals tab');
+  }
+});
+
+/**
+ * Approve / Deny from the Approvals tab.
+ *
+ * Authorization is `isApprover`, which handles BOTH the singular approverUserId and the
+ * approverUserIds[] set. Upstream compares the singular field only, so on an owners-policy
+ * request every co-approver is DM'd and sees the card but their click is a silent no-op.
+ * That path is approval-gated only today (comms is requester-first, so the set is always one element),
+ * but the store already models the set and there is no reason to carry the narrower check
+ * into a new stack.
+ */
+async function handleApprovalAction(action, { ack, body, client }) {
+  await ack();
+  const userId = body.user.id;
+  const id = body.actions[0].value;
+  const record = approvalsStore.get(id);
+
+  // Missing record or not an approver: republish with NO state change. Silent by design —
+  // the button carries an id, so a forwarded or replayed payload must not reveal whether
+  // that id exists.
+  if (!record || !approvalsStore.isApprover(record, userId)) {
+    try {
+      await publishApprovalsTab(userId, client);
+    } catch (err) {
+      log.error({ err: err.message }, 'failed to re-publish approvals home after auth mismatch');
+    }
+    return;
+  }
+
+  let wakeMessage;
+  if (action === 'approve') {
+    approvalsStore.approve(id, userId);
+    wakeMessage = `[approval] Approval ${record.id} granted for sending to ${record.destination}. Retry the identical send now.`;
+    log.info({ agentId: record.agentId, approver: userId, destination: record.destination, state: 'approved' }, 'approval decision');
+  } else {
+    approvalsStore.deny(id, userId);
+    wakeMessage = `[approval] The user declined sending to ${record.destination}. Do not retry or reroute this send.`;
+    log.info({ agentId: record.agentId, approver: userId, destination: record.destination, state: 'denied' }, 'approval decision');
+  }
+
+  // Wake the agent so it retries (or abandons) without the human having to prompt it again.
+  // Tracked so shutdown drains it; a wake failure must not lose the decision, which is
+  // already persisted above.
+  track(approvalWake(record, { text: wakeMessage, userId })
+    .catch((err) => log.error({ err: err.message, agentId: record.agentId }, 'approval wake threw')));
+
+  try {
+    await publishApprovalsTab(userId, client);
+  } catch (err) {
+    log.error({ err: err.message }, 'failed to re-publish approvals home after decision');
+  }
+}
+
+if (bolt) bolt.action('approval_approve', (args) => handleApprovalAction('approve', args));
+if (bolt) bolt.action('approval_deny', (args) => handleApprovalAction('deny', args));
+
+/**
+ * Opt out of / back in to the comms approval flow, per AGENT.
+ *
+ * ANTI-FORGERY: the button carries an agent id, but authorization is re-derived from the
+ * CLICKER's own identity, so a replayed or forwarded payload cannot toggle someone else's
+ * agent. Under identity=scope the `dmUsers` leg of canToggleAgent is a derivation rather
+ * than a lookup — homeAgentFor(userId) is by construction the only agent that user owns —
+ * so the one-entry map below is the whole of it. `ownedAgents` stays empty until shared
+ * agents grow an owners list; a minted ch- scope has no derivable owner and therefore
+ * nobody can toggle it, which fails closed.
+ */
+async function handleApprovalOptToggle(optedOut, { ack, body, client }) {
+  await ack();
+  const userId = body.user.id;
+  const targetAgent = body.actions[0].value;
+
+  const allowed = canToggleAgent({
+    userId,
+    targetAgent,
+    dmUsers: { [userId]: homeAgentFor(userId, 'opt_toggle') },
+    ownedAgents: {},
+  });
+  if (!allowed) {
+    log.warn({ userId, targetAgent }, 'opt toggle rejected — not owner');
+    return;
+  }
+
+  approvalsStore.setOptOut(targetAgent, { optedOut, by: userId });
+  log.info({ agentId: targetAgent, by: userId, optedOut }, 'comms approvals opt toggle');
+
+  try {
+    await publishApprovalsTab(userId, client);
+  } catch (err) {
+    log.error({ err: err.message }, 'failed to re-publish approvals home after opt toggle');
+  }
+}
+
+if (bolt) bolt.action('approval_optout', (args) => handleApprovalOptToggle(true, args));
+if (bolt) bolt.action('approval_optin', (args) => handleApprovalOptToggle(false, args));
 
 async function refreshToolsTab(userId, client) {
   const agentId = homeTargetFor(userId, 'app_home');
@@ -2195,6 +2323,22 @@ const streaming = new StreamingManager({
   slack,
   log,
   updateIntervalMs: STREAM_UPDATE_INTERVAL_MS,
+});
+
+// Built HERE, not next to the Approvals handlers that use it, because it closes over
+// `streaming` — a `const` declared on the line above. Constructing it earlier put the call in
+// that binding's temporal dead zone and threw "Cannot access 'streaming' before
+// initialization" at module load, i.e. a crash-loop on boot that `node --check` cannot see
+// (it is a syntax check, not an evaluation). The handlers reference `approvalWake` only from
+// inside a click, long after module evaluation, so declaring it late costs nothing.
+const approvalWake = createApprovalWake({
+  agentCore,
+  // The IMAGE-AWARE resolver. Passing agentCore.ensureRuntime here would silently pin the
+  // woken agent to the dispatcher's baked image — see cron-fire.js:196-201.
+  ensureRuntime: ensureCurrentRuntime,
+  streaming,
+  sessionIdFor: agentcoreSessionId,
+  log,
 });
 
 // P3: Wire up streaming — receive gateway events and update Slack messages live.
