@@ -2258,7 +2258,7 @@ if (bolt) bolt.action('connector_install', async ({ ack, body, client }) => {
   try {
     await marketplace.connectApp(configDoc(), AGENT_CONFIG_TABLE, agentId, slug, name, userId);
     child.info('connector connected (DDB)');
-    await client.chat.postMessage({ channel: userId, text: `:white_check_mark: *${name}* connected to *${agentId}* — available after your agent next restarts.\n\n:key: To finish setup, message your agent: "Connect me to ${name}"` });
+    await client.chat.postMessage({ channel: userId, text: `:white_check_mark: *${name}* connected to *${agentId}*\n\n:key: To finish setup, message your agent: "Connect me to ${name}"` });
     await refreshHome(userId, agentId, 'connectors', client, child);
   } catch (err) {
     child.error({ err: err.message }, 'connector connect failed');
@@ -2280,7 +2280,7 @@ if (bolt) bolt.action('connector_uninstall', async ({ ack, body, client }) => {
   try {
     await marketplace.disconnectApp(configDoc(), AGENT_CONFIG_TABLE, agentId, slug);
     child.info('connector disconnected (DDB)');
-    await client.chat.postMessage({ channel: userId, text: `:white_check_mark: *${slug}* disconnected from *${agentId}* — applies on your agent's next restart.` });
+    await client.chat.postMessage({ channel: userId, text: `:white_check_mark: *${slug}* disconnected from *${agentId}*.` });
     await refreshHome(userId, agentId, 'connectors', client, child);
   } catch (err) {
     child.error({ err: err.message }, 'connector disconnect failed');
