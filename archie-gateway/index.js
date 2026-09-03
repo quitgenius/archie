@@ -46,6 +46,7 @@ const agentCore = createAgentCoreClient();
 
 const approvalsStore = require('./approvals-store');
 const { makeApprovalHandlers, registerApprovalRoutes } = require('./approvals-routes');
+const { registerSlackProxyRoute } = require('./slack-proxy-routes');
 const { canToggleAgent } = require('./opt-toggle-auth');
 const { createApprovalWake } = require('./approvals-wake');
 
@@ -2595,19 +2596,15 @@ registerApprovalRoutes({
   handlers: makeApprovalHandlers({ store: approvalsStore, notifyApprover: _notifyApprover, log }),
 });
 
-// REMOVED 2026-08-11: `POST /api/:method`, the Slack proxy.
+// RESTORED 2026-09-03: `POST /api/:method`, the Slack proxy — see slack-proxy-routes.js, which
+// carries the full history, the accepted risk (unchanged from the 2026-08-11 removal note, and
+// identical to what OpenClaw runs today), and the bounded design to revisit it with.
 //
-// It existed so an OpenClaw ECS agent could speak to Slack itself, via slack-reply-plugin's
-// chat.postMessage. The AgentCore image does not ship that plugin (only connector-session,
-// demo-cache and mcp-auth), and under Pi the adapter streams its reply back through the
-// InvokeAgentRuntime SSE response for the DISPATCHER to post — so nothing called this any more.
-//
-// Worth removing rather than leaving inert: it was an ungated Slack-WRITE surface. Any holder of
-// the shared secret could post as the bot in any channel the bot can see, and every runtime can
-// resolve that secret (DISPATCHER_SHARED_SECRET_ID + its derived role's Secrets Manager read). So
-// an agent holding `bash` could speak as the bot with no capability grant at all, straight past
-// the tool-permission PEP. One `git revert` away if a Pi tool ever needs it — with a capability
-// attached this time.
+// The Pi image now ships slack-reply-plugin, so "nothing calls this any more" no longer holds:
+// `slack_send` is the only way an agent posts as ARCHIE'S OWN Slack app rather than as Connector's.
+// The capability the removal note asked for exists — `slack.send`, declared on the tool and gated
+// by the PEP — though note it gates the TOOL, not this endpoint.
+registerSlackProxyRoute({ web, slack, isSimulateChannel, log });
 
 // Token-validated file download — agents pass a signed ref from the
 // Attachments section. The ref encodes (fileId, expiry, hmac) so only

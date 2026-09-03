@@ -1,0 +1,87 @@
+'use strict';
+
+// Outbound Slack proxy — agent → dispatcher → Slack Web API.
+//
+// RESTORED 2026-09-03, at parity with the OpenClaw dispatcher (slack-dispatcher/index.js:2718).
+// It was removed on 2026-08-11 as dead code: the AgentCore image did not ship slack-reply-plugin,
+// so nothing called it. That changed — the Pi image now bundles the plugin and its `slack_send`
+// tool posts here, because this is the ONLY path that speaks as ARCHIE'S OWN Slack app. The
+// alternative the model reaches for otherwise is Connector's slack toolkit, which posts as the
+// CONNECTOR app and resolves a bare user id against that app, so "DM an operator" lands in Connector's DM
+// with an operator rather than ours (live-caught 2026-09-03 on the email-check-crayon cron).
+//
+// WHAT THE REMOVAL NOTE WARNED ABOUT, AND WHERE IT STANDS. The note called this an ungated
+// Slack-WRITE surface: the only auth is the shared secret, every runtime can resolve that secret
+// (DISPATCHER_SHARED_SECRET_ID + its derived role's Secrets Manager read), so an agent holding
+// `bash` can curl this directly and post as the bot in any channel the bot can see — past the
+// tool-permission PEP, which only gates the TOOL. That is still true here, and it is a DELIBERATE,
+// TIME-BOXED choice (2026-09-03): it is the same surface OpenClaw runs in production today,
+// so this is parity rather than a new exposure.
+//
+// The bounded version, if and when it is assessed: take the destination OUT of the caller's hands.
+// A `POST /api/slack/send` that carries the agent's scope id and resolves the channel server-side
+// via agent-scope.js `slackRefFromScopeId` would confine a compromised agent to its OWN
+// conversation, and would also delete the "model picks the channel" failure mode that caused the
+// incident above. `slack_send` already defaults to nothing and requires an explicit channel, so
+// that change is dispatcher-side only.
+//
+// NOT PORTED from OpenClaw, deliberately — both are coupled to mechanics archie does not have:
+//   - the 🤔 → ✅ reaction swap: turn-lifecycle reactions were removed on 2026-08-13.
+//   - `streaming.clearAllRuns(session, 'slack_send')`: that treats slack_send as the turn's
+//     authoritative final message, which is an OpenClaw streaming assumption. Under Pi the
+//     adapter streams the reply back over the InvokeAgentRuntime SSE response and the DISPATCHER
+//     posts it, so an in-turn slack_send is an EXTRA message, not the terminal one.
+
+// Keep this whitelist narrow — it is the blast radius of a compromised agent.
+const ALLOWED_METHODS = new Set([
+  'chat.postMessage',
+  'chat.update',
+  'chat.postEphemeral',
+  'reactions.add',
+  'files.uploadV2',
+  'conversations.replies',
+  'users.info',
+]);
+
+/**
+ * @param slack             the WebClient (or its simulate-aware proxy)
+ * @param isSimulateChannel (channel) => bool — C_SIMULATE* short-circuit, see below
+ * @param log               pino logger
+ */
+function makeSlackProxyHandler({ slack, isSimulateChannel = () => false, log }) {
+  return async function slackProxy(req, res) {
+    const method = req.params.method;
+    const child = log.child ? log.child({ slack_method: method }) : log;
+    if (!ALLOWED_METHODS.has(method)) {
+      child.warn('method not allowed');
+      return res.status(403).json({ ok: false, error: 'method not allowed' });
+    }
+    // The simulate short-circuit has to live HERE as well as on the `slack` Proxy. That proxy only
+    // wraps NAMESPACED access (slack.chat.postMessage); `apiCall` is a plain function on the client,
+    // so it comes back unwrapped and a C_SIMULATE* channel would reach real Slack and fail with
+    // invalid_channel — silently breaking `/simulate`, whose whole job is to report which Slack
+    // methods a turn calls.
+    const channel = req.body && req.body.channel;
+    if (isSimulateChannel(channel)) {
+      child.info({ channel, text: String((req.body && req.body.text) || '').slice(0, 200) },
+        '[simulate] slack proxy call intercepted');
+      return res.json({ ok: true, ts: `sim-proxy-${Date.now()}` });
+    }
+    try {
+      const started = Date.now();
+      const result = await slack.apiCall(method, req.body);
+      child.info({ latency_ms: Date.now() - started, ok: result && result.ok }, 'slack api call ok');
+      return res.json(result);
+    } catch (err) {
+      child.error({ err: err.message }, 'slack api call failed');
+      return res.status(502).json({ ok: false, error: err.message });
+    }
+  };
+}
+
+// Mounted AFTER the x-dispatcher-secret middleware, which is what authenticates it.
+function registerSlackProxyRoute({ web, slack, isSimulateChannel, log }) {
+  web.post('/api/:method', makeSlackProxyHandler({ slack, isSimulateChannel, log }));
+}
+
+module.exports = { ALLOWED_METHODS, makeSlackProxyHandler, registerSlackProxyRoute };
