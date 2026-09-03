@@ -123,8 +123,14 @@ async function runHealthcheck({
       }
 
       const ms = now() - started;
-      out?.verbose?.(`healthcheck ${agent}: served in ${ms}ms after ${attempts} attempt(s), ${text.trim().length} chars`);
-      return { ok: true, attempts, ms, sessionId: session };
+      // THE REPLY TEXT, not only its length. A character count cannot be read as evidence: the
+      // default prompt's pass is the 2-char "ok", and an agent that has lost its identity, its
+      // config or its tools answers a real question wrongly at exactly the same length. Whoever is
+      // deciding whether to hand this agent to a person needs to see what it said.
+      const reply = text.trim();
+      out?.verbose?.(`healthcheck ${agent}: served in ${ms}ms after ${attempts} attempt(s), ${reply.length} chars`);
+      out?.verbose?.(`reply        ${reply.length > 300 ? `${reply.slice(0, 300)}…` : reply}`);
+      return { ok: true, attempts, ms, sessionId: session, reply };
     } catch (e) {
       lastErr = e;
       const terminal = isTerminal(e);
@@ -234,6 +240,20 @@ async function healthcheck(ctx, args, out, deps = {}) {
   // Default ON. Off only for investigating an already-tainted tag — see the refusal below.
   const taintOnFailure = args.values['no-taint-on-failure'] ? false : true;
 
+  // `--prompt` WAS DECLARED AND SILENTLY DROPPED (registry.js:73 parses it; `runHealthcheck` reads
+  // `deps.prompt`, which only a test ever set). So every invocation ran DEFAULT_PROMPT — "Reply with
+  // the single word: ok" — and reported "2 chars" no matter what was asked for. That is the whole
+  // difference between a check and a proof: a 2-char reply confirms the model path answers, and
+  // says nothing about whether the agent loaded its own identity, config or tools. An operator
+  // trying to strengthen the check got the weak one back and no indication it had been ignored.
+  const prompt = args.values.prompt !== undefined ? String(args.values.prompt) : undefined;
+  if (prompt !== undefined && !prompt.trim()) {
+    throw usage('--prompt must be a non-empty string', {
+      detail: 'pi-adapter.mjs:1071-1073 rejects an empty prompt, so this would fail as a healthcheck '
+        + 'failure — and a healthcheck failure taints the tag.',
+    });
+  }
+
   // The `{ doc() }` accessor shape the shared readers take — reused from cmd/stage.js rather than
   // re-spelled, so there is one place where --profile is threaded to the clients the dispatcher's
   // client builds for itself.
@@ -259,7 +279,8 @@ async function healthcheck(ctx, args, out, deps = {}) {
 
   try {
     const res = await runHealthcheck({
-      agent, tag: tag, runtimeArn: binding.arn, budgetSeconds, ctx, out, deps,
+      agent, tag: tag, runtimeArn: binding.arn, budgetSeconds, ctx, out,
+      deps: prompt === undefined ? deps : { ...deps, prompt },
     });
     out.progress(`ok           ${agent} served in ${res.ms}ms after ${res.attempts} attempt(s)`);
     return { agent, tag, ...res };
