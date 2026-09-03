@@ -45,8 +45,8 @@ const ask = (sources, entities, scope, capability, grants = []) =>
 
 test('the domain is capabilities ∪ slugs, and the slugs are really there', () => {
   const domain = capabilityDomain(PROD);
-  // 23 capabilities + 8 Connector comms slugs. Two blocks for review, one entity set (semantics.json:123).
-  assert.equal(domain.length, 31);
+  // 24 capabilities + 8 Connector comms slugs. Two blocks for review, one entity set (semantics.json:123).
+  assert.equal(domain.length, 32);
   assert.deepEqual(domain, [...domain].sort(), 'sorted, so the row key order cannot depend on JSON key order');
 
   // THE BUG THE POLICY DOCUMENT FOUND IN ITSELF (policy/README.md:129-146). The 8 slugs were listed as
@@ -59,7 +59,7 @@ test('the domain is capabilities ∪ slugs, and the slugs are really there', () 
 test('every Capability entity carries attrs.name, because A2 reads it', () => {
   const entities = capabilityEntities(PROD);
   const caps = entities.filter((e) => e.uid.type === TYPE.capability);
-  assert.equal(caps.length, 31);
+  assert.equal(caps.length, 32);
   for (const e of caps) {
     // archie.cedarschema:29-33 and spike README §5: omit this and the condition ERRORS, the permit
     // never applies, and you would "confirm" a pin that is doing nothing.
@@ -77,11 +77,11 @@ test('CapGroup membership becomes the capability entity\'s parents, one hop only
   assert.deepEqual(parents.get('SLACK_SEND_MESSAGE'), ['connector.comms']);
   assert.equal(parents.get('aws-readonly'), undefined, 'a pinned capability is in no capGroup');
 
-  // The 7 baseline members are exactly CAPABILITY_DEFAULTS' 7 allow entries
-  // (permissions/capabilities.mjs:12-21). Plan §8.2 makes that map DERIVED from this group; until it
-  // does, `rowFor`'s pruning depends on the two agreeing (see policy-row.js ambientVerdict).
+  // The baseline members are exactly CAPABILITY_DEFAULTS' allow entries — which ARE now derived from
+  // this group (baseline.generated.mjs), so the two cannot drift; `rowFor`'s pruning depends on that
+  // agreement (see policy-row.js ambientVerdict).
   assert.deepEqual(PROD.data.capGroups.baseline.members.slice().sort(),
-    ['connector', 'cron', 'fs.read', 'health', 'hindsight.read', 'memory', 'otel']);
+    ['connector', 'cron', 'fs.read', 'health', 'hindsight.read', 'memory', 'otel', 'slack.send']);
 
   // CapGroups cannot nest: archie.cedarschema:36 declares `entity CapGroup;` with no `in [...]`.
   for (const e of capabilityEntities(PROD).filter((x) => x.uid.type === TYPE.capGroup)) {
@@ -126,12 +126,12 @@ test('the ScopeGroup vocabulary is the 12 pins PLUS the 5 skill groups, in both 
 
 test('entitiesFor is the shared set plus exactly one principal', () => {
   const shared = sharedEntities(PROD);
-  // 31 capabilities + 2 CapGroups + 17 ScopeGroups (12 pin + 5 skill; comms-approval removed 2026-08-19,
+  // 32 capabilities + 2 CapGroups + 17 ScopeGroups (12 pin + 5 skill; comms-approval removed 2026-08-19,
   // a zero-holder pin that was also breaking POLICY row writes on the deployed gateway). The skill groups
   // get entities like any other ScopeGroup even though no Cedar statement references them: the entity set is
   // vocabulary, and omitting them would make a Scope's `parents` name a group that does not exist — which
   // spike README §5 records as a dangling parent that still ALLOWS, i.e. fails OPEN.
-  assert.equal(shared.length, 31 + 2 + 17);
+  assert.equal(shared.length, 32 + 2 + 17);
   const all = entitiesFor(MEMBER, PROD);
   assert.equal(all.length, shared.length + 1);
   assert.equal(all[all.length - 1].uid.id, MEMBER);

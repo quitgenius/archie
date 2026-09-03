@@ -132,6 +132,7 @@ const CAPABILITY_SUMMARY = {
   connector: 'Use the third-party apps connected on the Connected Apps tab (Gmail, Drive, Notion, …).',
   health: 'Report whether its own plugins loaded.',
   'hindsight.read': 'Recall facts from the read-only organisation knowledge bank.',
+  'slack.send': 'Post Slack messages as Archie — used for cron jobs and cross-posting. Goes out under Archie\u2019s own bot identity, so it can only reach channels Archie is in, plus DMs with people who can DM Archie.',
   // grant-required (default-deny)
   'fs.write': 'WRITE and edit files in its own workspace. Irreversible within the workspace; cannot reach anything outside it.',
   runtime: 'Run arbitrary shell commands in its sandbox \u2014 the broadest grant here. Anything the sandbox can reach, it can do, including network calls with its own credentials.',

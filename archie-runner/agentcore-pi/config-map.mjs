@@ -25,10 +25,18 @@ import { buildSandboxProbeTools } from './sandbox-probe-tool.mjs';
 
 // ── Plugin manifest (§2.5) ──────────────────────────────────────────────────
 // The compat host is OPTIONAL: only plugins we ship a Pi bundle for are routed through
-// it; hindsight is Pi-NATIVE (own extension); slack-reply is dropped under Pi; everything
-// else is logged as unsupported (no silent gaps).
-const COMPAT_PLUGINS = new Set(['connector-session-plugin', 'demo-cache-plugin', 'openclaw-mcp-auth-plugin']); // have an esbuild bundle
-const DROPPED_PLUGINS = new Set(['slack-reply-plugin']); // not implemented under Pi (§5.3)
+// it; hindsight is Pi-NATIVE (own extension); everything else is logged as unsupported
+// (no silent gaps).
+const COMPAT_PLUGINS = new Set(['connector-session-plugin', 'demo-cache-plugin', 'openclaw-mcp-auth-plugin', 'slack-reply-plugin']); // have an esbuild bundle
+const DROPPED_PLUGINS = new Set([]); // empty today; the mechanism stays so a future drop is REPORTED, never silent
+
+// Attached to EVERY agent, whatever its per-agent plugin config says. `slack_send` is the only
+// way a Pi agent can post to Slack out-of-band (cron jobs, cross-posting) as ARCHIE'S OWN app.
+// Without it the model reaches for Connector's slack toolkit, which posts as the *Connector* app —
+// and Slack resolves a bare user id against the POSTING app, so "DM an operator" landed in Connector's DM
+// with an operator rather than ours. Live-caught 2026-09-03; see also the 2026-08-12 bash+curl incident
+// below, which was the same missing tool failing a different way.
+const ALWAYS_ATTACH_PLUGINS = ['slack-reply-plugin'];
 const MEMORY_SLOT_NATIVE = 'hindsight-openclaw'; // handled by hindsight-extension.mjs
 
 // What a plugin PROVIDES, so the boot warning can name the missing tool rather than the plugin
@@ -168,6 +176,12 @@ export function resolvePluginManifest(cfg) {
     if (!allow.has(id)) { skipped.push({ id, reason: 'not-allowed' }); continue; }
     if (COMPAT_PLUGINS.has(id)) compat.push({ id, pluginConfig: entries[id].config || {} });
     else skipped.push({ id, reason: 'no-pi-support-yet' });
+  }
+  // Fleet-wide attachments land regardless of per-agent config (and regardless of `allow`, which
+  // is why this runs AFTER the loop rather than seeding `entries`). Deduped: an agent that does
+  // name the plugin has already pushed it above.
+  for (const id of ALWAYS_ATTACH_PLUGINS) {
+    if (!compat.some((c) => c.id === id)) compat.push({ id, pluginConfig: entries[id]?.config || {} });
   }
   return { hindsight, compat, skipped };
 }

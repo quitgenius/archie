@@ -70,6 +70,15 @@ RUN cd openclaw-mcp-auth-plugin \
   && npx esbuild index.ts --bundle --format=cjs --platform=node --target=node22 \
        --outfile=/build/plugins/openclaw-mcp-auth-plugin.cjs
 
+# slack-reply-plugin: outbound Slack through the dispatcher proxy, which holds ARCHIE'S OWN
+# bot token (the agent never gets a Slack token). Zero runtime deps → a plain bundle.
+COPY slack-reply-plugin/ ./slack-reply-plugin/
+RUN cd slack-reply-plugin \
+  && npm install --omit=dev --no-fund --no-audit \
+  && npm install esbuild --no-save --no-fund --no-audit \
+  && npx esbuild index.ts --bundle --format=cjs --platform=node --target=node22 \
+       --outfile=/build/plugins/slack-reply-plugin.cjs
+
 # ── stage 2: runtime ──
 FROM node:22-slim
 WORKDIR /app

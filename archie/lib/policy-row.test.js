@@ -53,6 +53,9 @@ test('three verdicts, and each one comes from a distinguishable place in the pol
 
   // `allow` — A1, the baseline CapGroup. No grant consulted.
   assert.equal(all['fs.read'], VERDICT.ALLOW);
+  // Same route for slack.send: baseline since 2026-09-03, so every scope may post as Archie without a
+  // grant. Asserted explicitly because the whole point of adding it was fleet-wide availability.
+  assert.equal(all['slack.send'], VERDICT.ALLOW);
   // `allow` — a PINNED capability this scope is a member of. Membership IS access, so it is `allow`
   // and never `grant`: that is the whole difference between the shipped permit/forbid pairs and the
   // forbid-only design superseded on 2026-08-18 (semantics.cedar:100-105).
@@ -66,7 +69,7 @@ test('three verdicts, and each one comes from a distinguishable place in the pol
   // `deny` — a pin whose group this scope is not in. Nothing can allow it.
   assert.equal(all['demo_cache'], VERDICT.DENY);
 
-  assert.equal(Object.keys(all).length, 31, 'the full map covers the whole domain');
+  assert.equal(Object.keys(all).length, 32, 'the full map covers the whole domain');
 });
 
 test('a pinned capability is never `grant`, in either environment', () => {

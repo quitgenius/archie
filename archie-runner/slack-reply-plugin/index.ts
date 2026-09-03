@@ -39,7 +39,9 @@ export default definePluginEntry({
   description: "Posts Slack replies via the clawdbot dispatcher.",
 
   register(api) {
-    const proxyUrl = process.env.SLACK_PROXY_URL;
+    // OpenClaw sets SLACK_PROXY_URL; under Pi/AgentCore pi-entrypoint resolves the same host as
+    // DISPATCHER_BASE_URL at boot. Accept either so neither runtime needs a bespoke env var.
+    const proxyUrl = process.env.SLACK_PROXY_URL || process.env.DISPATCHER_BASE_URL;
     const secret = process.env.DISPATCHER_SHARED_SECRET;
 
     // Warn once at init if either env var is missing. We don't refuse
@@ -74,6 +76,8 @@ export default definePluginEntry({
 
     api.registerTool(() => ({
       name: "slack_download_file",
+      // Not baseline — default-deny under Pi until someone grants it deliberately.
+      capability: "slack.files",
       description:
         "Download a file attachment shared in the current Slack conversation. " +
         "Use the ref value from the Attachments section of the incoming message — " +
@@ -285,6 +289,9 @@ export default definePluginEntry({
 
     api.registerTool(() => ({
       name: "slack_send",
+      // Read by Pi's PEP (pi-adapter builds toolCaps from every tool declaring `capability`).
+      // Inert under OpenClaw, which has no capability model.
+      capability: "slack.send",
       description:
         "Send a Slack message to a specific channel/thread. " +
         "ONLY use for: (1) cron jobs or async background tasks, (2) cross-posting to a different channel. " +
@@ -297,7 +304,10 @@ export default definePluginEntry({
         properties: {
           channel: {
             type: "string",
-            description: "Slack channel ID from meta.slack.channel (e.g. C01… or D01…)",
+            description:
+              "Where to post: a channel id (C…), a DM id (D…), or a USER id (U…) to DM that " +
+              "person. A user id is resolved against Archie's own bot identity, so it opens " +
+              "Archie's DM with them. Under Slack-triggered turns, prefer meta.slack.channel.",
           },
           text: {
             type: "string",

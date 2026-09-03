@@ -25,10 +25,14 @@ test('the file on disk matches the policy', () => {
   assert.doesNotThrow(() => assertGenerated({ env: 'prod' }), 'the baseline set is env-independent');
 });
 
-test('it reproduces exactly the set the hand-written map had', () => {
-  // The port must be behaviour-preserving: these are the 7 that were in CAPABILITY_DEFAULTS before codegen.
+test('it reproduces the ported set, plus only deliberate additions', () => {
+  // PORTED is the 7 that were in CAPABILITY_DEFAULTS before codegen; the port had to be behaviour-
+  // preserving, so every one must STILL be baseline. Anything added since is named separately and on
+  // purpose — an accidental widening of the generally-available set still fails here.
+  const PORTED = ['fs.read', 'memory', 'cron', 'otel', 'connector', 'health', 'hindsight.read'];
+  const ADDED_SINCE = ['slack.send']; // 2026-09-03: archie's own Slack send (slack-reply-plugin)
   const { members, immutable } = baselineFrom(SANDBOX);
-  assert.deepEqual(members, ['fs.read', 'memory', 'cron', 'otel', 'connector', 'health', 'hindsight.read']);
+  assert.deepEqual(members, [...PORTED, ...ADDED_SINCE]);
   assert.deepEqual(immutable, ['otel', 'hindsight.read']);
 });
 
