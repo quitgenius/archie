@@ -84,6 +84,52 @@ check('prewarmCompatPlugins registers without resolving tools, and awaits in-fli
   delete globalThis.__connectorSessionPluginDiscovering;
 });
 
+// Live regression, 2026-09-04 (@mcpauth-discovery-race). The prewarm drained ONLY Connector's
+// in-flight map, so openclaw-mcp-auth-plugin's discovery was never awaited — its extra MCP servers
+// (DemoWarehouse, DemoQueryApp) landed ~1s after the session's tool list was frozen, on every session. Prod
+// dm-urbnxvak3l5: 19/19 cron fires called `mcp_auth__demo_warehouse__*` and got `Tool ... not found`.
+check('prewarm awaits EVERY discovering compat plugin, not just connector', async () => {
+  let connectorDone = false, mcpAuthDone = false;
+  globalThis.__connectorSessionPluginDiscovering = new Map([
+    ['agentA', new Promise((r) => setTimeout(() => { connectorDone = true; r(); }, 20))],
+  ]);
+  globalThis.__mcpAuthPluginDiscovering = new Map([
+    ['agentA', new Promise((r) => setTimeout(() => { mcpAuthDone = true; r(); }, 40))],
+  ]);
+  const entry = { id: 'fake-plugin', register() {} };
+  const r = await prewarmCompatPlugins([{ entry, pluginConfig: {} }], { logSink: sink });
+  assert.equal(connectorDone, true, 'awaited connector discovery');
+  assert.equal(mcpAuthDone, true, 'awaited mcp-auth discovery — the bug this test exists for');
+  assert.equal(r.awaited, 2, 'both maps counted');
+  assert.equal(r.timedOut, false);
+  delete globalThis.__connectorSessionPluginDiscovering;
+  delete globalThis.__mcpAuthPluginDiscovering;
+});
+
+// A plugin discovering asynchronously but absent from DISCOVERY_INFLIGHT_GLOBALS is invisible to
+// the prewarm and therefore always loses the tool-resolution race. Pin the list so adding a
+// third such plugin has to come past this test.
+check('DISCOVERY_INFLIGHT_GLOBALS covers both async-discovering plugins', async () => {
+  const src = await import('node:fs').then((fs) => fs.readFileSync(new URL('./plugin-host.mjs', import.meta.url), 'utf8'));
+  for (const g of ['__connectorSessionPluginDiscovering', '__mcpAuthPluginDiscovering']) {
+    assert.ok(src.includes(g), `${g} missing from the prewarm drain list`);
+  }
+});
+
+// mcp-auth's own in-flight map alone must be enough — the connector global is absent on an agent
+// with no connector slice, and that must not short-circuit the drain.
+check('prewarm awaits mcp-auth discovery with no connector map present', async () => {
+  let done = false;
+  globalThis.__mcpAuthPluginDiscovering = new Map([
+    ['agentA', new Promise((r) => setTimeout(() => { done = true; r(); }, 20))],
+  ]);
+  const entry = { id: 'fake-plugin', register() {} };
+  const r = await prewarmCompatPlugins([{ entry, pluginConfig: {} }], { logSink: sink });
+  assert.equal(done, true);
+  assert.equal(r.awaited, 1);
+  delete globalThis.__mcpAuthPluginDiscovering;
+});
+
 check('prewarm is BOUNDED — a hung discovery delays boot, it does not prevent it', async () => {
   // Settles well AFTER the timeout — a never-settling promise cannot be used here because the
   // prewarm's own timer is unref'd (deliberately: it must not hold the process open in prod), so

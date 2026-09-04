@@ -1,4 +1,4 @@
-import { definePluginEntry } from "../plugin-sdk/plugin-entry.mjs";
+import { definePluginEntry, type PluginApi } from "../plugin-sdk/plugin-entry.mjs";
 import { parsePluginConfig } from "./src/config.js";
 import { SENDER_PARAM, bindToolForTurn, buildAuthTools, discoverAndCache, extractSenderFromRunId, getCachedTemplates, getPluginHealth, isMcpAuthTool, registerAgentCfg } from "./src/tool-cache.js";
 
@@ -9,11 +9,59 @@ function maskKey(key: string): string {
 // Non-interactive mode (AgentCore / Pi): ephemeral per-session microVMs cannot bind an
 // inbound OAuth2 callback listener and have no co-located browser, so the interactive
 // authorization flow is disabled. OAuth2 servers run REFRESH-ONLY off a pre-seeded token
-// file on EFS (<agentDir>/mcp-auth-oauth2-tokens.json). Eager discovery is also skipped —
-// it derived agentDir from OPENCLAW_HOME, which is wrong under Pi's flat EFS layout; lazy
-// factory-time discovery uses the correct ctx.agentDir instead. Unset under ECS/OpenClaw,
-// so this is fully backward-compatible.
+// file on EFS (<agentDir>/mcp-auth-oauth2-tokens.json). Unset under ECS/OpenClaw, so this
+// is fully backward-compatible.
+//
+// Eager discovery USED to be skipped here as well, because the OpenClaw-era eager path
+// derived agentDir from OPENCLAW_HOME — wrong under Pi's flat EFS layout — and lazy
+// factory-time discovery had the correct ctx.agentDir. That reasoning was right about the
+// DIRECTORY and wrong about the TIMING, and it cost the fleet its extra MCP servers:
+//
+//   Pi resolves a session's tool list ONCE, synchronously, at session build. So the lazy
+//   path can only ever be late — the factory returns just the health tool, kicks discovery
+//   off in the background, and nothing ever re-resolves. Under OpenClaw that was harmless
+//   (one long-lived gateway, tools re-resolved per message, so only the first message
+//   lost); under Pi every session is a fresh microVM, so the per-process cache is always
+//   empty and the race loses IDENTICALLY EVERY TIME. Measured in prod 2026-09-04 on
+//   dm-urbnxvak3l5: discovery landed ~0.6-1.2s after `compat plugins loaded` reported
+//   `openclaw-mcp-auth-plugin tools:1`, on all 19 cron fires, so every DemoWarehouse call in
+//   every cron turn came back `Tool mcp_auth__demo_warehouse__list_clusters not found` in 0ms
+//   and the data-heavy jobs announced nothing. This is the SAME race that
+//   prewarmCompatPlugins already exists to close for connector-session-plugin.
+//
+// So we now discover EAGERLY under Pi too, using the compat host's agentDir (api.resolvePath
+// resolves against sessionCtx.agentDir, which the adapter sets to the EFS root for both
+// prewarm and session build — the same dir the lazy path would have used). The interactive
+// refusal is unaffected: it is enforced at the per-user connect chokepoint in tool-cache.ts,
+// not by withholding discovery.
 const NON_INTERACTIVE = process.env.MCP_AUTH_NONINTERACTIVE === "1";
+
+/**
+ * The directory OAuth2 token/client state lives in, for a discovery kicked off at
+ * register() time (before any tool-factory ctx exists).
+ *
+ * Under Pi the compat host's `api.resolvePath` resolves against `sessionCtx.agentDir`, so
+ * resolving "." yields exactly the agentDir the lazy path receives as `ctx.agentDir`.
+ * Under OpenClaw there is no such surface, so fall back to the OPENCLAW_HOME layout.
+ * `undefined` is a valid answer — discovery is schema-only and only OAuth2 servers need a
+ * dir at all.
+ */
+function eagerAgentDirFor(api: PluginApi, agentId: string): string | undefined {
+  if (typeof api.resolvePath === "function") {
+    try {
+      return api.resolvePath(".");
+    } catch (err) {
+      // Not silent: falling through means OAuth2 servers look for their token in the
+      // OPENCLAW_HOME layout, which does not exist under Pi — so a refresh-only server would
+      // fail to authorize for a reason invisible at the call site.
+      api.logger.warn(
+        `mcp-auth-plugin: api.resolvePath failed for agent="${agentId}" (${String(err)}) — falling back to the OPENCLAW_HOME agentDir layout`,
+      );
+    }
+  }
+  const openclawHome = process.env.OPENCLAW_HOME || "";
+  return openclawHome ? `${openclawHome}/.openclaw/agents/${agentId}/agent` : undefined;
+}
 
 // ── Process-level singletons ──────────────────────────────────────────────────
 // openclaw loads external plugins fresh on every tool resolution call, so
@@ -72,16 +120,15 @@ export default definePluginEntry({
         api.logger.info(
           `mcp-auth-plugin:   agent=${agentId} servers=${serverCount} firstKey=${maskKey(firstKey)}`,
         );
-        if (NON_INTERACTIVE) {
+        if (!getCachedTemplates(agentId) && !discovering.has(agentId)) {
+          // Resolved from the plugin API under Pi (the EFS agentDir) and from OPENCLAW_HOME
+          // under OpenClaw, so OAuth2 servers can read/persist tokens during eager discovery
+          // — before any tool-factory ctx.agentDir exists.
+          const eagerAgentDir = eagerAgentDirFor(api, agentId);
           api.logger.info(
-            `mcp-auth-plugin: non-interactive mode — skipping eager discovery for agent="${agentId}" (lazy discovery uses ctx.agentDir off EFS)`,
+            `mcp-auth-plugin: eager discovery started for agent="${agentId}"`
+            + `${NON_INTERACTIVE ? " (non-interactive)" : ""} agentDir=${eagerAgentDir ?? "none"}`,
           );
-        } else if (!getCachedTemplates(agentId) && !discovering.has(agentId)) {
-          api.logger.info(`mcp-auth-plugin: eager discovery started for agent="${agentId}"`);
-          // Derive agentDir from OPENCLAW_HOME so OAuth2 servers can persist
-          // tokens during eager discovery (before any ctx.agentDir is available).
-          const openclawHome = process.env.OPENCLAW_HOME || "";
-          const eagerAgentDir = openclawHome ? `${openclawHome}/.openclaw/agents/${agentId}/agent` : undefined;
           const p = discoverAndCache({ agentId, pluginCfg: cfg, agentCfg, agentDir: eagerAgentDir })
             .then(() => {
               const t = getCachedTemplates(agentId) ?? [];

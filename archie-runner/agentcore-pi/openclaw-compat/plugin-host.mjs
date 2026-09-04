@@ -154,15 +154,41 @@ function appendToLastUser(messages, text) {
  * and the race ALWAYS loses: 66/66 sampled session builds contained zero `mcp_connector__*` tools,
  * while `mcp_connector_plugin_health` cheerfully reported `ready, toolCount: 6`.
  *
- * Registering here is safe to do twice: the plugin guards its eager discovery with a
- * `globalThis.__connectorSessionPluginInited` flag, so the per-session register is a no-op for
- * discovery purposes once this has run.
+ * Registering here is safe to do twice: each plugin guards its eager discovery with a
+ * `globalThis.__<plugin>Inited` flag, so the per-session register is a no-op for discovery
+ * purposes once this has run.
  *
- * Readiness is read from the plugin's own in-flight map. That is a deliberate coupling to one
- * plugin's internals — we own both sides, and the alternative (a readiness contract in the SDK)
- * is a bigger change than the bug warrants. It degrades safely: an unknown shape just means no
- * promises to await.
+ * Readiness is read from each plugin's own in-flight map (DISCOVERY_INFLIGHT_GLOBALS). That is a
+ * deliberate coupling to those plugins' internals — we own both sides, and the alternative (a
+ * readiness contract in the SDK) is a bigger change than the bug warrants. It degrades safely: an
+ * unknown shape just means no promises to await.
+ *
+ * ⚠️ EVERY compat plugin that discovers asynchronously MUST be in that list. Draining only
+ * Connector's map is how the identical bug survived in openclaw-mcp-auth-plugin for a month:
+ * `awaited: 1` in the prod logs was Connector alone, so mcp-auth's extra MCP servers (DemoWarehouse,
+ * DemoQueryApp) resolved ~1s after the session's tool list was already frozen — every session, every
+ * cron fire, `Tool mcp_auth__demo_warehouse__* not found` in 0ms. Adding a plugin here is part of
+ * porting it, not an optimisation.
  */
+// agentId -> Promise<void> maps, one per async-discovering compat plugin. Names are the plugins'
+// own globals (connector-session-plugin, openclaw-mcp-auth-plugin).
+const DISCOVERY_INFLIGHT_GLOBALS = [
+  '__connectorSessionPluginDiscovering',
+  '__mcpAuthPluginDiscovering',
+];
+
+// Collect the in-flight discovery promises across all of them. Shape-tolerant by design: a plugin
+// that isn't loaded, or whose global is some other shape, contributes nothing rather than throwing
+// on the boot path.
+function inflightDiscoveries() {
+  const out = [];
+  for (const name of DISCOVERY_INFLIGHT_GLOBALS) {
+    const m = globalThis[name];
+    if (m && typeof m.values === 'function') out.push(...m.values());
+  }
+  return out;
+}
+
 export async function prewarmCompatPlugins(entries, opts = {}) {
   const { sessionCtx = {}, config = {}, logSink = console, timeoutMs = 15000 } = opts;
   const registered = [];
@@ -175,8 +201,7 @@ export async function prewarmCompatPlugins(entries, opts = {}) {
       makeLogger(entry.id, logSink).warn?.(`prewarm register failed (isolated): ${String(e && e.message || e)}`);
     }
   }
-  const inflight = globalThis.__connectorSessionPluginDiscovering;
-  const pending = inflight && typeof inflight.values === 'function' ? [...inflight.values()] : [];
+  const pending = inflightDiscoveries();
   if (!pending.length) return { registered, awaited: 0, timedOut: false };
 
   let timedOut = false;

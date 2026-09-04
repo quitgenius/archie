@@ -56,6 +56,17 @@ export interface PluginApi {
   registerTool(factory: (ctx: PluginToolContext) => unknown): void;
   /** Subscribe to a lifecycle hook (e.g. "before_tool_call", "before_prompt_build"). */
   on(event: string, handler: (event: PluginHookEvent, ctx: PluginToolContext) => unknown): void;
+  /**
+   * Resolve a path against the agent's directory — the same dir a tool factory later receives as
+   * `PluginToolContext.agentDir`. Available at `register(api)` time, which is the ONLY way a
+   * plugin can reach the agentDir before any factory ctx exists (mcp-auth needs it to run eager
+   * discovery against the real EFS dir rather than an OPENCLAW_HOME-shaped guess).
+   *
+   * Optional for the same reason `trigger` above was worth declaring: the compat host has always
+   * provided it, but an undeclared field pushes plugins into host-specific guessing. Callers must
+   * still feature-detect — a different host may not supply it.
+   */
+  resolvePath?(p: string): string;
 }
 
 export type PluginConfigSchema = Record<string, unknown>;
