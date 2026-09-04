@@ -118,11 +118,42 @@ test('capabilityOf: MCP servers matched by configured prefix, demo_warehouse→d
   assert.equal(cap('demo_diagram_app__create'), 'demo_diagram_app');
 });
 
+// Live regression, prod 2026-09-04. openclaw-mcp-auth-plugin registers proxied MCP tools as
+// `mcp_auth__<toolPrefix>__<name>` (its tool-cache.ts TOOL_PREFIX), which the bare-prefix rule above
+// never matched — so on agent-zvo25p all six DemoWarehouse tools resolved 'unknown', were hidden by
+// the grant filter, and the closure invariant logged a hole each. `demo_warehouse` and `demo_query_app` were BOTH granted
+// (GRANT#dm-urbnxvak3l5 → agent-base) and neither is policy-pinned, so the capability name was the
+// only thing standing between the agent and its data.
+test('capabilityOf: mcp-auth namespaced MCP tools resolve to the server capability', () => {
+  const cap = makeCapabilityResolver({ toolCaps: TC, mcpPrefixes: ['demo_query_app', 'demo_warehouse', 'demo_diagram_app'] });
+  assert.equal(cap('mcp_auth__demo_warehouse__execute_query'), 'demo_warehouse'); // alias, namespaced
+  assert.equal(cap('mcp_auth__demo_warehouse__list_clusters'), 'demo_warehouse');
+  assert.equal(cap('mcp_auth__demo_query_app__run_query'), 'demo_query_app');
+  assert.equal(cap('mcp_auth__demo_diagram_app__create'), 'demo_diagram_app');
+  // The plugin's own health tool stays baseline `health` — it must NOT be gated as a data cap, and
+  // the health rule runs before the prefix rules precisely so this holds.
+  assert.equal(cap('mcp_auth_plugin_health'), 'health');
+});
+
 test('capabilityOf: unknown / unconfigured MCP → unknown (→ deny)', () => {
   const cap = makeCapabilityResolver({ toolCaps: TC, mcpPrefixes: ['demo_query_app'] });
   assert.equal(cap('demo_warehouse__execute_sql'), 'unknown');   // prefix not configured for this agent
   assert.equal(cap('totally_new_tool'), 'unknown');
+  // Namespacing does not smuggle an unconfigured server past the gate either.
+  assert.equal(cap('mcp_auth__demo_warehouse__execute_query'), 'unknown');
   assert.equal(policyFor('unknown'), 'deny');
+});
+
+// The prefix is duplicated in capabilities.mjs rather than imported (boot-path depth, see its
+// comment). Pin the two together so a rename in the plugin cannot silently re-open the hole.
+test('capabilities.mjs MCP_AUTH_PREFIX matches the plugin TOOL_PREFIX', async () => {
+  const { readFileSync } = await import('node:fs');
+  const plugin = readFileSync(new URL('../../openclaw-mcp-auth-plugin/src/tool-cache.ts', import.meta.url), 'utf8');
+  const m = plugin.match(/const TOOL_PREFIX = "([^"]+)"/);
+  assert.ok(m, 'could not find TOOL_PREFIX in the plugin');
+  const mine = readFileSync(new URL('./capabilities.mjs', import.meta.url), 'utf8');
+  assert.ok(mine.includes(`const MCP_AUTH_PREFIX = '${m[1]}'`),
+    `capabilities.mjs MCP_AUTH_PREFIX must be '${m[1]}' to match the plugin`);
 });
 
 test('default policy: allow-list baseline, everything else deny via *', () => {

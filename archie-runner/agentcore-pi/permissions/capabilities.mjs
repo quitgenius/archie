@@ -60,6 +60,13 @@ export const isBaseline = (cap) => policyFor(cap) === 'allow';
 // What remains here is only the residual we can't decorate: Pi-owned built-ins (their objects aren't
 // ours), and dynamic/plugin surfaces with no static object (health, connector, demo_cache, MCP
 // prefixes). An MCP tool whose prefix isn't configured → 'unknown' → deny.
+// The namespace openclaw-mcp-auth-plugin registers its proxied MCP tools under
+// (openclaw-mcp-auth-plugin/src/tool-cache.ts TOOL_PREFIX). Duplicated as a constant rather than
+// imported: this module is on the boot path and the plugin ships as a bundled .cjs at a different
+// in-image depth, so a cross-tree import here is the boot-crash class the deploy playbook warns
+// about. capabilities.test.mjs pins the two together.
+const MCP_AUTH_PREFIX = 'mcp_auth__';
+
 export function makeCapabilityResolver({ mcpPrefixes = [], toolCaps = {} } = {}) {
   const prefixCaps = mcpPrefixes.map((p) => ({ p, cap: p === 'demo_warehouse' ? 'demo_warehouse' : p }));
   return function capabilityOf(toolName) {
@@ -106,7 +113,21 @@ export function makeCapabilityResolver({ mcpPrefixes = [], toolCaps = {} } = {})
     // kept whole.
     if (HINDSIGHT_WRITE_TOOLS.has(n)) return 'hindsight.write';
     if (n.startsWith('agent_knowledge_')) return 'hindsight.read';
-    for (const { p, cap } of prefixCaps) if (n.startsWith(p)) return cap; // demo_query_app__…, demo_warehouse__…, demo_diagram_app__…
+    // Configured MCP servers, matched by their `toolPrefix`. TWO NAMINGS, and both are load-bearing:
+    //
+    //   `demo_warehouse__execute_query`            — OpenClaw's naming, which this rule was written for
+    //   `mcp_auth__demo_warehouse__execute_query`  — what openclaw-mcp-auth-plugin ACTUALLY registers under
+    //                                          Pi (tool-cache.ts: `mcp_auth__<toolPrefix>__<name>`)
+    //
+    // Only the first was matched, so every mcp-auth tool resolved 'unknown' → deny, and the closure
+    // invariant logged a hole per tool. That was invisible in prod until 2026-09-04 because a
+    // separate bug meant these tools never registered at all (see prewarmCompatPlugins) — the
+    // capability gap was sitting behind it, and fixing the race alone just moved the agents from
+    // "tool not found" to "tool hidden by the grant filter". Same outcome for the member, different
+    // log line, so match both spellings.
+    for (const { p, cap } of prefixCaps) {
+      if (n.startsWith(p) || n.startsWith(`${MCP_AUTH_PREFIX}${p}`)) return cap;
+    }
     return 'unknown'; // → policyFor('unknown') → '*' → deny (fail-closed)
   };
 }
