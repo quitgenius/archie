@@ -12,7 +12,7 @@ import { createHash } from 'node:crypto';
 import { registerBedrock, getModel, runTurn, withModel, pca } from './pi-runtime.mjs';
 import { resolveSessionPath, writeIndexEntry } from './session-store.mjs';
 import { outcomeAttributes } from './tool-outcome.mjs';
-import { resolveModelSpec, resolveAllowedTools, buildBuiltinTools, buildCustomTools, readBootstrapContext, makeResourceLoader, resolvePluginManifest, findUnavailablePlugins } from './config-map.mjs';
+import { resolveModelSpec, resolveAllowedTools, buildBuiltinTools, buildCustomTools, readBootstrapContext, makeResourceLoader, resolvePluginManifest, findUnavailablePlugins, resolveMcpPrefixes } from './config-map.mjs';
 import { loadAgentConfig } from './agent-config.mjs';
 import { buildCompatPlugins, prewarmCompatPlugins } from './openclaw-compat/plugin-host.mjs';
 import { createHindsightExtension } from './hindsight-extension.mjs';
@@ -568,8 +568,21 @@ function loadConfig(resolved) {
           agent: agent.id, ...u,
         }));
       }
-      // MCP server prefixes for capability resolution (connector.extraMcpServers[].toolPrefix).
-      MCP_PREFIXES = (agent?.connector?.extraMcpServers ?? []).map((s) => s?.toolPrefix).filter(Boolean);
+      // MCP server prefixes for capability resolution — from the mcp-auth plugin slice, which is
+      // the same input the plugin names its tools from (see resolveMcpPrefixes for why reading
+      // agent.connector here meant this was always []).
+      MCP_PREFIXES = resolveMcpPrefixes(agent, cfg);
+      // LOUD when an agent has mcp-auth servers but no prefixes resolved: every tool that plugin
+      // registers would resolve 'unknown' and be hidden by the grant filter, which reads to the
+      // member as "the agent can't see my data" with nothing in the logs naming the cause.
+      const mcpAuthServers = cfg?.plugins?.entries?.['openclaw-mcp-auth-plugin']?.config?.agents?.[agent.id]?.mcpServers ?? [];
+      if (mcpAuthServers.length && !MCP_PREFIXES.length) {
+        console.error(JSON.stringify({
+          level: 'warn', component: 'pi-adapter', agent: agent.id,
+          msg: 'mcp-auth servers configured but NO tool prefixes resolved — every mcp_auth__* tool will resolve capability=unknown and be hidden',
+          servers: mcpAuthServers.length,
+        }));
+      }
       // SKILL_PATHS are set per turn by hydrateSkills (the agent's INSTALLED skills materialize
       // from DDB onto /tmp, scoped by fingerprint) — not from the config's extraDirs here.
       return {

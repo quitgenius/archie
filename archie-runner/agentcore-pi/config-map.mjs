@@ -202,6 +202,36 @@ export function resolvePluginManifest(cfg) {
  * Reports the TOOLS as well as the plugin id, because "slack-reply-plugin is dropped" only means
  * something to someone who already knows it provides `slack_send`.
  */
+/**
+ * The MCP server tool-prefixes this agent's proxied MCP tools will be named with — the input the
+ * capability resolver keys on (`mcp_auth__<prefix>__<tool>` → that server's capability).
+ *
+ * READ FROM THE SAME SLICE THE PLUGIN READS. openclaw-mcp-auth-plugin names its tools from
+ * `plugins.entries['openclaw-mcp-auth-plugin'].config.agents[<id>].mcpServers[].toolPrefix`, so
+ * anything else deriving the prefixes from a different field can silently disagree with the names
+ * that actually get registered — and did:
+ *
+ *   pi-adapter read `agent.connector.extraMcpServers`, but boot-config.mjs sets `agent.connector` to
+ *   the CONNECTOR-SESSION-PLUGIN slice (`{cronEntityId, toolkits}`), which has no extraMcpServers.
+ *   So MCP_PREFIXES was ALWAYS `[]`, every `mcp_auth__*` tool resolved 'unknown' → deny, and the
+ *   closure invariant logged a hole per tool. Verified against the live prod config for
+ *   dm-urbnxvak3l5 on 2026-09-04: `agent.connector` keys were exactly [cronEntityId, toolkits],
+ *   while the mcp-auth slice carried toolPrefix demo_warehouse + demo_query_app.
+ *
+ * `caps-from-config.mjs` reads the RAW agent config (which does carry `connector.extraMcpServers`)
+ * and derived the `demo_warehouse`/`demo_query_app` GRANTS correctly from it — which is why the grants were right and
+ * only the runtime resolution was wrong. Two readers of one fact, two different inputs.
+ *
+ * The `agent.connector.extraMcpServers` read is kept as a fallback: harmless where the field is
+ * absent, and it keeps working for any caller that passes the raw config shape.
+ */
+export function resolveMcpPrefixes(agent, cfg) {
+  const fromPlugin = cfg?.plugins?.entries?.['openclaw-mcp-auth-plugin']?.config?.agents?.[agent?.id]?.mcpServers ?? [];
+  const fromAgent = agent?.connector?.extraMcpServers ?? [];
+  const prefixes = [...fromPlugin, ...fromAgent].map((s) => s?.toolPrefix).filter(Boolean);
+  return [...new Set(prefixes)];
+}
+
 export function findUnavailablePlugins(allow, manifest) {
   const loaded = new Set([
     ...(manifest?.compat || []).map((c) => c.id),
