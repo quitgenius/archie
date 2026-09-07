@@ -561,12 +561,19 @@ async function requiresMention(agentId) {
 // parameter in modules/archie, and this branch's infra pathspec is byte-identical to master — adding
 // one would break that invariant for a setting we intend to delete.
 //
-// OFF as of 2026-09-07 (sandbox): unknown-scope provisioning is enabled again for testing. What makes
-// that safe to re-enable now is that a minted scope is no longer ownerless — the mint path sets the
-// @mentioner as its first owner (owners.bootstrapOwner, forwardToAgent), so an agent brought into
-// being by a message is administrable by the person who asked for it. Previously it would have been
-// reachable by nobody but a root operator.
-const ALPHA_REFUSE_UNKNOWN_SCOPES = false;
+// ON. Briefly flipped off on 2026-09-07 to exercise the mint path in the sandbox, and flipped back
+// the same day before this build reached prod (sandbox): prod archie is a live alpha in the Pelago
+// workspace, so an @mention in any unfamiliar channel would provision a runtime, an EFS access
+// point and a Connector project for a scope nobody asked for — and the workload identity and
+// agentic_ai ENIs that come with it survive the runtime's deletion and cannot be deleted by us, so
+// the residue is permanent.
+//
+// The mint-path owner bootstrap (owners.bootstrapOwner, forwardToAgent) is therefore unreachable
+// while this is true, and stays in place for when it is not. Note what it still guarantees at the
+// moment this flips: it fires only for a scope with NO owners, and hydration now gives every
+// channel agent owners — declared or the migration fallback — so there is no window in which an
+// established channel agent is claimable by whoever speaks first.
+const ALPHA_REFUSE_UNKNOWN_SCOPES = true;
 
 /**
  * Does this scope exist AT ALL — any row under `AGENT#<scope>`?
