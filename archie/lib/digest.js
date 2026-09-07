@@ -144,6 +144,7 @@ const IMAGES = {
       // exact failure the Dockerfile's own allowlist comment warns about from the other direction.
       { path: 'archie-gateway/agent-scope.js' },
       { path: 'archie-gateway/agent-directory.js' },
+      { path: 'archie-gateway/agent-labels.js' },
 
       // Outbound-comms approvals (P1/P2 of the comms-approval port). Added here the moment the
       // omission bit: a change confined to approvals-routes.js produced an UNCHANGED tag, so
@@ -154,9 +155,7 @@ const IMAGES = {
       { path: 'archie-gateway/approvals-store.js' },
       { path: 'archie-gateway/approvals-routes.js' },
       { path: 'archie-gateway/approvals-wake.js' },
-      { path: 'archie-gateway/opt-toggle-auth.js' },
       { path: 'archie-gateway/owners.js' },
-      { path: 'archie-gateway/routes-owners.js' },
 
       // Found by the bidirectional test below, not by inspection: all three are on the Dockerfile's
       // COPY line and were never declared here, so an edit to any of them produced an unchanged tag
@@ -167,6 +166,7 @@ const IMAGES = {
       { path: 'archie-gateway/runtime-quota-metrics.js' },
       { path: 'archie-gateway/semaphore.js' },
       { path: 'archie-gateway/sdk-http.js' },
+      { path: 'archie-gateway/slack-proxy-routes.js' },
       { path: 'archie-gateway/runtime-registry.js' },
       { path: 'archie-gateway/cron-service.js' },
       { path: 'archie-gateway/cron-runner.js' },

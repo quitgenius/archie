@@ -16,12 +16,21 @@
 // ── KEY SHAPE ───────────────────────────────────────────────────────────────────────────────────
 //   pk = CONV#<agentId>          sk = THREAD#<threadTs>
 //
-// NOT `AGENT#<id>` with a CONV# sort key, and this is load-bearing. Every AgentCore runtime role
-// holds dynamodb:PutItem/UpdateItem on this table so it can persist its own AGENT#<id>/SEED, and
-// IAM has NO sort-key condition key — so a write scope of LeadingKeys AGENT#* cannot exclude a sort
-// key. Under AGENT#<id> an agent could rewrite or delete its own conversation history. This is
-// exactly why GRANT#<id> is its own partition rather than AGENT#<id>/GRANT#*; the same reasoning
-// applies here and the same mistake is available.
+// NOT `AGENT#<id>` with a CONV# sort key. The separation is defence in depth, not the closing of a
+// live hole — and the reason stated here before was wrong, so it is worth stating correctly.
+//
+// AGENTS HAVE NO DYNAMODB WRITE ACCESS AT ALL, and must never be given any. Verified live
+// 2026-09-07: a derived runtime role carries one DynamoDB statement, `DdbReadOwnScope`
+// (GetItem/Query/BatchGetItem on LeadingKeys [AGENT#<own>, GRANT#<own>, SKILL#*]), and
+// `archie-agentcore-base` carries no dynamodb: action at all. The dispatcher is the sole writer of
+// AGENT#<id>/SEED (§9.9a, agentcore-client.js). This comment previously claimed the opposite —
+// "every AgentCore runtime role holds dynamodb:PutItem/UpdateItem on this table" — which was never
+// checked against a live role. Same false claim, same fix, in config-resolver/schema.test.mjs.
+//
+// The shape still holds, because IAM has NO sort-key condition key: any future write grant scoped
+// to LeadingKeys AGENT#* would necessarily cover every sort key beneath it. Keeping conversation
+// history out of that partition means such a grant could never reach it — the same argument that
+// keeps GRANT#<id> out of AGENT#<id>/GRANT#*.
 //
 // threadTs is a fixed-width epoch string ("1780993922.012579"), so lexicographic order IS
 // chronological order for the next few centuries. A Query with ScanIndexForward=false therefore

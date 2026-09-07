@@ -47,7 +47,6 @@ const agentCore = createAgentCoreClient();
 const approvalsStore = require('./approvals-store');
 const { makeApprovalHandlers, registerApprovalRoutes } = require('./approvals-routes');
 const { registerSlackProxyRoute } = require('./slack-proxy-routes');
-const { canToggleAgent } = require('./opt-toggle-auth');
 const { createApprovalWake } = require('./approvals-wake');
 
 const { createCronService } = require('./cron-service');
@@ -62,8 +61,8 @@ const { createTurnQueue } = require('./turn-queue');
 const { createSessionTracker } = require('./session-tracker');
 const { createCronHome } = require('./cron-home');
 const { mintAgentName, normaliseScopeId, slackRefFromScopeId } = require('./agent-scope');
-const { createAgentDirectory } = require('./agent-directory');
-const { createOwnersDirectory } = require('./owners');
+const { createAgentLabels } = require('./agent-labels');
+const { createOwners } = require('./owners');
 const { diffObserved, specDiff } = require('./spec-diff');
 const { createDispatcherMetrics } = require('./dispatcher-metrics');
 const { createRuntimeQuotaSampler } = require('./runtime-quota-metrics');
@@ -245,28 +244,31 @@ function configDoc() {
   return _configDoc;
 }
 
-// The App Home agent selector's list: every agent, labelled by its real Slack name.
-//
-// `slack` is a const declared much further down, so it cannot be handed over here — the wrapper defers
-// each reference to CALL time, which is after boot has initialised it. Same reasoning as
-// resolveUserProfile's comment; done with an explicit shim rather than a comment because this one is
-// evaluated at module load, where a bare `slack` would be a TDZ throw rather than a latent bug.
-const agentDirectory = createAgentDirectory({
-  tableName: AGENT_CONFIG_TABLE,
-  doc: () => configDoc(),
+// Scope id -> Slack name, for the selector and for whichever agent a Home tab is rendering.
+// STATELESS: every call hits Slack. No name map, no TTL, no rename events. See agent-labels.js.
+const agentLabels = createAgentLabels({
   slack: {
-    users: { list: (a) => slack.users.list(a), info: (a) => slack.users.info(a) },
-    conversations: { list: (a) => slack.conversations.list(a), info: (a) => slack.conversations.info(a) },
+    users: { list: (a) => slack.users.list(a) },
+    conversations: { list: (a) => slack.conversations.list(a) },
   },
-  logger: log,
+  log,
 });
 
-// Per-agent owners: who may turn the comms-approval gate off for an agent that is not their
-// own DM agent. Two readers with different freshness — a boot-time list for rendering, a
-// fresh GetItem for the authorization decision. See owners.js for why they are split.
-const ownersDirectory = createOwnersDirectory({
+// Per-agent owners: who may point App Home at a scope and administer it there. Every read is
+// fresh — there is no boot-time list and no reload signal to depend on. See owners.js.
+const owners = createOwners({
   tableName: AGENT_CONFIG_TABLE,
   doc: () => configDoc(),
+  metrics: dispatcherMetrics,
+  // Is this Slack id a bot? One users.info per human add, no cache. A bot user id is an ordinary
+  // `U…`, indistinguishable from a person's by shape, so this cannot be decided locally.
+  // `USLACKBOT` is checked by id: Slackbot is not reported as a bot by users.info.
+  isBotUser: async (userId) => {
+    if (userId === 'USLACKBOT') return true;
+    if (slackBotUserId && userId === slackBotUserId) return true;   // archie itself, free to answer
+    const r = await slack.users.info({ user: userId });
+    return Boolean(r && r.user && (r.user.is_bot || r.user.is_app_user));
+  },
   log,
 });
 
@@ -437,10 +439,9 @@ async function loadFleetConfig() {
 async function reloadFleetConfig() {
   return reloadMutex.runExclusive(async () => {
     await loadFleetConfig();
-    // The owners LIST is push-only (no TTL); this is its push signal, the same one the
-    // OpenClaw dispatcher uses after a config-repo change. Authorization does not depend on
-    // it — isOwner always reads fresh — so a failure here degrades rendering, not access.
-    await ownersDirectory.load();
+    // NOTHING TO RELOAD FOR OWNERS. Every owner read is fresh (owners.js), so there is no
+    // cached list for this to invalidate — which is the point: /reload is unreachable from
+    // outside the VPC, so anything that depended on it was stale with no way to fix it.
   });
 }
 
@@ -559,7 +560,13 @@ async function requiresMention(agentId) {
 // commented-out block it cannot be quietly lost. Deliberately not an env var: that means an SSM
 // parameter in modules/archie, and this branch's infra pathspec is byte-identical to master — adding
 // one would break that invariant for a setting we intend to delete.
-const ALPHA_REFUSE_UNKNOWN_SCOPES = true;
+//
+// OFF as of 2026-09-07 (sandbox): unknown-scope provisioning is enabled again for testing. What makes
+// that safe to re-enable now is that a minted scope is no longer ownerless — the mint path sets the
+// @mentioner as its first owner (owners.bootstrapOwner, forwardToAgent), so an agent brought into
+// being by a message is administrable by the person who asked for it. Previously it would have been
+// reachable by nobody but a root operator.
+const ALPHA_REFUSE_UNKNOWN_SCOPES = false;
 
 /**
  * Does this scope exist AT ALL — any row under `AGENT#<scope>`?
@@ -569,9 +576,9 @@ const ALPHA_REFUSE_UNKNOWN_SCOPES = true;
  * working. Testing for CONFIG would refuse it and turn a gate on creation into a gate on provenance.
  * `AGENT#` IS the source of truth for what an agent is — the same rule agent-directory.js states.
  *
- * READS DYNAMODB, never the in-memory directory. `agentDirectory.has()` is the right shape and the
- * wrong source: that map is Scanned once at boot for the App Home selector and refreshed only by push,
- * so an agent hydrated by the `archie` CLI is invisible to it until the dispatcher restarts — which is
+ * READS DYNAMODB, and there is no longer any cached alternative to be tempted by — the App Home
+ * selector's boot-time directory was deleted for the same reason this never used it: an agent
+ * hydrated by the `archie` CLI was invisible to that map until the dispatcher restarted, which is
  * exactly the alpha workflow. A cached answer here fails by refusing a real agent.
  *
  * No alias handling needed: the CRON-only `{alias}` partitions are keyed by config-repo directory
@@ -1108,14 +1115,30 @@ async function forwardToAgentCore(agent, event, child, opts = {}) {
 // point — a p50 35s turn, plus anything queued behind it — is ours to lose on a restart. Handing the
 // event to SQS makes the queue the system of record from the moment it lands.
 async function forwardToAgent(agent, event, child) {
-  // THE MINT HOOK. Every turn funnels through here — message, app_mention and /simulate — so this is
-  // the one place that sees an agent come into existence, and it is why the selector's list needs no
-  // polling: the gateway IS the minter (resolveAgent → mintAgentName), so a new agent is known the
-  // instant it exists rather than at the next refresh.
+  // FIRST CONTACT ESTABLISHES OWNERSHIP. Every turn funnels through here — message, app_mention and
+  // /simulate — so this is the one place that sees a scope come into being.
   //
-  // Fire-and-forget, and swallowing: this is the turn path. A directory that cannot name a new scope
-  // must never delay or fail a message.
-  agentDirectory.noteMinted(agent).catch((err) => child.warn({ err: err.message, agent }, 'agent directory: noteMinted failed — the agent selector may not list this agent until the next restart'));
+  // Safe to call unconditionally with no preceding read: the write is conditional on the scope having
+  // no owners at all, so it does nothing for every established agent. That condition is load-bearing
+  // rather than an optimisation — without it, @mentioning archie in an already-owned channel would
+  // make the mentioner an owner of it. See owners.bootstrapOwner.
+  //
+  // CHANNEL SCOPES ONLY. A `dm-<user>` scope's owner is derived from its id and deliberately not
+  // stored, so writing one would be data that can only agree with the derivation or be wrong.
+  //
+  // Not awaited into the turn, and non-fatal: a failure leaves the condition true, so the next
+  // message to this scope retries it. Blocking a reply on an ownership write would be the wrong
+  // trade — but unlike the directory append this replaced, a failure IS logged and metered, because
+  // an ownerless channel agent is one nobody can administer.
+  // NEVER A BOT. `bolt.event('message')` drops anything carrying bot_id in its pre-filter, but
+  // `app_mention` does NOT — so a bot @mentioning archie in a new channel would otherwise become
+  // that scope's first and only owner, and a bot cannot administer anything. Decided from the event
+  // (bot_id) and from our own identity, so it costs no Slack call on the turn path.
+  const senderIsBot = Boolean(event.bot_id) || (slackBotUserId && event.user === slackBotUserId);
+  if (agent.startsWith('ch-') && event.user && !senderIsBot) {
+    owners.bootstrapOwner({ scopeId: agent, ownerUserId: event.user })
+      .catch((err) => child.error({ err: err.message, agent }, 'owners: bootstrapOwner threw — this scope may have no owner until its next turn'));
+  }
 
   if (!turnQueue.enabled) return forwardToAgentCore(agent, event, child);
 
@@ -1276,7 +1299,7 @@ if (!NO_SOCKET_MODE) {
         // received the DM, which is `agent` whatever the viewer happens to be looking at.
         const homeHijacked = userSelectedAgent.has(event.user);
         if (!homeHijacked && (userActiveTab.get(event.user) === 'conversations' || !userActiveTab.has(event.user))) {
-          const view = marketplace.buildHomeView(agent, 'conversations', homeViewOptions(event.user, agent));
+          const view = marketplace.buildHomeView(agent, 'conversations', await homeViewOptions(event.user, agent));
           slack.views.publish({ user_id: event.user, view })
             .catch(err => child.warn({ err: err.message }, 'failed to refresh app home after new conversation'));
         }
@@ -1383,17 +1406,40 @@ const userSelectedAgent = new Map();
  * Every App Home handler calls THIS, not homeAgentFor. The one exception is the Conversations push in
  * the message handler, which deliberately does not — see the comment there.
  */
-function homeTargetFor(userId, surface) {
+async function homeTargetFor(userId, surface) {
   const selected = userSelectedAgent.get(userId);
-  if (selected) return selected;
+  if (!selected) return homeAgentFor(userId, surface);
+
+  // REVALIDATE ON EVERY RENDER AND EVERY ACTION, with a fresh read.
+  //
+  // The selection lives in an in-memory Map that outlives an ownership change, so checking it only
+  // at selection time would leave a revoked owner driving someone else's agent until they happened
+  // to reselect. This is the one place every App Home path funnels through, which is why the check
+  // lives here rather than being retrofitted across ~30 handlers — that is how one gets missed.
+  //
+  // Costs one GetItem per human render. isOwner short-circuits the derived own-DM leg without
+  // touching the table, so the common case (no selection, or a selection of your own agent) is free.
+  if (await owners.isOwner(userId, selected)) return selected;
+
+  // Drop it rather than refusing: falling back to the viewer's OWN agent is the fail-safe direction,
+  // and leaving a dead selection in place would make every subsequent render pay the same failed
+  // read to reach the same answer.
+  userSelectedAgent.delete(userId);
+  log.warn({ user: userId, dropped: selected, surface }, 'home target: selection no longer owned — falling back to own agent');
   return homeAgentFor(userId, surface);
 }
 
-/** The options every buildHomeView call needs so the selector renders on every tab. */
-function homeViewOptions(userId, agentId, extra = {}) {
+/**
+ * The options every buildHomeView call needs so the selector renders on every tab.
+ *
+ * ASYNC because the target's label is resolved from Slack on every render rather than read from a
+ * cache. That is one Slack call per Home render, on a human-triggered path — and it is why a renamed
+ * channel shows its new name on the next click instead of after a restart.
+ */
+async function homeViewOptions(userId, agentId, extra = {}) {
   return {
     teamId: slackTeamId,
-    targetLabel: agentDirectory.labelFor(agentId),
+    targetLabel: await agentLabels.labelFor(agentId),
     ...extra,
   };
 }
@@ -1413,7 +1459,7 @@ async function homeViewOptionsAsync(userId, agentId, extra = {}) {
 
 if (bolt) bolt.event('app_home_opened', async ({ event, client }) => {
   const userId = event.user;
-  const agentId = homeTargetFor(userId, 'app_home');
+  const agentId = await homeTargetFor(userId, 'app_home');
   const activeTab = userActiveTab.get(userId) || 'conversations';
   const child = log.child({ event_type: 'app_home_opened', user: userId, agent: agentId });
   try {
@@ -1443,16 +1489,39 @@ if (bolt) bolt.event('app_home_opened', async ({ event, client }) => {
 // THE OPTIONS LOAD. Slack sends a `block_suggestion` payload when the select opens and on each
 // keystroke past min_query_length; Bolt routes it here (SocketModeReceiver forwards every payload to
 // processEvent, and helpers.js classifies block_suggestion as an Options payload — so no "Options Load
-// URL" is needed, that requirement is HTTP-mode only). This is the first bolt.options handler in the
-// app.
+// URL" is needed, that requirement is HTTP-mode only).
 //
-// Purely in-memory: the directory list is built at boot, so a keystroke costs no I/O.
-if (bolt) bolt.options(marketplace.AGENT_SELECT_ACTION, async ({ options, ack }) => {
-  const query = (options && options.value) || '';
+// EVERY LOAD IS FRESH. One DynamoDB Query for what this viewer owns, then Slack names for exactly
+// those scopes. Nothing is held between loads, so an agent someone was made an owner of a moment ago
+// appears the next time the dropdown opens — no restart, no /reload, which is the whole reason the
+// previous boot-time directory is gone.
+//
+// THE ROSTER IS THE VIEWER'S OWNED SCOPES, so the list is also the visibility gate: a scope you do
+// not own is not offered. That is not the authorization check — the select action re-derives that
+// from the clicker's identity, because Slack echoes back whatever was in the view.
+//
+// `options.value` filters the ALREADY-OWNED set locally. It is not passed to DynamoDB: the query is
+// keyed on the OWNERS facet and filtered on membership, and adding a name predicate would mean
+// filtering on data the index does not carry.
+if (bolt) bolt.options(marketplace.AGENT_SELECT_ACTION, async ({ options, body, ack }) => {
+  const query = String((options && options.value) || '').trim().toLowerCase();
+  const userId = body && body.user && body.user.id;
   try {
-    await ack({ option_groups: marketplace.buildAgentOptionGroups(agentDirectory.search(query)) });
+    const scopes = await owners.ownedScopes(userId);
+    const entries = await agentLabels.resolve(scopes);
+    const matched = query
+      ? entries.filter((e) => e.scopeId.toLowerCase().includes(query)
+        || (e.name || '').toLowerCase().includes(query))
+      : entries;
+    const { option_groups, truncated } = marketplace.buildAgentOptionGroups(matched);
+    if (truncated > 0) {
+      // Said out loud rather than silently dropped. The previous selector cut every agent in the fleet to the
+      // alphabetically-first 100 with nothing anywhere recording it.
+      log.warn({ user: userId, shown: matched.length - truncated, truncated }, 'agent selector: options truncated at the Slack 100-option cap');
+    }
+    await ack({ option_groups });
   } catch (err) {
-    log.error({ err: err.message, query }, 'agent selector: options load failed');
+    log.error({ err: err.message, query, user: userId }, 'agent selector: options load failed');
     await ack({ options: [] });
   }
 });
@@ -1467,22 +1536,30 @@ if (bolt) bolt.options(marketplace.AGENT_SELECT_ACTION, async ({ options, ack })
 // nothing else here needs to change when it does.
 //
 // THE VALUE IS UNTRUSTED. Slack echoes back whatever was in the view, so it is normalised and then
-// checked against the directory before being stored — the same treatment handleGrantChange gives a
-// capability, and for the same reason: a value that arrived over the wire is an assertion, not a fact.
+// AUTHORIZED against the clicker's own identity before being stored — the same treatment
+// handleGrantChange gives a capability, and for the same reason: a value that arrived over the wire
+// is an assertion, not a fact. The options-load filter decides what is VISIBLE; this decides what is
+// ALLOWED, and only this one is a security boundary.
 if (bolt) bolt.action(marketplace.AGENT_SELECT_ACTION, async ({ ack, body, client }) => {
   await ack();
   const userId = body.user.id;
   const selectedRaw = body.actions[0].selected_option && body.actions[0].selected_option.value;
   const child = log.child({ action: 'agent_gtxe3a', user: userId, selected: selectedRaw });
 
-  // UNREACHABLE THROUGH THE UI, and treated as such. Every option in the select was built from the
-  // directory, so a value that is not in the directory did not come from a real interaction — it is a
-  // bug in how options are built, or a hand-crafted payload. Throwing surfaces it in the logs as an
-  // error; a `return` would swallow the first case, and a message to the user would be answering for
-  // a situation the UI is supposed to make impossible.
+  // A MALFORMED VALUE IS A BUG, and throws. Slack cannot produce an empty option value, so this is
+  // either a defect in how options are built or a hand-crafted payload; a `return` would swallow the
+  // first case.
   const scopeId = selectedRaw ? normaliseScopeId(selectedRaw) : null;
-  if (!scopeId || !agentDirectory.has(scopeId)) {
-    throw new Error(`agent_gtxe3a: '${selectedRaw}' is not a known agent`);
+  if (!scopeId) throw new Error(`agent_gtxe3a: '${selectedRaw}' is not a scope id`);
+
+  // A WELL-FORMED VALUE THE CLICKER DOES NOT OWN IS *NOT* A BUG, and must not throw. Two ways to
+  // reach it, one of them entirely legitimate: a crafted payload naming somebody else's scope, or an
+  // owner whose ownership was withdrawn between the dropdown opening and them clicking. Refuse, say
+  // so, and leave the previous selection alone — throwing would log an error for a race that the
+  // fresh read has already handled correctly.
+  if (!(await owners.isOwner(userId, scopeId))) {
+    child.warn({ target: scopeId }, 'agent selector: selection refused — clicker does not own that scope');
+    return;
   }
 
   userSelectedAgent.set(userId, scopeId);
@@ -1492,35 +1569,23 @@ if (bolt) bolt.action(marketplace.AGENT_SELECT_ACTION, async ({ ack, body, clien
   // resolve the new agent themselves through homeTargetFor — nothing here passes an agent id.
   // Jobs and Tools have their own refreshers because those tabs need data fetched; every other tab
   // renders from state buildHomeView already has.
+  // Jobs, Tools, Owners and Approvals all FETCH their tab's data, so each has its own publisher.
+  // Routing them through refreshHome would render the new agent's tab with the data absent — which
+  // Owners and Tools deliberately draw as "could not read this", so the switch would look like a
+  // permissions failure rather than a fetch that was never made.
   const tab = userActiveTab.get(userId) || 'conversations';
   if (tab === 'jobs') await refreshJobsTab(userId, client);
   else if (tab === 'tools') await refreshToolsTab(userId, client);
+  else if (tab === 'owners') await publishOwnersTab(userId, client);
+  else if (tab === 'approvals') await publishApprovalsTab(userId, client);
   else await refreshHome(userId, scopeId, tab, client, child);
 });
 
-// ---------- Directory freshness: Slack's own rename events ----------
+// NO RENAME HANDLERS, and no event subscriptions needed for the selector.
 //
-// These are the ONLY invalidation the label cache has, and they are push. Renaming a channel or
-// changing a display name corrects the entry in place; nothing polls, and there is no TTL. A relabel
-// does NOT republish anyone's Home — the next render picks it up, and pushing an unrequested view at
-// every viewer because someone renamed a channel would be worse than a stale label until next click.
-if (bolt) bolt.event('channel_rename', async ({ event }) => {
-  if (agentDirectory.applyChannelRename(event && event.channel)) {
-    log.info({ channel: event.channel.id, name: event.channel.name }, 'agent directory: relabelled after channel_rename');
-  }
-});
-
-if (bolt) bolt.event('group_rename', async ({ event }) => {
-  if (agentDirectory.applyChannelRename(event && event.channel)) {
-    log.info({ channel: event.channel.id, name: event.channel.name }, 'agent directory: relabelled after group_rename');
-  }
-});
-
-if (bolt) bolt.event('user_change', async ({ event }) => {
-  if (agentDirectory.applyUserChange(event && event.user)) {
-    log.info({ user: event.user.id }, 'agent directory: relabelled after user_change');
-  }
-});
+// `channel_rename` / `group_rename` / `user_change` used to patch the boot-time label cache in
+// place — the only invalidation it had. With labels resolved fresh on every render there is nothing
+// to invalidate: a renamed channel shows its new name the next time anyone opens the dropdown.
 
 if (bolt) bolt.action('marketplace_detail', async ({ ack, body, client }) => {
   await ack();
@@ -1538,7 +1603,7 @@ if (bolt) bolt.action('marketplace_detail', async ({ ack, body, client }) => {
 if (bolt) bolt.action('marketplace_tab_skills', async ({ ack, body, client }) => {
   await ack();
   const userId = body.user.id;
-  const agentId = homeTargetFor(userId, 'app_home');
+  const agentId = await homeTargetFor(userId, 'app_home');
   userActiveTab.set(userId, 'skills');
   try {
     const view = marketplace.buildHomeView(agentId, 'skills', await homeViewOptionsAsync(userId, agentId));
@@ -1551,7 +1616,7 @@ if (bolt) bolt.action('marketplace_tab_skills', async ({ ack, body, client }) =>
 if (bolt) bolt.action('marketplace_tab_connectors', async ({ ack, body, client }) => {
   await ack();
   const userId = body.user.id;
-  const agentId = homeTargetFor(userId, 'app_home');
+  const agentId = await homeTargetFor(userId, 'app_home');
   userActiveTab.set(userId, 'connectors');
   // Refresh Connector cache if needed
   if (CONNECTOR_API_KEY) {
@@ -1569,7 +1634,7 @@ if (bolt) bolt.action('marketplace_tab_connectors', async ({ ack, body, client }
 if (bolt) bolt.action('marketplace_tab_models', async ({ ack, body, client }) => {
   await ack();
   const userId = body.user.id;
-  const agentId = homeTargetFor(userId, 'app_home');
+  const agentId = await homeTargetFor(userId, 'app_home');
   userActiveTab.set(userId, 'models');
   // Refresh Bedrock cache if needed
   await marketplace.fetchBedrockModels(bedrockClient, { log });
@@ -1585,7 +1650,7 @@ if (bolt) bolt.action('marketplace_tab_models', async ({ ack, body, client }) =>
 if (bolt) bolt.action('marketplace_tab_conversations', async ({ ack, body, client }) => {
   await ack();
   const userId = body.user.id;
-  const agentId = homeTargetFor(userId, 'app_home');
+  const agentId = await homeTargetFor(userId, 'app_home');
   userActiveTab.set(userId, 'conversations');
   try {
     const view = marketplace.buildHomeView(agentId, 'conversations', await homeViewOptionsAsync(userId, agentId));
@@ -1603,7 +1668,7 @@ if (bolt) bolt.action('marketplace_tab_conversations', async ({ ack, body, clien
 const handleConversationsPage = async ({ ack, body, client }) => {
   await ack();
   const userId = body.user.id;
-  const agentId = homeTargetFor(userId, 'app_home');
+  const agentId = await homeTargetFor(userId, 'app_home');
   const page = Math.max(0, parseInt(body.actions[0].value, 10) || 0);
   if (!agentId) return;
   try {
@@ -1624,7 +1689,7 @@ if (bolt) bolt.action('conversations_open_thread', async ({ ack }) => { await ac
 if (bolt) bolt.action('conversations_toggle_pin', async ({ ack, body, client }) => {
   await ack();
   const userId = body.user.id;
-  const agentId = homeTargetFor(userId, 'app_home');
+  const agentId = await homeTargetFor(userId, 'app_home');
   const threadTs = body.actions[0].value;
   if (!agentId || !threadTs) return;
   conversations.togglePin(agentId, threadTs);
@@ -1640,7 +1705,7 @@ if (bolt) bolt.action('conversations_toggle_pin', async ({ ack, body, client }) 
 const handleConversationsMove = (direction) => async ({ ack, body, client }) => {
   await ack();
   const userId = body.user.id;
-  const agentId = homeTargetFor(userId, 'app_home');
+  const agentId = await homeTargetFor(userId, 'app_home');
   const threadTs = body.actions[0].value;
   if (!agentId || !threadTs) return;
   conversations.moveConversation(agentId, threadTs, direction);
@@ -1658,7 +1723,7 @@ if (bolt) bolt.action('conversations_move_down', handleConversationsMove('down')
 if (bolt) bolt.action('conversations_reset_order', async ({ ack, body, client }) => {
   await ack();
   const userId = body.user.id;
-  const agentId = homeTargetFor(userId, 'app_home');
+  const agentId = await homeTargetFor(userId, 'app_home');
   if (!agentId) return;
   conversations.resetRecentOrder(agentId);
   try {
@@ -1683,7 +1748,7 @@ if (bolt) bolt.action('conversations_search_open', async ({ ack, body, client })
 // Conversation search submit — replaces the modal with the results in-place
 if (bolt) bolt.view('conversations_search_submit', async ({ ack, body, view }) => {
   const userId = body.user.id;
-  const agentId = homeTargetFor(userId, 'app_home');
+  const agentId = await homeTargetFor(userId, 'app_home');
   const query = (view.state.values.search_block.search_query.value || '').trim();
   if (!query || !agentId) {
     await ack();
@@ -1697,7 +1762,7 @@ if (bolt) bolt.view('conversations_search_submit', async ({ ack, body, view }) =
 if (bolt) bolt.action('marketplace_tab_jobs', async ({ ack, body, client }) => {
   await ack();
   const userId = body.user.id;
-  const agentId = homeTargetFor(userId, 'app_home');
+  const agentId = await homeTargetFor(userId, 'app_home');
   userActiveTab.set(userId, 'jobs');
   let jobs = null;
   let cronRunner = null;
@@ -1751,7 +1816,7 @@ async function fetchToolPermissions(agentId) {
 if (bolt) bolt.action('marketplace_tab_tools', async ({ ack, body, client }) => {
   await ack();
   const userId = body.user.id;
-  const agentId = homeTargetFor(userId, 'app_home');
+  const agentId = await homeTargetFor(userId, 'app_home');
   userActiveTab.set(userId, 'tools');
   const tools = await fetchToolPermissions(agentId);
   try {
@@ -1770,8 +1835,8 @@ if (bolt) bolt.action('marketplace_tab_tools', async ({ ack, body, client }) => 
 
 /** Republish the viewer's Approvals tab. Used after every decision and every opt toggle. */
 async function publishApprovalsTab(userId, client) {
-  const agentId = homeTargetFor(userId, 'app_home');
-  const view = marketplace.buildHomeView(agentId, 'approvals', homeViewOptions(userId, agentId, {
+  const agentId = await homeTargetFor(userId, 'app_home');
+  const view = marketplace.buildHomeView(agentId, 'approvals', await homeViewOptions(userId, agentId, {
     approvalsStore,
     approverUserId: userId,
     canToggle: await canToggleApprovals(userId, agentId),
@@ -1782,17 +1847,145 @@ async function publishApprovalsTab(userId, client) {
 /**
  * May this viewer turn the comms-approval gate off for this agent?
  *
+ * Ownership, and nothing narrower — an owner administers the scope, and the approval gate is one of
+ * the things being administered. `owners.isOwner` covers both legs (the derived own-DM scope and the
+ * stored OWNERS row), so the derivation is not repeated here; owners.js is its single authority.
+ *
  * Used for RENDERING only — handleApprovalOptToggle re-derives it from the clicker's own id,
- * because the button value is untrusted. Drawing a control that would refuse is the archie
- * hazard specifically: unlike OpenClaw, whose in-tab picker only listed agents you manage,
- * archie's global selector offers the whole fleet, so it is easy to land on someone else's
- * agent and meet a button that silently does nothing.
+ * because the button value is untrusted.
  */
 async function canToggleApprovals(userId, agentId) {
-  if (!userId || !agentId) return false;
-  if (agentId === homeAgentFor(userId, 'opt_toggle')) return true;
-  return ownersDirectory.isOwner(userId, agentId);
+  return owners.isOwner(userId, agentId);
 }
+
+// ---------- Owners tab ----------
+//
+// Who may point App Home at this scope. Reachable ONLY for a scope the viewer owns, which is
+// structural rather than checked here: homeTargetFor refuses an unowned selection and the agent
+// selector never offers one, so there is no path to this tab for a scope you do not own.
+
+/**
+ * The tab's data, read fresh like everything else about owners.
+ *
+ * `derived` is the DM scope's implicit owner — asserted from the scope id, never stored — so it is
+ * carried separately and labelled separately in the UI. `stored` is the OWNERS row.
+ *
+ * Returns null on a read failure rather than {}: the tab renders a warning for null and "no owners"
+ * for empty, and a permissions screen must never show the second when it means the first.
+ */
+async function ownersViewFor(agentId) {
+  const ref = slackRefFromScopeId(agentId);
+  const derived = ref && ref.kind === 'user' ? ref.id : null;
+  try {
+    return { derived, stored: await owners.ownersOf(agentId) };
+  } catch (err) {
+    log.error({ agent: agentId, err: err.message }, 'owners tab: could not read owners');
+    return null;
+  }
+}
+
+async function publishOwnersTab(userId, client, { notice = null } = {}) {
+  const agentId = await homeTargetFor(userId, 'app_home');
+  const view = marketplace.buildHomeView(agentId, 'owners', await homeViewOptions(userId, agentId, {
+    owners: await ownersViewFor(agentId),
+    ownersNotice: notice,
+  }));
+  await client.views.publish({ user_id: userId, view });
+}
+
+if (bolt) bolt.action('marketplace_tab_owners', async ({ ack, body, client }) => {
+  await ack();
+  const userId = body.user.id;
+  userActiveTab.set(userId, 'owners');
+  try {
+    await publishOwnersTab(userId, client);
+  } catch (err) {
+    log.error({ err: err.message }, 'failed to switch to owners tab');
+  }
+});
+
+// The multi_users_select itself. Slack fires an action on every change, and there is nothing to do
+// with it — the value is read off the view state when Add is pressed, so that the selection and the
+// scope are read in the same interaction rather than accumulated in process memory. Acked and
+// dropped, deliberately: without a registered handler Bolt logs an unhandled-request warning for
+// every keystroke in the picker.
+if (bolt) bolt.action(marketplace.OWNER_ADD_SELECT, async ({ ack }) => { await ack(); });
+
+/**
+ * Add an owner.
+ *
+ * AUTHORIZATION IS RE-DERIVED FROM THE CLICKER, not taken from the button. The button carries the
+ * scope id so the write cannot be aimed at whatever the process last rendered, and then that scope
+ * is checked against the clicker's own identity with a fresh read — a replayed or forwarded payload
+ * therefore cannot add an owner to somebody else's agent.
+ *
+ * THE TARGET SCOPE COMES FROM THE BUTTON AND IS RE-CHECKED, rather than from homeTargetFor. Those
+ * agree in every real interaction; taking it from the payload and authorizing it is the version that
+ * is still correct if they ever disagree.
+ */
+if (bolt) bolt.action(marketplace.OWNER_ADD_ACTION, async ({ ack, body, client }) => {
+  await ack();
+  const userId = body.user.id;
+  const targetAgent = normaliseScopeId(body.actions[0].value || '');
+  const child = log.child({ action: 'owners_add', user: userId, agent: targetAgent });
+
+  if (!targetAgent) throw new Error(`owners_add: '${body.actions[0].value}' is not a scope id`);
+
+  if (!(await owners.isOwner(userId, targetAgent))) {
+    child.warn('owners add refused — clicker does not own that scope');
+    return;
+  }
+
+  // The picked users live in the view's state, keyed by block then action. Slack sends the whole
+  // state with the interaction, so there is nothing held between the pick and the press.
+  //
+  // The block id is SCOPE-KEYED, and read for the scope the button names — not for whatever the
+  // view happens to contain. If those ever disagree (a stale view, a replayed payload) this finds
+  // nothing and adds nobody, which is the right answer; the previous fixed block id would have
+  // applied one scope's selection to another.
+  const state = (body.view && body.view.state && body.view.state.values) || {};
+  const block = state[marketplace.ownersAddBlockId(targetAgent)] || {};
+  const picked = (block[marketplace.OWNER_ADD_SELECT] || {}).selected_users || [];
+  if (!picked.length) {
+    child.info('owners add: nobody selected — nothing to do');
+    return;
+  }
+
+  // Each add is independent: one rejected id must not discard the others. Every outcome is logged
+  // and metered by addOwner itself, so a partial success is visible rather than reported as a whole.
+  const bots = [];
+  const failed = [];
+  for (const ownerUserId of picked) {
+    try {
+      await owners.addOwner({ scopeId: targetAgent, ownerUserId, by: userId });
+    } catch (err) {
+      if (err.name === 'OwnerIsBot' || err.name === 'OwnerUnverified') bots.push({ ownerUserId, why: err.name });
+      else failed.push(ownerUserId);
+      child.warn({ ownerUserId, reason: err.name || 'error', err: err.message }, 'owners add rejected for one user');
+    }
+  }
+  const added = picked.length - bots.length - failed.length;
+  child.info({ added, refused: bots.length, failed: failed.length }, 'owners add complete');
+
+  // SAY WHY NOTHING HAPPENED. A refusal only in the log is indistinguishable, to the person who
+  // pressed the button, from a broken tab.
+  const notices = [];
+  if (bots.some((b) => b.why === 'OwnerIsBot')) {
+    notices.push(`Not added: ${bots.filter((b) => b.why === 'OwnerIsBot').map((b) => `<@${b.ownerUserId}>`).join(', ')} — bots have no Home tab, so they cannot own an agent.`);
+  }
+  if (bots.some((b) => b.why === 'OwnerUnverified')) {
+    notices.push(`Not added: ${bots.filter((b) => b.why === 'OwnerUnverified').map((b) => `<@${b.ownerUserId}>`).join(', ')} — could not check whether they are a person. Try again shortly.`);
+  }
+  if (failed.length) {
+    notices.push(`Failed to add ${failed.map((u) => `<@${u}>`).join(', ')} — nothing was changed for them. Try again shortly.`);
+  }
+
+  try {
+    await publishOwnersTab(userId, client, { notice: notices.join(' ') || null });
+  } catch (err) {
+    child.error({ err: err.message }, 'failed to re-publish owners tab after add');
+  }
+});
 
 if (bolt) bolt.action('marketplace_tab_approvals', async ({ ack, body, client }) => {
   await ack();
@@ -1865,27 +2058,17 @@ if (bolt) bolt.action('approval_deny', (args) => handleApprovalAction('deny', ar
  *
  * ANTI-FORGERY: the button carries an agent id, but authorization is re-derived from the
  * CLICKER's own identity, so a replayed or forwarded payload cannot toggle someone else's
- * agent. Under identity=scope the `dmUsers` leg of canToggleAgent is a derivation rather
- * than a lookup — homeAgentFor(userId) is by construction the only agent that user owns —
- * so the one-entry map below is the whole of it. `ownedAgents` stays empty until shared
- * agents grow an owners list; a minted ch- scope has no derivable owner and therefore
- * nobody can toggle it, which fails closed.
+ * agent.
  */
 async function handleApprovalOptToggle(optedOut, { ack, body, client }) {
   await ack();
   const userId = body.user.id;
   const targetAgent = body.actions[0].value;
 
-  // TWO CHECKS, and the order matters. canToggleAgent answers from the boot-time list, which
-  // is cheap and covers the own-DM-agent leg by derivation. If it says no on the owners leg we
-  // still ask the table, because the list is push-only and an owner hydrated since the last
-  // reload would otherwise be refused. If it says yes on the OWNERS leg we re-ask anyway, so a
-  // REVOKED owner loses access at this click rather than at the next restart. The dmUsers leg
-  // needs no table read — homeAgentFor is a derivation, not a lookup.
-  const ownAgent = homeAgentFor(userId, 'opt_toggle');
-  const allowed = targetAgent === ownAgent
-    ? true
-    : await ownersDirectory.isOwner(userId, targetAgent);
+  // ONE CHECK, and it is a fresh read. isOwner short-circuits the derived own-DM leg without
+  // touching the table and otherwise reads the OWNERS row, so an owner added moments ago is
+  // admitted and a revoked one refused, both at this click.
+  const allowed = await owners.isOwner(userId, targetAgent);
   if (!allowed) {
     log.warn({ userId, targetAgent }, 'opt toggle rejected — not owner');
     return;
@@ -1905,7 +2088,7 @@ if (bolt) bolt.action('approval_optout', (args) => handleApprovalOptToggle(true,
 if (bolt) bolt.action('approval_optin', (args) => handleApprovalOptToggle(false, args));
 
 async function refreshToolsTab(userId, client) {
-  const agentId = homeTargetFor(userId, 'app_home');
+  const agentId = await homeTargetFor(userId, 'app_home');
   if (!agentId) return;
   const tools = await fetchToolPermissions(agentId);
   const view = marketplace.buildHomeView(agentId, 'tools', await homeViewOptionsAsync(userId, agentId, { tools }));
@@ -1926,7 +2109,7 @@ async function handleGrantChange(kind, { ack, body, client }) {
   await ack();
   const userId = body.user.id;
   const capability = body.actions[0].value;
-  const agentId = homeTargetFor(userId, 'app_home');
+  const agentId = await homeTargetFor(userId, 'app_home');
   if (!agentId) return;
   const child = log.child({ action: `tools_${kind}`, user: userId, agent: agentId, capability });
   if (!AGENT_CONFIG_TABLE) { child.error('no AGENT_CONFIG_TABLE — cannot change grants'); return; }
@@ -1959,7 +2142,7 @@ if (bolt) bolt.action('tools_revoke', (args) => handleGrantChange('revoke', args
 
 // Helper to refresh the Jobs tab for a user
 async function refreshJobsTab(userId, client) {
-  const agentId = homeTargetFor(userId, 'app_home');
+  const agentId = await homeTargetFor(userId, 'app_home');
   if (!agentId) return;
   const jobs = await fetchAgentCronJobs(agentId);
   const cronRunner = await fetchCronRunner(agentId);
@@ -1972,7 +2155,7 @@ if (bolt) bolt.action('jobs_detail', async ({ ack, body, client }) => {
   await ack();
   const jobId = body.actions[0].value;
   const userId = body.user.id;
-  const agentId = homeTargetFor(userId, 'app_home');
+  const agentId = await homeTargetFor(userId, 'app_home');
   if (!agentId) return;
   // Straight from the service — this read the (never-populated) cronCache until 2026-08-11, so the
   // detail modal never opened under AgentCore either.
@@ -1991,7 +2174,7 @@ if (bolt) bolt.action('jobs_detail', async ({ ack, body, client }) => {
 if (bolt) bolt.action('jobs_run', async ({ ack, body, client }) => {
   await ack();
   const userId = body.user.id;
-  const agentId = homeTargetFor(userId, 'app_home');
+  const agentId = await homeTargetFor(userId, 'app_home');
   const jobId = body.actions[0].value;
   if (!agentId) return;
   try {
@@ -2006,7 +2189,7 @@ if (bolt) bolt.action('jobs_run', async ({ ack, body, client }) => {
 if (bolt) bolt.action('jobs_toggle', async ({ ack, body, client }) => {
   await ack();
   const userId = body.user.id;
-  const agentId = homeTargetFor(userId, 'app_home');
+  const agentId = await homeTargetFor(userId, 'app_home');
   let jobId, enabled;
   try {
     const parsed = JSON.parse(body.actions[0].value);
@@ -2033,7 +2216,7 @@ if (bolt) bolt.action('jobs_toggle', async ({ ack, body, client }) => {
 if (bolt) bolt.action('jobs_runner_set', async ({ ack, body, client }) => {
   await ack();
   const userId = body.user.id;
-  const agentId = homeTargetFor(userId, 'app_home');
+  const agentId = await homeTargetFor(userId, 'app_home');
   if (!agentId) return;
   const runner = body.actions[0].value;
   try {
@@ -2051,7 +2234,7 @@ if (bolt) bolt.action('jobs_delete', async ({ ack, body, client }) => {
   const jobId = body.actions[0].value;
   // Find job name from the current cached data
   const userId = body.user.id;
-  const agentId = homeTargetFor(userId, 'app_home');
+  const agentId = await homeTargetFor(userId, 'app_home');
   let jobName = jobId;
   if (agentId) {
     const job = cronHome && cronHome.get(agentId, jobId);
@@ -2069,7 +2252,7 @@ if (bolt) bolt.action('jobs_delete', async ({ ack, body, client }) => {
 if (bolt) bolt.view('jobs_delete_confirm', async ({ ack, body, client, view }) => {
   await ack();
   const userId = body.user.id;
-  const agentId = homeTargetFor(userId, 'app_home');
+  const agentId = await homeTargetFor(userId, 'app_home');
   if (!agentId) return;
   let jobId;
   try {
@@ -2089,7 +2272,7 @@ if (bolt) bolt.action('model_detail', async ({ ack, body, client }) => {
   await ack();
   const modelId = body.actions[0].value;
   const userId = body.user.id;
-  const agentId = homeTargetFor(userId, 'app_home');
+  const agentId = await homeTargetFor(userId, 'app_home');
   const modal = marketplace.buildModelDetailModal(modelId, agentId,
     await marketplace.fetchAgentMarketplace(configDoc(), AGENT_CONFIG_TABLE, agentId));
   if (!modal) return;
@@ -2105,7 +2288,7 @@ if (bolt) bolt.action('connector_detail', async ({ ack, body, client }) => {
   await ack();
   const slug = body.actions[0].value;
   const userId = body.user.id;
-  const agentId = homeTargetFor(userId, 'app_home');
+  const agentId = await homeTargetFor(userId, 'app_home');
   const modal = marketplace.buildConnectorDetailModal(slug, agentId,
     await marketplace.fetchAgentMarketplace(configDoc(), AGENT_CONFIG_TABLE, agentId));
   if (!modal) {
@@ -2140,7 +2323,7 @@ if (bolt) bolt.action('connector_search_open', async ({ ack, body, client }) => 
 // Connector search submit (view callback) — responds with update to replace modal in-place
 if (bolt) bolt.view('connector_search_submit', async ({ ack, body, view }) => {
   const userId = body.user.id;
-  const agentId = homeTargetFor(userId, 'app_home');
+  const agentId = await homeTargetFor(userId, 'app_home');
   const query = (view.state.values.search_block.search_query.value || '').trim();
   if (!query) {
     await ack();
@@ -2174,7 +2357,7 @@ bolt.action('marketplace_install', async ({ ack, body, client }) => {
   await ack();
   const userId = body.user.id;
   const skillId = body.actions[0].value;
-  const agentId = homeTargetFor(userId, 'app_home');
+  const agentId = await homeTargetFor(userId, 'app_home');
   const child = log.child({ action: 'marketplace_install', user: userId, agent: agentId, skill: skillId });
   if (!agentId) { await client.chat.postMessage({ channel: userId, text: NO_AGENT_MSG }); return; }
 
@@ -2220,7 +2403,7 @@ if (bolt) bolt.action('marketplace_uninstall', async ({ ack, body, client }) => 
   await ack();
   const userId = body.user.id;
   const skillId = body.actions[0].value;
-  const agentId = homeTargetFor(userId, 'app_home');
+  const agentId = await homeTargetFor(userId, 'app_home');
   const child = log.child({ action: 'marketplace_uninstall', user: userId, agent: agentId, skill: skillId });
   if (!agentId) { await client.chat.postMessage({ channel: userId, text: NO_AGENT_MSG }); return; }
 
@@ -2240,7 +2423,7 @@ if (bolt) bolt.action('marketplace_uninstall', async ({ ack, body, client }) => 
 if (bolt) bolt.action('connector_install', async ({ ack, body, client }) => {
   await ack();
   const userId = body.user.id;
-  const agentId = homeTargetFor(userId, 'app_home');
+  const agentId = await homeTargetFor(userId, 'app_home');
   let slug, name;
   try {
     const val = JSON.parse(body.actions[0].value);
@@ -2271,7 +2454,7 @@ if (bolt) bolt.action('connector_uninstall', async ({ ack, body, client }) => {
   await ack();
   const userId = body.user.id;
   const slug = body.actions[0].value;
-  const agentId = homeTargetFor(userId, 'app_home');
+  const agentId = await homeTargetFor(userId, 'app_home');
   const child = log.child({ action: 'connector_uninstall', user: userId, agent: agentId, slug });
   if (body.view?.id) {
     try { await client.views.update({ view_id: body.view.id, view: marketplace.buildConnectorInstallingModal(slug, 'uninstall') }); } catch { /* best-effort */ }
@@ -2294,7 +2477,7 @@ if (bolt) bolt.action('connector_uninstall', async ({ ack, body, client }) => {
 if (bolt) bolt.action('model_select', async ({ ack, body, client }) => {
   await ack();
   const userId = body.user.id;
-  const agentId = homeTargetFor(userId, 'app_home');
+  const agentId = await homeTargetFor(userId, 'app_home');
   let modelId, modelName;
   try {
     const val = JSON.parse(body.actions[0].value);
@@ -2734,10 +2917,12 @@ web.get('/debug/streaming', (_req, res) => {
   res.json({ ok: true, sessions: streaming.debugSnapshot(), sessionCount: streaming.sessionCount });
 });
 
-// Routing has no fleet-wide state to summarise any more — it is derived per event. What an operator
-// can still usefully see is which agents exist, which is what the directory holds.
+// Routing has no fleet-wide state to summarise any more — it is derived per event — and there is no
+// longer an in-process agent roster to count either. `archie fleet status` reads the table directly
+// (scanAgentScopes), which is the honest source; reporting a cached count here would be inventing a
+// number the process does not have.
 function summariseRoutes() {
-  return { routing: 'derived per event (dm-<userId> / ch-<channelId>)', agents: agentDirectory.size() };
+  return { routing: 'derived per event (dm-<userId> / ch-<channelId>)' };
 }
 
 // ---------- Startup ----------
@@ -2771,21 +2956,6 @@ let slackBotUserId = null;
     log.info({ teamId: slackTeamId, botUserId: slackBotUserId }, 'auth.test resolved');
   } catch (err) {
     log.warn({ err: err.message }, 'auth.test failed — streaming may not work in channels');
-  }
-
-  // The App Home agent selector's list. Loaded ONCE here; from this point it is maintained by push
-  // only — the mint hook in forwardToAgent, and Slack's channel_rename/group_rename/user_change
-  // events. There is deliberately no refresh interval: see the header of agent-directory.js.
-  //
-  // Non-fatal and not awaited-into-failure: `load` swallows its own errors, and an empty selector
-  // degrades App Home to exactly today's behaviour (your own agent) rather than breaking it.
-  await agentDirectory.load();
-
-  // Same contract as the directory above: non-fatal, and an empty result degrades the
-  // Approvals tab to agent-qg61c0-only rather than breaking it.
-  {
-    const r = await ownersDirectory.load();
-    log.info(r, 'owners directory loaded');
   }
 
   if (bolt) {

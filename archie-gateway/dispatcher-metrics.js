@@ -183,6 +183,11 @@ const M_RUNTIME_GENERATION_ROLL = 'RuntimeGenerationRollCount';
 // dimension.
 const M_MESSAGE_RECEIVED = 'MessagesReceivedCount';
 
+// Owner adds. Two counters rather than one with an `ok` property, matching the Connector pattern:
+// a failure is the thing anyone would alarm on, and an alarm cannot filter on an EMF property.
+const M_OWNER_ADDED = 'OwnerAddedCount';
+const M_OWNER_ADD_FAILED = 'OwnerAddFailedCount';
+
 /**
  * Create a dispatcher metrics emitter (EMF-via-stdout).
  *
@@ -427,6 +432,17 @@ function createDispatcherMetrics(deps = {}) {
   // resolves an agent, BEFORE the turn is forwarded — so the two cannot disagree. That means it counts
   // messages RECEIVED, not replies delivered: a turn that later fails still counts. Deliberate, and
   // stated here because "message volume" invites the other reading.
+  // An owner was added to a scope. `agent` is the scope the ownership is OVER; `by` is who granted
+  // it ('hydrate'/'mention' for the automatic writers), `ownerUserId` who received it. Timestamp is
+  // inherent to the EMF record.
+  function emitOwnerAdded(agent, { ownerUserId, by, ok = true, errName } = {}) {
+    const props = {};
+    if (ownerUserId) props.ownerUserId = ownerUserId;
+    if (by) props.grantedBy = by;
+    if (errName) props.errName = errName;
+    emitMetric(ok ? M_OWNER_ADDED : M_OWNER_ADD_FAILED, 1, 'Count', agent, props);
+  }
+
   function emitMessageReceived(agent, { userId, channel, eventType } = {}) {
     const props = {};
     if (userId) props.userId = userId;
@@ -454,6 +470,7 @@ function createDispatcherMetrics(deps = {}) {
     emitRuntimeCache,
     emitRuntimeGenerationRoll,
     emitMessageReceived,
+    emitOwnerAdded,
     _namespace: namespace,
   };
 }
@@ -475,6 +492,7 @@ const NOOP_METRICS = {
   emitTurnReleased() {},
   emitRuntimeGenerationRoll() {},
   emitMessageReceived() {},
+  emitOwnerAdded() {},
   _namespace: NAMESPACE,
 };
 
