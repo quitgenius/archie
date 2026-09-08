@@ -327,23 +327,39 @@ test('config parity says so when a round-trip degrades to self-consistency', asy
 
 // ── grants ───────────────────────────────────────────────────────────────────────────────────
 
-function grantDeps({ catalogSkills = 4, storedGrant = { slack: { sources: ['config'] } }, config = { skills: [] }, reconciled = ['slack', 'demo_warehouse'], putResult = { roleName: 'agentcore/agent-75lieo', applied: true } } = {}) {
+// `policyRow` and `fleetPolicy` model THE SECOND TABLE READ the IAM derivation makes. The fixture had
+// neither, and no `docCmds` either — so both reads threw on `undefined.GetCommand`, `stripPolicyManaged`
+// swallowed it through its own fail-open catch, and every test here passed while asserting a caps list
+// derived from ONE source. That is the shape of the live bug (`grants apply` revoking a pinned
+// capability's IAM): a fixture that cannot see a read cannot notice it is missing.
+function grantDeps({
+  catalogSkills = 4, storedGrant = { slack: { sources: ['config'] } }, config = { skills: [] },
+  reconciled = ['slack', 'demo_warehouse'], putResult = { roleName: 'agentcore/agent-75lieo', applied: true },
+  policyRow = null, fleetPolicy = null,
+} = {}) {
   const put = [];
   const doc = {
     send: async (cmd) => {
       const key = cmd.input.Key;
       if (key.sk === 'CONFIG') return config === null ? {} : { Item: { data: JSON.stringify(config) } };
+      if (key.sk === 'POLICY') {
+        return policyRow === null ? {} : { Item: { data: typeof policyRow === 'string' ? policyRow : JSON.stringify(policyRow) } };
+      }
+      if (String(key.pk).startsWith('CONFIG#policy')) {
+        return fleetPolicy === null ? {} : { Item: { data: JSON.stringify(fleetPolicy) } };
+      }
       if (String(key.pk).startsWith('GRANT#')) {
         return storedGrant === null ? {} : { Item: { data: typeof storedGrant === 'string' ? storedGrant : JSON.stringify(storedGrant) } };
       }
       return {};
     },
   };
+  const docCmds = { GetCommand: class { constructor(input) { this.input = input; } } };
   return {
     put,
     deps: {
       env: {},
-      clients: { doc, iam: {}, iamCmds: {}, sts: {}, stsCmds: {} },
+      clients: { doc, docCmds, iam: {}, iamCmds: {}, sts: {}, stsCmds: {} },
       modules: {
         marketplace: () => ({
           loadMarketplaceDataFromDdb: async () => (catalogSkills === null ? { error: 'AccessDenied' } : { catalogSkills, installable: 1, agents: 1 }),
@@ -384,6 +400,71 @@ test('grants apply rewrites IAM ONLY, from GRANT#* as stored — no recomputatio
   const r = await wrappers['grants apply'](makeCtx(), args(['agent-75lieo']), makeOut(), deps);
   assert.deepEqual(r.caps, ['slack', 'github']);
   assert.deepEqual(put[0].caps, ['slack', 'github']);
+});
+
+// ── the two-source IAM derivation ────────────────────────────────────────────────────────────
+//
+// A PINNED capability is absent from GRANT#* on purpose (hydration strips anything the Cedar policy
+// owns), so the grant row alone cannot describe the IAM a pinned holder needs. The provisioning path
+// has always read grant ∪ policy-allow; these commands read the same pair now. Measured live on
+// 2026-09-08: before this, `grants apply dm-ux0mz5ckp2r` dropped both `sts:AssumeRole` statements from
+// an agent holding aws-readonly and cloudwatch-logs by pin.
+test('a PINNED capability contributes IAM from the POLICY row, which the grant row cannot carry', async () => {
+  const { deps, put } = grantDeps({
+    storedGrant: { runtime: { sources: ['skill:aws-readonly'] } },
+    fleetPolicy: { groups: { 'pin.aws-readonly': ['dm-abi'], 'pin.cloudwatch-logs': [] } },
+    policyRow: { verdicts: { 'aws-readonly': 'allow', 'cloudwatch-logs': 'deny' } },
+  });
+  const out = makeOut();
+  const r = await wrappers['grants apply'](makeCtx(), args(['agent-75lieo']), out, deps);
+  assert.deepEqual(r.caps, ['runtime', 'aws-readonly'], 'the allowed pin must reach the role');
+  assert.deepEqual(put[0].caps, ['runtime', 'aws-readonly']);
+  assert.match(out.lines.progress.join('\n'), /pinned cap\(s\) contribute IAM from the POLICY row/);
+});
+
+test('a pinned capability the policy DENIES here is stripped and stays out — and the warning says why', async () => {
+  const { deps, put } = grantDeps({
+    // A row written before the capability was pinned: legitimate to hold, confers nothing now.
+    storedGrant: { slack: { sources: ['config'] }, airflow: { sources: ['skill:airflow'] } },
+    fleetPolicy: { groups: { 'pin.airflow': ['dm-agent-848o7l'] } },
+    policyRow: { verdicts: { airflow: 'deny' } },
+  });
+  const out = makeOut();
+  const r = await wrappers['grants apply'](makeCtx(), args(['agent-75lieo']), out, deps);
+  assert.deepEqual(r.caps, ['slack'], 'a denied pin must not attach cross-account IAM');
+  assert.deepEqual(put[0].caps, ['slack']);
+  assert.match(out.lines.warn.join('\n'), /DENIES them for this scope/);
+});
+
+test('an ALLOWED pin in the grant row is not reported as removable — that advice would break the agent', async () => {
+  const { deps } = grantDeps({
+    storedGrant: { 'aws-readonly': { sources: ['manual:UX0MZ5CKP2R'] } },
+    fleetPolicy: { groups: { 'pin.aws-readonly': ['dm-abi'] } },
+    policyRow: { verdicts: { 'aws-readonly': 'allow' } },
+  });
+  const out = makeOut();
+  const r = await wrappers['grants apply'](makeCtx(), args(['agent-75lieo']), out, deps);
+  assert.deepEqual(r.caps, ['aws-readonly'], 'stripped from the grant, re-added from the policy');
+  assert.doesNotMatch(out.lines.warn.join('\n'), /Revoke/);
+});
+
+test('an unparseable POLICY row aborts — an under-permissioned role reported as success is the failure', async () => {
+  const { deps, put } = grantDeps({ policyRow: 'not json{' });
+  await rejects(wrappers['grants apply'](makeCtx(), args(['agent-75lieo']), makeOut(), deps), EXIT.REFUSED, /POLICY is present but unparseable/);
+  assert.equal(put.length, 0, 'nothing may be written from a bad read');
+});
+
+test('reconcile derives the SAME role as apply — the two commands must not disagree about IAM', async () => {
+  const shared = {
+    fleetPolicy: { groups: { 'pin.aws-readonly': ['dm-abi'] } },
+    policyRow: { verdicts: { 'aws-readonly': 'allow' } },
+  };
+  const a = grantDeps({ ...shared, storedGrant: { slack: { sources: ['config'] }, demo_warehouse: { sources: ['skill:demo_warehouse'] } } });
+  await wrappers['grants apply'](makeCtx(), args(['agent-75lieo']), makeOut(), a.deps);
+  const b = grantDeps({ ...shared, reconciled: ['slack', 'demo_warehouse'] });
+  await wrappers['grants reconcile'](makeCtx(), args(['agent-75lieo']), makeOut(), b.deps);
+  assert.deepEqual(b.put[0].caps, a.put[0].caps);
+  assert.ok(a.put[0].caps.includes('aws-readonly'));
 });
 
 test('reconcile SKIPS when the skill catalog is empty — it would derive no skill caps and strip everything', async () => {

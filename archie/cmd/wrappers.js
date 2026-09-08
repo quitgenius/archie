@@ -557,11 +557,17 @@ async function configParity(ctx, args, out, deps) {
  */
 function grantClients(ctx, deps) {
   if (deps.clients) return deps.clients;
-  const { DynamoDBDocumentClient } = require('@aws-sdk/lib-dynamodb');
+  const docCmds = require('@aws-sdk/lib-dynamodb');
   const iamCmds = require('@aws-sdk/client-iam');
   const { GetCallerIdentityCommand } = require('@aws-sdk/client-sts');
   return {
-    doc: DynamoDBDocumentClient.from(makeClient(ctx, '@aws-sdk/client-dynamodb', 'DynamoDBClient')),
+    doc: docCmds.DynamoDBDocumentClient.from(makeClient(ctx, '@aws-sdk/client-dynamodb', 'DynamoDBClient')),
+    // The whole lib-dynamodb namespace, not just the client. Both table reads below construct their
+    // command through `clients.docCmds` (cmd/agent.js:157-167 does the same), and this factory used to
+    // omit it — so `stripPolicyManaged` threw on `undefined.GetCommand` on every real run, was caught by
+    // its own fail-open catch, and reported "policy artifact unreadable" at verbose only. It had never
+    // stripped anything in production.
+    docCmds,
     iam: makeClient(ctx, '@aws-sdk/client-iam', 'IAMClient'),
     iamCmds,
     sts: makeClient(ctx, '@aws-sdk/client-sts', 'STSClient'),
@@ -629,7 +635,7 @@ async function readStoredGrant(clients, table, agentId, deps) {
  * contract policy-derive.js documents. Fail-open on any read problem — an empty set is the pre-policy
  * behaviour, and an IAM repair must not be blocked by an unreadable artifact.
  */
-async function stripPolicyManaged(caps, { clients, ctx, agentId, out }) {
+async function stripPolicyManaged(caps, { clients, ctx, agentId, out, allowedForScope = [] }) {
   let pinned = new Set();
   try {
     const schema = await import(`file://${require.resolve('../../archie-runner/config-resolver/schema.mjs')}`);
@@ -643,13 +649,64 @@ async function stripPolicyManaged(caps, { clients, ctx, agentId, out }) {
     return caps;
   }
   const kept = caps.filter((c) => !pinned.has(c));
-  const dropped = caps.filter((c) => pinned.has(c));
+  // WARN ONLY ABOUT THE ONES THAT LOSE THEIR IAM. A pinned capability the policy ALLOWS for this scope
+  // is re-added by policyAllowedCaps a few lines later, so telling the operator to revoke it would be
+  // advice to break a working agent. What is left is a row holding a capability the policy DENIES here:
+  // that one really does confer nothing, and is the case worth naming.
+  const allowed = new Set(allowedForScope);
+  const dropped = caps.filter((c) => pinned.has(c) && !allowed.has(c));
   if (dropped.length) {
     out.warn(`${agentId}: ignoring ${dropped.length} policy-managed cap(s) when deriving IAM — ${dropped.join(', ')}. `
-      + 'The Cedar policy decides these, so a grant row for them confers no tool access and must not '
-      + 'attach IAM either. Remove them from the row (App Home → Tools → Revoke) to tidy up.');
+      + 'The Cedar policy decides these and DENIES them for this scope, so a grant row for them confers '
+      + 'no tool access and must not attach IAM either. Remove them from the row (App Home → Tools → '
+      + 'Revoke) to tidy up.');
   }
   return kept;
+}
+
+/**
+ * The capabilities this agent's POLICY row ALLOWS — the SECOND source the IAM derivation needs.
+ *
+ * A pinned capability is deliberately ABSENT from GRANT#*: hydration strips anything the Cedar policy
+ * owns (migrate-to-ddb R1), because the policy's forbid beats a grant-row permit and a row that
+ * confers nothing would still make the Tools tab claim otherwise. Correct for the PEP, which reads the
+ * policy. But IAM has no policy row to consult, so deriving the role from the grant row ALONE gives a
+ * pinned holder the tool and none of the AWS access it needs — and that is every IAM-needing
+ * capability except `datadog` (API keys) and the test-only probe: aws-readonly, aws-person79b333-secrets,
+ * cloudwatch-logs, airflow. All four are the reverted SHELL skills, whose scripts do the
+ * `sts:AssumeRole` themselves, so this matters MORE after the revert than it did before.
+ *
+ * The provisioning path has always read both (archie-gateway/derived-role.js readAgentCaps). This one
+ * did not, which made `grants apply` — documented as "the safe command" — silently REVOKE IAM. Measured
+ * live on 2026-09-08: `grants apply dm-ux0mz5ckp2r` dropped both `sts:AssumeRole` statements from an
+ * agent holding aws-readonly and cloudwatch-logs by pin, leaving its shell scripts to fail with
+ * AccessDenied until the next cold provision rebuilt the role.
+ *
+ * ABSENCE vs FAILURE, the same distinction readStoredGrant draws: no row (or a row with no verdicts) is
+ * a real answer — nothing is pinned for this scope, so there is nothing to add. A row that is present
+ * and unparseable ABORTS, because the alternative is writing an under-permissioned role and reporting
+ * success.
+ */
+async function policyAllowedCaps({ clients, ctx, agentId }) {
+  const schema = await import(`file://${require.resolve('../../archie-runner/config-resolver/schema.mjs')}`);
+  const r = await clients.doc.send(new clients.docCmds.GetCommand({
+    TableName: ctx.resources.configTable, Key: schema.agentPolicyKey(agentId),
+  }));
+  if (!r || !r.Item || r.Item.data == null) return [];
+  let row;
+  try {
+    row = JSON.parse(r.Item.data);
+  } catch (e) {
+    throw new CliError(`AGENT#${agentId}/POLICY is present but unparseable — refusing to derive IAM without it`, {
+      code: EXIT.REFUSED,
+      cause: e,
+      detail: 'The policy row is where a PINNED capability confers its IAM. Treating an unreadable row as '
+        + '"no pinned caps" writes a role missing every cross-account grant and reports success. '
+        + 'Re-run `archie policy publish` to rewrite it.',
+    });
+  }
+  const verdicts = (row && row.verdicts) || {};
+  return Object.keys(verdicts).filter((c) => verdicts[c] === 'allow').sort();
 }
 
 /**
@@ -674,7 +731,17 @@ async function writeRolePolicy({ ctx, clients, agentId, caps: rawCaps }, out, de
   //
   // A row can hold one legitimately (written before the capability was pinned), so this reports rather
   // than refuses — refusing would leave the role un-repairable for an agent whose row predates the pin.
-  const caps = await stripPolicyManaged(rawCaps, { clients, ctx, agentId, out });
+  // TWO SOURCES, read in this order so the strip can report accurately: the policy row first (what it
+  // ALLOWS here), then the grant row minus anything the policy owns and denies. See policyAllowedCaps.
+  const allowed = await policyAllowedCaps({ clients, ctx, agentId });
+  const fromGrant = await stripPolicyManaged(rawCaps, { clients, ctx, agentId, out, allowedForScope: allowed });
+  const added = allowed.filter((c) => !fromGrant.includes(c));
+  const caps = [...fromGrant, ...added];
+  if (added.length) {
+    out.progress(`${agentId}: ${added.length} pinned cap(s) contribute IAM from the POLICY row, not the `
+      + `grant — ${added.join(', ')}. The Cedar policy allows them for this scope; hydration keeps them `
+      + 'out of GRANT#* by design, so this is the only place their IAM can come from.');
+  }
   out.verbose(`role policy: agent=${agentId} caps=${caps.length ? caps.join(',') : '(none — the policy is still written, for the config read)'} credentialSecretBase=${secretBase}`);
   const { putDerivedGrants } = deps.modules.derivedRole();
   const r = await putDerivedGrants({
@@ -752,7 +819,9 @@ async function grantsReconcile(ctx, args, out, deps) {
     });
   }
   const role = await writeRolePolicy({ ctx, clients, agentId, caps }, out, deps);
-  return { agent: agentId, table, caps, added, removed, role: role.roleName, iamApplied: role.applied, reason: role.reason || null };
+  // `caps` is what went into GRANT#*; `roleCaps` is what the ROLE was written with. They differ by
+  // exactly the pinned capabilities, which belong in the second and never the first.
+  return { agent: agentId, table, caps, roleCaps: role.caps, added, removed, role: role.roleName, iamApplied: role.applied, reason: role.reason || null };
 }
 
 async function grantsApply(ctx, args, out, deps) {
@@ -773,7 +842,10 @@ async function grantsApply(ctx, args, out, deps) {
     return { dryRun: true, agent: agentId, table, caps: stored.caps, grantPresent: stored.present };
   }
   const role = await writeRolePolicy({ ctx, clients, agentId, caps: stored.caps }, out, deps);
-  return { agent: agentId, table, caps: stored.caps, role: role.roleName, iamApplied: role.applied, reason: role.reason || null };
+  // `role.caps`, NOT `stored.caps` — report what the role was actually written with. The grant row is
+  // only one of the two sources (see policyAllowedCaps), so echoing it back described a role that was
+  // never written and hid the pinned capability this command exists to keep working.
+  return { agent: agentId, table, caps: role.caps, storedCaps: stored.caps, role: role.roleName, iamApplied: role.applied, reason: role.reason || null };
 }
 
 // ── §2.25 cron ───────────────────────────────────────────────────────────────────────────────
