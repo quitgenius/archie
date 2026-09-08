@@ -104,6 +104,36 @@ async function loadAllowedSkills(doc, table, agentId) {
   }
 }
 
+/**
+ * The per-scope Cedar VERDICTS from `AGENT#<id>/POLICY` — `{<capability>: 'allow'|'deny'}`.
+ *
+ * Sibling of loadAllowedSkills, same row, same not-cached reasoning. Separate function because the
+ * two answer different questions and one of them must not imply the other: `skills` gates a pinned
+ * SKILL install, `verdicts` says whether a pinned CAPABILITY is live for this scope.
+ *
+ * Needed because `pinned` (from the fleet artifact) is membership-INDEPENDENT: it says "the policy
+ * owns aws-readonly", never "this agent has it". Rendering a policy-managed capability without the
+ * verdict can only say "the policy decides this", which is the one thing a reader already assumes —
+ * the useful sentence is "your agent HAS this, and here is where that comes from".
+ *
+ * NULL on a missing row or a failed read, and the caller renders that as unknown rather than as
+ * denied: claiming an agent lacks a capability it holds is the same class of wrong answer as an
+ * empty permissions list.
+ */
+async function loadPolicyVerdicts(doc, table, agentId) {
+  if (!doc || !table || !agentId) return null;
+  try {
+    const schema = await loadSchema();
+    const { GetCommand } = require('@aws-sdk/lib-dynamodb');
+    const r = await doc.send(new GetCommand({ TableName: table, Key: schema.agentPolicyKey(agentId) }));
+    const row = r?.Item?.data ? JSON.parse(r.Item.data) : null;
+    const v = row && row.verdicts;
+    return (v && typeof v === 'object' && !Array.isArray(v)) ? v : null;
+  } catch {
+    return null;
+  }
+}
+
 let _schema = null;
 async function loadSchema() {
   if (_schema) return _schema;
@@ -240,7 +270,7 @@ function setDerivedRoleHook(fn) { _derivedRoleHook = fn; }
  * @returns {{grantable: object, baseline: object}} keyed by capability:
  *   { policy, provider, summary, tools[], granted, sources[], manualSources[], derivedSources[] }
  */
-async function describeCapabilities(grant, extraCaps = [], pinned = new Set()) {
+async function describeCapabilities(grant, extraCaps = [], pinned = new Set(), verdicts = null) {
   const catalog = await toolCatalog();
   const stored = (grant && typeof grant === 'object' && !Array.isArray(grant.capabilities)) ? grant : {};
 
@@ -273,7 +303,16 @@ async function describeCapabilities(grant, extraCaps = [], pinned = new Set()) {
   const baseline = {};
   const policyManaged = {};
   for (const [cap, meta] of Object.entries(catalog.capabilities)) {
-    if (pinned.has(cap)) { policyManaged[cap] = describe(cap, meta); continue; }
+    if (pinned.has(cap)) {
+      // `granted` for a policy-managed capability is the VERDICT, not the grant row. Hydration
+      // strips these from GRANT#* by design, so `sources.length` is 0 for a live holder and the
+      // default `granted` would render every one of them as not-held — the exact inversion of the
+      // truth for the scopes that actually have them. `null` verdicts (no row / unreadable) stay
+      // null so the row can say "unknown" instead of guessing in either direction.
+      const verdict = verdicts ? (verdicts[cap] || 'deny') : null;
+      policyManaged[cap] = { ...describe(cap, meta), policyVerdict: verdict, granted: verdict === 'allow' };
+      continue;
+    }
     (meta.policy === 'allow' ? baseline : grantable)[cap] = describe(cap, meta);
   }
 
@@ -503,6 +542,7 @@ async function extraCapsForAgent(doc, table, agentId, { log } = {}) {
 module.exports = {
   readGrant,
   describeCapabilities,
+  loadPolicyVerdicts,
   grantCapability,
   revokeCapability,
   extraCapsForAgent,

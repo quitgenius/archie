@@ -1818,15 +1818,19 @@ async function fetchToolPermissions(agentId) {
   if (!AGENT_CONFIG_TABLE || !agentId) return null;
   try {
     const doc = configDoc();
-    const [{ grant }, extraCaps, pinned] = await Promise.all([
+    const [{ grant }, extraCaps, pinned, verdicts] = await Promise.all([
       grants.readGrant(doc, AGENT_CONFIG_TABLE, agentId),
       grants.extraCapsForAgent(doc, AGENT_CONFIG_TABLE, agentId, { log }),
       // R1: the capabilities the Cedar policy owns. Passed so the tab can render them as
       // policy-managed rather than as approvable — a working Approve button for one of these promises
       // access no approval can give.
       grants.loadPinnedCaps(doc, AGENT_CONFIG_TABLE),
+      // …and the per-scope VERDICTS, because `pinned` is membership-independent: it says the policy
+      // owns a capability, never whether THIS agent holds it. Without this the section could only
+      // restate that the policy decides, which the reader already assumes.
+      grants.loadPolicyVerdicts(doc, AGENT_CONFIG_TABLE, agentId),
     ]);
-    return { ...(await grants.describeCapabilities(grant, extraCaps, pinned)), extraCaps };
+    return { ...(await grants.describeCapabilities(grant, extraCaps, pinned, verdicts)), extraCaps };
   } catch (err) {
     log.error({ err: err.message, agent: agentId }, 'could not read tool permissions');
     return null;
