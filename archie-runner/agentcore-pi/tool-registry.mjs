@@ -21,11 +21,6 @@ import { buildKnowledgeTools } from './knowledge-tools.mjs';
 import { buildKnowledgeWriteTools } from './knowledge-write-tools.mjs';
 import { buildCronTools } from './cron-tool.mjs';
 import { buildOtelTools } from './otel-tool.mjs';
-import { buildDatadogTools } from './datadog-tool.mjs';
-import { buildCloudwatchLogsTools } from './cloudwatch-logs-tool.mjs';
-import { buildPerson79b333SecretsTools } from './aws-person79b333-secrets-tool.mjs';
-import { buildAirflowTools } from './airflow-tool.mjs';
-import { buildAwsReadonlyTools } from './aws-readonly-tool.mjs';
 import { createSandboxProbeTool } from './sandbox-probe-tool.mjs';
 import { CUSTOM_TOOLS, permissiveAllowSet } from './tool-declarations.mjs';
 
@@ -48,11 +43,6 @@ export function allCustomTools(cwd = '/tmp') {
     ...buildKnowledgeWriteTools({ apiUrl: 'https://hindsight.invalid', bankId: 'closure-check' }),
     ...buildCronTools(allow),
     ...buildOtelTools(),
-    ...buildDatadogTools(allow),
-    ...buildCloudwatchLogsTools(allow),
-    ...buildPerson79b333SecretsTools(allow),
-    ...buildAirflowTools(allow),
-    ...buildAwsReadonlyTools(allow),
     createSandboxProbeTool(),
   ];
 }

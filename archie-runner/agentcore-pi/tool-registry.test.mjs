@@ -40,7 +40,23 @@ test('the tool-derived resolver resolves every custom tool to its declared capab
 test('declared caps are policy-classified as intended (baseline vs grant-gated)', () => {
   const caps = CUSTOM_TOOLS;
   for (const c of ['memory', 'cron', 'otel']) assert.ok(Object.values(caps).includes(c) && policyFor(c) === 'allow', `${c} baseline`);
-  for (const c of ['datadog', 'cloudwatch-logs', 'aws-person79b333-secrets', 'airflow', 'aws-readonly', 'sandbox-probe']) {
+  // Grant-gated capabilities that a TOOL declares. otel.fleet and sandbox-probe are what is left
+  // after the five in-process AWS tools were deleted on 2026-09-08 (their skills reverted to shell
+  // scripts) — see tool-declarations.mjs.
+  for (const c of ['otel.fleet', 'sandbox-probe']) {
     assert.ok(Object.values(caps).includes(c) && policyFor(c) === 'deny', `${c} grant-gated`);
+  }
+});
+
+test('the reverted AWS capabilities are still grant-gated, but no longer tool-backed', () => {
+  // THE POINT OF THIS TEST is that deleting a tool must not silently relax its capability. These five
+  // are now reached through bash + the skill's shell script rather than an in-process tool, so:
+  //   - NO tool declares them (nothing for the PEP to gate, nothing for the filter to hide), and
+  //   - they must still default-DENY, because CAP_IAM_REQUIREMENTS keys the derived role's
+  //     sts:AssumeRole on them and pins.<env>.json pins them.
+  // If a capability here ever flipped to 'allow', every agent would get the reader role.
+  for (const c of ['datadog', 'cloudwatch-logs', 'aws-person79b333-secrets', 'airflow', 'aws-readonly']) {
+    assert.equal(Object.values(CUSTOM_TOOLS).includes(c), false, `${c} should have no tool`);
+    assert.equal(policyFor(c), 'deny', `${c} must still be grant-gated`);
   }
 });

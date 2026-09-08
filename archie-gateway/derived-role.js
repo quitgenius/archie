@@ -69,8 +69,10 @@ async function readAgentCaps(doc, tableName, agentId) {
     // test-only probe: aws-readonly, aws-person79b333-secrets, cloudwatch-logs, airflow. Observed live —
     // person79b333 holds aws-readonly by pin, its runtime resolved the tool and the PEP allowed the call,
     // and the assume failed with "not authorized to perform: sts:AssumeRole" because the role carried
-    // no such statement. The @aws-ports BDD passed only because its fixture writes the cap straight
-    // into the grant row, bypassing the strip.
+    // no such statement. (The @aws-ports BDD passed only because its fixture wrote the cap straight
+    // into the grant row, bypassing the strip. That feature was deleted on 2026-09-08 with the
+    // in-process AWS tools it tested; the same statement is now what `aws-ro.sh` needs to assume the
+    // reader, so this two-source read matters MORE after the revert to the shell, not less.)
     doc.send(new GetCommand({ TableName: tableName, Key: agentPolicyKey(agentId) })),
   ]);
   const caps = new Set();

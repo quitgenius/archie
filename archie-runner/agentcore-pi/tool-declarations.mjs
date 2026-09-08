@@ -93,15 +93,16 @@ export const CUSTOM_TOOLS = {
   otel_fleet_metric: 'otel.fleet',
   otel_fleet_trace: 'otel.fleet',
 
-  // datadog-tool.mjs
-  datadog: 'datadog',
-
-  // cloudwatch-logs-tool.mjs / aws-person79b333-secrets-tool.mjs / airflow-tool.mjs / aws-readonly-tool.mjs
-  // — each assumes a cross-account reader in-process, hence one grant-gated capability each.
-  cloudwatch_logs: 'cloudwatch-logs',
-  aws_person79b333_secrets: 'aws-person79b333-secrets',
-  airflow: 'airflow',
-  aws_readonly: 'aws-readonly',
+  // NO ROWS for datadog / cloudwatch_logs / aws_person79b333_secrets / airflow / aws_readonly. Those five
+  // in-process tools were DELETED on 2026-09-08 and their skills reverted to the shell scripts they
+  // were ported from (skill-requires-overrides.mjs explains why: each tool shipped a starter surface
+  // narrower than the CLI, so the skills were less capable under archie than under OpenClaw).
+  //
+  // THEIR CAPABILITIES STILL EXIST and are deliberately still in PROVIDER_NAMES below — they are
+  // what CAP_IAM_REQUIREMENTS keys on to put sts:AssumeRole on an agent's derived role, and what
+  // pins.<env>.json pins. What they no longer have is a TOOL: the agent reaches AWS through bash
+  // plus the skill's script, so the capability is an IAM fact rather than a PEP-gated tool surface.
+  // checkClosure only walks tool names, so a capability with no tool is not a hole.
 
   // sandbox-probe-tool.mjs — TEST-ONLY, for the derived-role IAM harness.
   sandbox_probe: 'sandbox-probe',

@@ -16,11 +16,6 @@ import { buildKnowledgeTools } from './knowledge-tools.mjs';
 import { buildKnowledgeWriteTools } from './knowledge-write-tools.mjs';
 import { buildCronTools } from './cron-tool.mjs';
 import { buildOtelTools } from './otel-tool.mjs';
-import { buildDatadogTools } from './datadog-tool.mjs';
-import { buildCloudwatchLogsTools } from './cloudwatch-logs-tool.mjs';
-import { buildPerson79b333SecretsTools } from './aws-person79b333-secrets-tool.mjs';
-import { buildAirflowTools } from './airflow-tool.mjs';
-import { buildAwsReadonlyTools } from './aws-readonly-tool.mjs';
 import { buildSandboxProbeTools } from './sandbox-probe-tool.mjs';
 
 // ── Plugin manifest (§2.5) ──────────────────────────────────────────────────
@@ -114,9 +109,7 @@ export function buildCustomTools(allow, cwd, ctx = {}) {
     // the tool_call PEP denies a call that arrives anyway.
     ...buildKnowledgeWriteTools(ctx.hindsight || {}),
     ...buildCronTools(allow, ctx), ...buildOtelTools(),
-    ...buildDatadogTools(allow),
     // §7.3/7.4 ported AWS skills (grant-gated; each assumes a cross-account reader in-process).
-    ...buildCloudwatchLogsTools(allow), ...buildPerson79b333SecretsTools(allow), ...buildAirflowTools(allow), ...buildAwsReadonlyTools(allow),
     ...buildSandboxProbeTools(allow),
   ];
 }

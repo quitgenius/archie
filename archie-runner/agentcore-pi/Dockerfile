@@ -89,8 +89,35 @@ WORKDIR /app
 # python3/make/g++ are for duckdb's node-gyp source build (no guaranteed arm64 prebuilt).
 # curl is for the agent's own exec tool — lets a turn diagnose network reachability (e.g. an
 # internal MCP server ALB) from inside the actual runtime, not just from an external test task.
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates python3 make g++ curl \
+#
+# jq is for the SHELL SKILLS. Their scripts (cw.sh, dd.sh, cwq.sh, aws-ro.sh, person79b333-secrets.sh) are
+# back in service after the G3/G4 in-process ports were reverted, and while none of the five parses
+# JSON with jq TODAY, every one of them emits it — an agent following the prose will reach for jq
+# immediately, and its absence is the class of failure that presents as "the skill is broken".
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates python3 make g++ curl jq \
   && rm -rf /var/lib/apt/lists/*
+
+# THE AWS CLI, for the shell skills. Copied from the official image rather than curl|unzip: no extra
+# build deps (unzip), no checksum to maintain by hand, and the tag pins the version.
+#
+# WHY IT IS BACK. aws-readonly/cloudwatch-logs/datadog-logs/aws-person79b333-secrets/support-aws-debug all
+# shell out to `aws`. The ports that replaced them with in-process SDK tools each implemented a
+# STARTER surface — aws_readonly was five actions over two SDK clients against the CLI's whole
+# read surface — so the skills were functionally narrower than in OpenClaw. Reverting to the scripts
+# restores parity; that needs the binary.
+#
+# ON PATH, deliberately. The scripts invoke bare `aws`, exactly as they do under OpenClaw, and parity
+# is the point of the revert. Installing it off-PATH would hide it from an agent that has no business
+# with it, but it would also mean patching every script and diverging from the sandra source.
+# Containment is the SKILL install gate (files only materialise for installed skills) and IAM (the
+# reader role is only assumable by agents whose derived role carries the statement) — not the
+# filesystem.
+#
+# SIZE: this is the largest single addition to the image. Measure the cold-boot delta before and
+# after (BOOT_PHASE name=ready) — the warm pool re-pulls on every runtime update and those pulls
+# egress via NAT.
+COPY --from=amazon/aws-cli:2.31.16 /usr/local/aws-cli/ /usr/local/aws-cli/
+RUN ln -s /usr/local/aws-cli/v2/current/bin/aws /usr/local/bin/aws
 
 COPY agentcore-pi/package.json ./
 RUN npm install --omit=dev --no-fund --no-audit
@@ -121,9 +148,7 @@ COPY agentcore-pi/pi-runtime.mjs agentcore-pi/pi-adapter.mjs agentcore-pi/config
      agentcore-pi/dispatcher-client.mjs \
      agentcore-pi/cron-tool-core.mjs agentcore-pi/cron-tool.mjs agentcore-pi/workspace-seed.mjs \
      agentcore-pi/skill-sync.mjs agentcore-pi/skill-scope.mjs agentcore-pi/tls-scoped.mjs \
-     agentcore-pi/trace-context.mjs agentcore-pi/otel-tool.mjs agentcore-pi/datadog-tool.mjs \
-     agentcore-pi/aws-assume.mjs agentcore-pi/cloudwatch-logs-tool.mjs agentcore-pi/aws-person79b333-secrets-tool.mjs \
-     agentcore-pi/airflow-tool.mjs agentcore-pi/aws-readonly-tool.mjs \
+     agentcore-pi/trace-context.mjs agentcore-pi/otel-tool.mjs \
      agentcore-pi/sandbox-probe-tool.mjs agentcore-pi/observability-iam.cjs agentcore-pi/tool-registry.mjs \
      agentcore-pi/tool-declarations.mjs ./
 # The OTEL self-observability tools (otel-tool.mjs) load the query/metric corpus from the shared
