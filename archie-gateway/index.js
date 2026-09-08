@@ -2686,6 +2686,8 @@ cronService = createCronService({
   onLongRun: cronAlerts.onLongRun,
   onOverlapSkip: cronAlerts.onOverlapSkip,
   // Deletion telemetry: a removal used to leave no trace at all (§M4 follow-up).
+  onJobAdded: cronAlerts.onJobAdded,
+  onJobUpdated: cronAlerts.onJobUpdated,
   onJobRemoved: cronAlerts.onJobRemoved,
   // §3a' — the per-scope CRON_RUNNER gate, plus the metric for what it declines. A gated tick
   // writes nothing to the store, so CronFireGated is the only place it is countable.

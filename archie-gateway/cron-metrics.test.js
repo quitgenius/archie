@@ -7,6 +7,9 @@ const {
   CRON_METRIC_NAME,
   CRON_DELIVERY_METRIC_NAME,
   CRON_REMOVED_METRIC_NAME,
+  CRON_ADDED_METRIC_NAME,
+  CRON_UPDATED_METRIC_NAME,
+  CRON_ENABLED_CHANGED_METRIC_NAME,
 } = require('./cron-metrics');
 
 function capture() {
@@ -242,5 +245,95 @@ describe('CronFireGated', () => {
   it('does not throw on a malformed job', () => {
     const e = createCronAlertEmitter({ emit: () => {}, now: () => 0 });
     expect(() => e.onRunnerGated(null)).not.toThrow();
+  });
+});
+
+// ── mutation events (add / update / enabled toggle) ──────────────────────────────────────────────
+//
+// These exist because CronJobRecord could not answer "did someone change this, and to what?" — the
+// dm-urbnxvak3l5 `Focus Time Slack Status` disable of 2026-09-03 was only findable by diffing ~500
+// sweeps, five days later. The assertions below are the properties that investigation needed.
+
+const live = {
+  agentId: 'dm-urbnxvak3l5', jobId: '242be63a', name: 'Focus Time Slack Status', enabled: true,
+  schedule: { kind: 'every', everyMs: 300000 },
+  delivery: { mode: 'none' },
+  sessionTarget: 'isolated',
+};
+
+describe('createCronAlertEmitter.onJobAdded', () => {
+  it('emits CronJobAdded describing the new job', () => {
+    const { emitter, lines, first } = capture();
+    emitter.onJobAdded(live);
+    expect(lines).toHaveLength(1);
+    const e = first();
+    expect(e._aws.CloudWatchMetrics[0].Metrics[0]).toEqual({ Name: CRON_ADDED_METRIC_NAME, Unit: 'Count' });
+    expect(e._aws.CloudWatchMetrics[0].Dimensions).toEqual([['Agent'], []]);
+    expect(e[CRON_ADDED_METRIC_NAME]).toBe(1);
+    expect(e.Agent).toBe('dm-urbnxvak3l5');
+    expect(e.JobId).toBe('242be63a');
+    expect(e.scheduleExpr).toBe('every 300000ms');
+    expect(e.mode).toBe('none');
+    expect(e.enabled).toBe(true);
+    expect(e.source).toBe('requested');
+  });
+});
+
+describe('createCronAlertEmitter.onJobUpdated', () => {
+  it('NAMES what changed and carries the previous value — the thing CronJobRecord cannot', () => {
+    const { emitter, first } = capture();
+    emitter.onJobUpdated(live, { ...live, enabled: false });
+    const e = first();
+    expect(e._aws.CloudWatchMetrics[0].Metrics[0].Name).toBe(CRON_UPDATED_METRIC_NAME);
+    expect(e.changed).toBe('enabled');
+    expect(e.changedCount).toBe(1);
+    expect(e.enabledFrom).toBe(true);
+    expect(e.enabledTo).toBe(false);
+    expect(e.created).toBe(false);
+  });
+
+  it('emits a SECOND, alarm-shaped metric on an enabled transition', () => {
+    // A property cannot be alarmed on; a metric name can. And a disabled job is invisible in every
+    // other signal precisely because it stops firing.
+    const { emitter, lines } = capture();
+    emitter.onJobUpdated(live, { ...live, enabled: false });
+    expect(lines).toHaveLength(2);
+    const toggle = JSON.parse(lines[1]);
+    expect(toggle._aws.CloudWatchMetrics[0].Metrics[0].Name).toBe(CRON_ENABLED_CHANGED_METRIC_NAME);
+    expect(toggle.enabledFrom).toBe(true);
+    expect(toggle.enabledTo).toBe(false);
+    expect(toggle.name).toBe('Focus Time Slack Status');
+  });
+
+  it('does NOT emit the toggle metric when enabled was untouched', () => {
+    const { emitter, lines } = capture();
+    emitter.onJobUpdated(live, { ...live, name: 'renamed' });
+    expect(lines).toHaveLength(1);
+    expect(JSON.parse(lines[0]).changed).toBe('name');
+  });
+
+  it("reports an ineffective edit as changed:'none' rather than staying silent", () => {
+    // The hydrator re-posts unchanged jobs; silence would make an ineffective edit look like no edit.
+    const { emitter, first, lines } = capture();
+    emitter.onJobUpdated(live, { ...live });
+    expect(lines).toHaveLength(1);
+    expect(first().changed).toBe('none');
+    expect(first().changedCount).toBe(0);
+  });
+
+  it('handles a create-shaped update (no previous record) without inventing a transition', () => {
+    const { emitter, lines, first } = capture();
+    emitter.onJobUpdated(null, live);
+    expect(lines).toHaveLength(1); // no toggle metric — there was nothing to transition from
+    expect(first().created).toBe(true);
+  });
+
+  it('records a schedule change with both expressions', () => {
+    const { emitter, first } = capture();
+    emitter.onJobUpdated(live, { ...live, schedule: { kind: 'cron', expr: '0 9 * * 1' } });
+    const e = first();
+    expect(e.changed.split(',').sort()).toEqual(['scheduleExpr', 'scheduleKind']);
+    expect(e.scheduleExprFrom).toBe('every 300000ms');
+    expect(e.scheduleExprTo).toBe('0 9 * * 1');
   });
 });

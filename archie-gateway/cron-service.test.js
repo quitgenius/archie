@@ -280,6 +280,66 @@ describe('cron-service removal telemetry', () => {
   });
 });
 
+describe('cron-service mutation telemetry (add / update)', () => {
+  // The gap these close: `emitChange` re-emits a CronJobRecord on every mutation, so the new STATE
+  // is visible — but the record is identical whether it came from an edit or the periodic sweep, and
+  // it carries no previous value. The `Focus Time Slack Status` disable on dm-urbnxvak3l5
+  // (2026-09-03) was therefore only findable by diffing ~500 sweeps five days after the fact.
+  const wire = (hooks) => {
+    const clock = new FakeClock(0);
+    return createCronService({
+      dir, clock, now: () => clock.now(),
+      agentCore: { ensureRuntime: vi.fn(async () => 'arn'), invokeStreaming: vi.fn(async () => ({ text: 'x' })) },
+      sessionIdFor: (j) => `sess-${j.agentId}`.padEnd(33, '0'),
+      deliver: vi.fn(async () => {}),
+      inventoryIntervalMs: 0, jobRecordIntervalMs: 0,
+      ...hooks,
+    });
+  };
+
+  it('reports an add with the stored record', () => {
+    const added = [];
+    const service = wire({ onJobAdded: (job, info) => added.push({ jobId: job.jobId, name: job.name, source: info.source }) });
+    service.add(job({ name: 'whale', schedule: { kind: 'every', everyMs: 600000 } }));
+    expect(added).toEqual([{ jobId: 'digest', name: 'whale', source: 'requested' }]);
+  });
+
+  it('passes the PREVIOUS record to the update hook, read before the merge', () => {
+    const seen = [];
+    const service = wire({ onJobUpdated: (before, after) => seen.push({ from: before && before.enabled, to: after.enabled }) });
+    service.add(job({ schedule: { kind: 'every', everyMs: 600000 }, enabled: true }));
+    service.update({ agentId: 'agentA', jobId: 'digest', enabled: false });
+    expect(seen).toEqual([{ from: true, to: false }]);
+  });
+
+  it('the previous record is a CLONE — a runner mutating in place cannot corrupt the event', () => {
+    let captured = null;
+    const service = wire({ onJobUpdated: (before) => { captured = before; } });
+    service.add(job({ name: 'original', schedule: { kind: 'every', everyMs: 600000 } }));
+    service.update({ agentId: 'agentA', jobId: 'digest', name: 'renamed' });
+    expect(captured.name).toBe('original');
+    expect(service.list()[0].name).toBe('renamed');
+  });
+
+  it('a throwing telemetry hook fails neither the add nor the update', () => {
+    const service = wire({
+      onJobAdded: () => { throw new Error('emf down'); },
+      onJobUpdated: () => { throw new Error('emf down'); },
+    });
+    expect(() => service.add(job({ schedule: { kind: 'every', everyMs: 600000 } }))).not.toThrow();
+    expect(() => service.update({ agentId: 'agentA', jobId: 'digest', enabled: false })).not.toThrow();
+    expect(service.list()[0].enabled).toBe(false);
+  });
+
+  it('an update with no previous record reports before=null rather than throwing', () => {
+    const seen = [];
+    const service = wire({ onJobUpdated: (before, after) => seen.push({ before, jobId: after.jobId }) });
+    service.update(job({ schedule: { kind: 'every', everyMs: 600000 } }));
+    expect(seen).toHaveLength(1);
+    expect(seen[0].before).toBeNull();
+  });
+});
+
 describe('cron-service purgeAgent (§E1 — hydration wipes the slate)', () => {
   it('DISARMS as well as deletes — a purged job must never fire again', async () => {
     // THE POINT OF THE WHOLE TEST FILE ENTRY. `store.delete()` drops the cache entry and re-persists

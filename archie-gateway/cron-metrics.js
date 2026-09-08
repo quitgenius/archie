@@ -37,6 +37,27 @@ const METRIC_DELIVERY = 'CronDeliveryFailure';
 // self-deletes via store.delete() inside the runner (cron-runner.js:225/248/271), which bypasses
 // remove(). So this metric means "somebody asked for this job to go", never "it finished".
 const METRIC_REMOVED = 'CronJobRemoved';
+// The counterparts to METRIC_REMOVED, and they exist for the same reason it does — a mutation that
+// leaves no explicit event can only be INFERRED by diffing snapshots.
+//
+// `emitChange` already re-emits a CronJobRecord on add/update, so the job's new STATE is visible
+// within seconds. That is not the same as an EVENT: a CronJobRecord looks identical whether it came
+// from an edit or from the periodic sweep, and it carries no previous value. So "did someone change
+// this job, and what did they change?" needed a stats query over ~500 sweeps to answer.
+//
+// Measured, 2026-09-08: `Focus Time Slack Status` on dm-urbnxvak3l5 was DISABLED between 13:33:42
+// and 13:47:50 on 2026-09-03 and stayed off for five days. The first record showing enabled=0 landed
+// exactly one sweep interval (14.1 min) after the last enabled=1 — i.e. a sweep OBSERVING the change,
+// not the change announcing itself. Nothing named the edit, nothing named the previous value, and the
+// only reason it was found at all is that a re-hydrate was being risk-assessed.
+const METRIC_ADDED = 'CronJobAdded';
+const METRIC_UPDATED = 'CronJobUpdated';
+// An `enabled` flip gets its OWN metric rather than riding CronJobUpdated as a property, because the
+// question it answers is alarm-shaped: "a job that was running has been turned off" (or back on).
+// EMF properties are searchable but not alarmable — an alarm needs a metric name — and a silently
+// disabled job is indistinguishable from a healthy one in every other signal we emit: it stops
+// firing, so CronFailureAlert, CronLongRun and CronDeliveryFailure all go quiet too.
+const METRIC_ENABLED_CHANGED = 'CronJobEnabledChanged';
 // A run that took longer than the long-run threshold (default 10 min). NOT a failure — the turn
 // may well succeed — but for any job firing more often than the threshold it also means ticks are
 // being dropped, and it is the leading indicator for the largest prod failure class (`run: timeout`
@@ -182,7 +203,81 @@ function createCronAlertEmitter(deps = {}) {
     log.info({ agent: agentOf(job), jobId, name: (job && job.name) || jobId, reason: info.reason || 'requested' }, 'cron job removed');
   }
 
-  return { onAlert, onDeliveryFailure, onJobRemoved, onLongRun, onOverlapSkip, onRunnerGated, _namespace: namespace, _metric: METRIC, _metricDelivery: METRIC_DELIVERY };
+  // The job fields worth carrying on a mutation event, flattened once so add/update/remove describe
+  // a job the same way. Bounded, non-PHI, and enough to answer "what is this job" without the store.
+  function jobFacts(job) {
+    const delivery = (job && job.delivery) || {};
+    const sched = (job && job.schedule) || {};
+    return {
+      name: (job && job.name) || null,
+      mode: delivery.mode || 'none',
+      channel: delivery.channel,
+      scheduleKind: sched.kind,
+      scheduleExpr: sched.expr || (sched.everyMs != null ? `every ${sched.everyMs}ms` : (sched.at != null ? `at ${sched.at}` : undefined)),
+      enabled: job ? job.enabled !== false : undefined,
+      sessionTarget: (job && job.sessionTarget) || null,
+    };
+  }
+
+  /** A job created by request (API/tool/hydrator). Mirrors onJobRemoved. */
+  function onJobAdded(job, info = {}) {
+    const jobId = jobIdOf(job);
+    emitMetric(METRIC_ADDED, agentOf(job), jobId, {
+      ...jobFacts(job),
+      source: info.source || 'requested',
+    });
+    log.info({ agent: agentOf(job), jobId, name: (job && job.name) || jobId }, 'cron job added');
+  }
+
+  /**
+   * A job edited by request. `before` may be null (an update that created).
+   *
+   * WHAT CHANGED IS COMPUTED HERE, not left to the reader. The alternative — emit the new state and
+   * let a query diff it against the previous record — is what already existed via CronJobRecord and
+   * is precisely what failed: it needs the reader to know a change happened before they can look for
+   * it. `changed` is a comma-joined field list (bounded: seven possible names), and each changed
+   * field rides as an explicit `<field>From`/`<field>To` pair so one log line is self-describing.
+   *
+   * An update that changes nothing still emits, with `changed: 'none'` — an idempotent PATCH is a
+   * real thing the fleet does (the hydrator re-posts unchanged jobs) and silence would make an
+   * ineffective edit look like no edit at all.
+   */
+  function onJobUpdated(before, after, info = {}) {
+    const a = jobFacts(before);
+    const b = jobFacts(after);
+    const props = {};
+    const changed = [];
+    for (const k of Object.keys(b)) {
+      if (a[k] === b[k]) continue;
+      changed.push(k);
+      props[`${k}From`] = a[k] === undefined ? null : a[k];
+      props[`${k}To`] = b[k] === undefined ? null : b[k];
+    }
+    const jobId = jobIdOf(after) !== 'unknown' ? jobIdOf(after) : jobIdOf(before);
+    emitMetric(METRIC_UPDATED, agentOf(after) !== 'unknown' ? agentOf(after) : agentOf(before), jobId, {
+      ...b,
+      created: !before,
+      changed: changed.length ? changed.join(',') : 'none',
+      changedCount: changed.length,
+      source: info.source || 'requested',
+      ...props,
+    });
+    log.info({ agent: agentOf(after), jobId, changed }, 'cron job updated');
+
+    // The alarm-shaped half. Only on a real transition — an update that left `enabled` alone must not
+    // look like someone touching it, or the metric cannot be alarmed on at all.
+    if (before && a.enabled !== b.enabled) {
+      emitMetric(METRIC_ENABLED_CHANGED, agentOf(after), jobId, {
+        ...b,
+        enabledFrom: a.enabled,
+        enabledTo: b.enabled,
+        source: info.source || 'requested',
+      });
+      log.info({ agent: agentOf(after), jobId, from: a.enabled, to: b.enabled }, 'cron job enabled flag changed');
+    }
+  }
+
+  return { onAlert, onDeliveryFailure, onJobAdded, onJobUpdated, onJobRemoved, onLongRun, onOverlapSkip, onRunnerGated, _namespace: namespace, _metric: METRIC, _metricDelivery: METRIC_DELIVERY };
 }
 
 module.exports = {
@@ -194,4 +289,7 @@ module.exports = {
   CRON_METRIC_NAME: METRIC,
   CRON_DELIVERY_METRIC_NAME: METRIC_DELIVERY,
   CRON_REMOVED_METRIC_NAME: METRIC_REMOVED,
+  CRON_ADDED_METRIC_NAME: METRIC_ADDED,
+  CRON_UPDATED_METRIC_NAME: METRIC_UPDATED,
+  CRON_ENABLED_CHANGED_METRIC_NAME: METRIC_ENABLED_CHANGED,
 };

@@ -65,6 +65,12 @@ function createCronService(opts) {
 
   function add(job) {
     const rec = runner.add(job);
+    // Telemetry AFTER the mutation and never able to fail it — same contract as remove()'s.
+    try {
+      if (opts.onJobAdded) opts.onJobAdded(rec || job, { source: 'requested' });
+    } catch (err) {
+      log.warn({ err: String(err && err.message) }, 'cron: add telemetry failed');
+    }
     emitChange(rec || job);
     return rec;
   }
@@ -94,6 +100,14 @@ function createCronService(opts) {
     const existing = store.get(job.id || keyOf(job.agentId, job.jobId));
     const merged = existing ? { ...existing, ...job } : job;
     const rec = runner.update(merged);
+    // `existing` is read BEFORE the merge, so the event can carry the previous value — the thing a
+    // CronJobRecord can never carry, and the reason an `enabled` flip was only findable by diffing
+    // ~500 sweeps. Cloned because `merged` spreads `existing` and the runner may mutate in place.
+    try {
+      if (opts.onJobUpdated) opts.onJobUpdated(existing ? { ...existing } : null, rec || merged, { source: 'requested' });
+    } catch (err) {
+      log.warn({ err: String(err && err.message) }, 'cron: update telemetry failed');
+    }
     emitChange(rec || merged);
     return rec;
   }
