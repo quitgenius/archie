@@ -9,54 +9,73 @@
 // then relied on `channel_rename` / `group_rename` / `user_change` to stay correct. That was wrong in
 // two directions at once: it silently indexed only the first 100 of every agent in the fleet, and its one repair
 // path (`POST /reload`) is unreachable from outside the VPC — the gateway admits port 9090 only from
-// the runtime and hydrator security groups — so an operator who noticed a stale label could not fix
-// it without rolling the service.
+// the runtime and hydrator security groups.
 //
-// WHAT MAKES FRESH AFFORDABLE. Under owner-gating the caller resolves only the scopes ONE viewer
-// owns, not the fleet, and it resolves them when a human opens a tab or types in the selector. Two
-// paginated Tier-2 calls cover any number of scopes, and a kind that is not present costs nothing:
-// a viewer who owns only DM scopes never calls conversations.list.
+// ── PER-SCOPE `info`, NOT A WORKSPACE `list`. THIS BROKE PROD ONCE. ──────────────────────────────
+//
+// The first version bulk-loaded names with `users.list` + `conversations.list`, on the reasoning that
+// two calls cover any number of scopes. That is true in a small workspace and false in a real one:
+// `conversations.list` is Tier 2 (~20 req/min) AND PAGINATED, so in the Pelago workspace one render
+// costs many Tier-2 requests rather than one. `labelFor` is awaited by `homeViewOptions`, i.e. by
+// EVERY App Home render, so the budget was gone in minutes and Bolt's WebClient then backed off 30s
+// per attempt — which is not a degraded label, it is a Home tab that never publishes. Observed in
+// prod 2026-09-08: continuous `A rate limit was exceeded (url: .../conversations.list,
+// retry-after: 30)`.
+//
+// So labels are resolved ONE SCOPE AT A TIME with `users.info` / `conversations.info` (Tier 4 and
+// Tier 3, ~100 and ~50 per minute, single request each). The common case — one scope for the current
+// render target — is now exactly one cheap call instead of paginating thousands of channels.
+//
+// ── NEVER RETRY, NEVER BLOCK ────────────────────────────────────────────────────────────────────
+//
+// A label is cosmetic; a render is not. The caller injects a NO-RETRY client, so a 429 fails
+// immediately and degrades to the raw scope id rather than sleeping. Concurrency is bounded so a
+// viewer who owns many scopes cannot fire 60 requests at once, and every per-scope failure is
+// absorbed independently — a rate-limited lookup costs that one entry its name, nothing more.
 //
 // EVERY FAILURE DEGRADES TO THE RAW SCOPE ID, never to an empty label and never to a throw. The raw
-// id is the honest answer — it is also what an operator needs in order to cross-check DynamoDB — so
-// a lost `channels:read` scope makes the selector ugly rather than empty. `missing_scope` is the case
-// that matters: it is what a reinstall with narrowed scopes looks like.
+// id is the honest answer — it is also what an operator needs in order to cross-check DynamoDB.
 
 const { slackRefFromScopeId } = require('./agent-scope');
 const { composeLabel } = require('./agent-directory');
 
 const NOOP_LOG = { info() {}, warn() {}, error() {}, debug() {} };
 
-// conversations.list is Tier 2 and the docs advise <=200 per page; users.list takes 500 happily.
-const CHANNEL_PAGE = 200;
-const USER_PAGE = 500;
-
-// Cursor loops are bounded so a malformed or looping cursor cannot spin forever on a render path.
-const MAX_PAGES = 50;
+// How many per-scope lookups run at once. Small on purpose: these are Tier 3/4 methods and the
+// point of the bound is that one viewer's interaction cannot exhaust the workspace's budget.
+const CONCURRENCY = 5;
 
 /**
  * @param deps.slack  { users: {list}, conversations: {list} } — injected, so tests need no WebClient
  * @param deps.log    pino-shaped logger
  */
 function createAgentLabels({ slack, log = NOOP_LOG }) {
-  async function paginate(what, call, absorb) {
-    let cursor;
-    let pages = 0;
-    do {
-      let r;
-      try {
-        r = await call(cursor);
-      } catch (err) {
-        log.warn({ what, err: err.message, code: err.data && err.data.error }, 'agent-labels: name load failed — labels degrade to raw scope ids');
-        return;
+  /**
+   * One scope's Slack name, or null. Never throws, never retries, never sleeps.
+   *
+   * `missing_scope` is the case that matters most (a reinstall with narrowed scopes) and
+   * `ratelimited` the one that broke prod; both land here and both yield null, which the caller
+   * renders as the raw scope id.
+   */
+  async function nameFor(ref) {
+    if (!ref) return null;
+    try {
+      if (ref.kind === 'user') {
+        const r = await slack.users.info({ user: ref.id });
+        const u = (r && r.user) || {};
+        const p = u.profile || {};
+        return p.display_name || u.real_name || p.real_name || u.name || null;
       }
-      if (!r || r.ok === false) {
-        log.warn({ what, error: r && r.error }, 'agent-labels: name load returned not-ok — labels degrade to raw scope ids');
-        return;
-      }
-      absorb(r);
-      cursor = (r.response_metadata && r.response_metadata.next_cursor) || '';
-    } while (cursor && ++pages < MAX_PAGES);
+      const r = await slack.conversations.info({ channel: ref.id });
+      const c = (r && r.channel) || {};
+      return c.name ? `#${c.name}` : null;
+    } catch (err) {
+      log.warn(
+        { kind: ref.kind, id: ref.id, err: err.message, code: err.data && err.data.error },
+        'agent-labels: name lookup failed — this entry degrades to its raw scope id',
+      );
+      return null;
+    }
   }
 
   /**
@@ -70,52 +89,27 @@ function createAgentLabels({ slack, log = NOOP_LOG }) {
     const ids = (scopeIds || []).filter((s) => typeof s === 'string' && s);
     const refs = ids.map((scopeId) => ({ scopeId, ref: slackRefFromScopeId(scopeId) }));
 
-    const needUsers = refs.some((r) => r.ref && r.ref.kind === 'user');
-    const needChannels = refs.some((r) => r.ref && r.ref.kind === 'channel');
+    // Bounded concurrency. A viewer owning many scopes must not fire 60 requests at once — that is how
+    // a Tier-3 budget is spent in one interaction. Sequential batches of CONCURRENCY.
+    const names = new Array(refs.length).fill(null);
+    for (let i = 0; i < refs.length; i += CONCURRENCY) {
+      const slice = refs.slice(i, i + CONCURRENCY);
+      const got = await Promise.all(slice.map((r) => nameFor(r.ref)));
+      for (let k = 0; k < got.length; k += 1) names[i + k] = got[k];
+    }
 
-    const userNames = new Map();
-    const channelNames = new Map();
-
-    // Both kinds at once — they are independent calls to independent methods, so serialising them
-    // would double the latency of a render for no benefit. A kind nobody asked for is not called.
-    await Promise.all([
-      needUsers ? paginate('users', (cursor) => slack.users.list({ limit: USER_PAGE, cursor }), (r) => {
-        for (const u of r.members || []) {
-          if (!u || !u.id) continue;
-          const p = u.profile || {};
-          const name = p.display_name || u.real_name || p.real_name || u.name;
-          if (name) userNames.set(u.id, name);
-        }
-      }) : Promise.resolve(),
-      // `types` MUST name private_channel explicitly or the call returns public channels only.
-      needChannels ? paginate('channels', (cursor) => slack.conversations.list({
-        types: 'public_channel,private_channel',
-        limit: CHANNEL_PAGE,
-        exclude_archived: false,
-        cursor,
-      }), (r) => {
-        for (const c of r.channels || []) {
-          if (c && c.id && c.name) channelNames.set(c.id, c.name);
-        }
-      }) : Promise.resolve(),
-    ]);
-
-    return refs.map(({ scopeId, ref }) => {
-      const raw = ref ? (ref.kind === 'user' ? userNames.get(ref.id) : channelNames.get(ref.id)) : null;
-      const shown = raw ? (ref.kind === 'channel' ? `#${raw}` : raw) : null;
-      return {
-        scopeId,
-        kind: ref ? ref.kind : 'other',
-        name: shown || null,
-        label: composeLabel(shown, scopeId),
-      };
-    });
+    return refs.map(({ scopeId, ref }, i) => ({
+      scopeId,
+      kind: ref ? ref.kind : 'other',
+      name: names[i] || null,
+      label: composeLabel(names[i], scopeId),
+    }));
   }
 
   /**
    * One scope's label, for the selector's `initial_option` and anything else rendering a single
-   * target. Costs the same Slack call as resolving a set, so a caller that needs both a list and the
-   * current target's label should call `resolve` once with both rather than calling this as well.
+   * target. Exactly ONE Slack request — this is the App-Home-render path, so its cost is the cost of
+   * opening the Home tab.
    */
   async function labelFor(scopeId) {
     if (!scopeId) return '';

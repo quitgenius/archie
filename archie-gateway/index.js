@@ -247,10 +247,23 @@ function configDoc() {
 // Scope id -> Slack name, for the selector and for whichever agent a Home tab is rendering.
 // STATELESS: every call hits Slack. No name map, no TTL, no rename events. See agent-labels.js.
 const agentLabels = createAgentLabels({
-  slack: {
-    users: { list: (a) => slack.users.list(a) },
-    conversations: { list: (a) => slack.conversations.list(a) },
-  },
+  // A DEDICATED NO-RETRY CLIENT, and this is the load-bearing part rather than tidiness. The shared
+  // WebClient retries a 429 with the Retry-After the API asks for — 30s at a time — and `labelFor`
+  // is awaited by every App Home render, so one exhausted budget turned every Home open into a
+  // multi-minute hang instead of an ugly label. Broke prod on 2026-09-08.
+  //
+  // Labels are cosmetic: fail immediately, degrade to the raw scope id, keep rendering.
+  // rejectRateLimitedCalls makes a 429 throw at once instead of sleeping; retries 0 covers the rest.
+  slack: (() => {
+    const c = new WebClient(SLACK_BOT_TOKEN, {
+      retryConfig: { retries: 0 },
+      rejectRateLimitedCalls: true,
+    });
+    return {
+      users: { info: (a) => c.users.info(a) },
+      conversations: { info: (a) => c.conversations.info(a) },
+    };
+  })(),
   log,
 });
 
