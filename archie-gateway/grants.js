@@ -191,6 +191,12 @@ async function toolCatalog() {
     ...Object.keys(caps.CAPABILITY_DEFAULTS).filter((c) => c !== '*'),
     ...Object.values(tools).map((t) => t.capability),
     ...Object.values(decl.PLUGIN_PROVIDERS).flatMap((p) => p.capabilities),
+    // Capabilities that exist WITHOUT a tool — the reverted shell skills (see TOOLLESS_CAPABILITIES).
+    // Without this the three sources above miss them entirely, because each one is keyed off a tool
+    // or a plugin, and these are neither: the agent reaches AWS through bash and the skill's script.
+    // They are also the most privileged capabilities in the fleet, so omitting them made the Tools
+    // tab quietly silent about exactly what a reader most needs to see.
+    ...(decl.TOOLLESS_CAPABILITIES || []),
   ]);
   const missing = [...capNames].filter((c) => !CAPABILITY_SUMMARY[c]).sort();
   if (missing.length) {

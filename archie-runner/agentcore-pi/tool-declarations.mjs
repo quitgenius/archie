@@ -108,6 +108,28 @@ export const CUSTOM_TOOLS = {
   sandbox_probe: 'sandbox-probe',
 };
 
+// ── Capabilities with NO tool ────────────────────────────────────────────────────────────────────
+// The five above, named as data rather than only described in a comment.
+//
+// A capability normally enters the universe by being declared on a tool. These five no longer are
+// (their in-process tools were deleted on 2026-09-08), and they are not plugin surfaces either — the
+// agent reaches AWS through bash plus the skill's shell script, so the capability is an IAM fact and
+// a policy pin rather than a PEP-gated tool surface.
+//
+// WHY THIS EXPORT EXISTS AT ALL, and it is not tidiness. Consumers that build the capability universe
+// from tool rows silently LOST these when the rows went: `archie-gateway/grants.js` derives its set
+// from CORE_TOOLS/CUSTOM_TOOLS + PLUGIN_PROVIDERS + CAPABILITY_DEFAULTS, so `describeCapabilities`
+// stopped listing them and the Tools tab stopped showing them as policy-managed — while the pins,
+// the POLICY verdicts and the derived-role IAM all kept working. The result was a tab that omitted
+// the most privileged capabilities an agent holds, and an `assertGrantable` that refused them as
+// "not a known capability" instead of naming the policy. Found by 9 failing tests, 2026-09-08.
+//
+// PROVIDER_NAMES already carries them, but it is the PROVIDER identity set, not the capability set —
+// it also holds `core`, which is no capability at all — so it cannot serve as this source.
+export const TOOLLESS_CAPABILITIES = new Set([
+  'datadog', 'cloudwatch-logs', 'aws-person79b333-secrets', 'airflow', 'aws-readonly',
+]);
+
 // ── Plugin providers ─────────────────────────────────────────────────────────────────────────────
 // Declared by capability SURFACE rather than tool list, because their tools are resolved per agent at
 // runtime: connector's from its connected toolkits, mcp-auth's from its configured MCP servers. An
