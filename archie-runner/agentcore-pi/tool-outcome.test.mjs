@@ -113,7 +113,12 @@ test('never throws, whatever it is handed', () => {
 
 test('outcomeAttributes omits absent measurements rather than sending nulls', () => {
   const none = outcomeAttributes(toolOutcome('plain text'));
-  assert.deepEqual(Object.keys(none), ['agent_i32pz9.tool.result.chars']);   // ok:null is ABSENT, not false
+  // `ok: null` is still ABSENT, not false — coercing it is the false-green this module exists to
+  // stop. What is NEW is `declared: false`, which says so explicitly instead of leaving the reader
+  // to infer it from a missing key (see the note on `declared` in outcomeAttributes).
+  assert.deepEqual(Object.keys(none).sort(), ['agent_i32pz9.tool.result.chars', 'agent_i32pz9.tool.result.declared']);
+  assert.equal(none['agent_i32pz9.tool.result.declared'], false);
+  assert.equal('agent_i32pz9.tool.result.ok' in none, false);
 
   const failed = outcomeAttributes(toolOutcome(mcp({ successful: false, error: 'boom', code: 'E1' })));
   assert.equal(failed['agent_i32pz9.tool.result.ok'], false);
@@ -189,4 +194,63 @@ test('THE PII GUARD: no part of the payload reaches the output', () => {
   // And the outcome is still useful, which is the point of the boundary rather than dropping it all.
   assert.equal(o.ok, false);
   assert.equal(o.message, 'delivery failed');
+});
+
+// ── uniform shape across tool kinds (2026-09-08) ────────────────────────────────────────────────
+//
+// The ragged set measured live: of 10 tool spans on dm-urbnxvak3l5's 5-minute cron, CONNECTOR_
+// SEARCH_TOOLS and CONNECTOR_MANAGE_CONNECTIONS carried no `ok` and no `failed`, so a span query
+// could not distinguish a failure from a tool that declares nothing. `declared` is the fix; the
+// measurements themselves are still never invented.
+
+test('EVERY outcome carries `declared`, whatever the tool shape', () => {
+  const shapes = [
+    'plain text',                                        // no envelope at all
+    mcp({ successful: true }),                           // declared single
+    mcp({ whatever: 1 }),                                // envelope, no outcome
+    batch({ successful: true }, { successful: false, error: 'x' }), // declared batch
+    batch({ data_preview: {} }, { data_preview: {} }),   // batch declaring nothing
+  ];
+  for (const input of shapes) {
+    const a = outcomeAttributes(toolOutcome(input));
+    assert.equal(typeof a['agent_i32pz9.tool.result.declared'], 'boolean', `declared missing for ${String(input).slice(0, 40)}`);
+    assert.equal(typeof a['agent_i32pz9.tool.result.chars'], 'number');
+  }
+});
+
+test('a DECLARED single call gets the batch shape — items/failed — so one query covers both', () => {
+  const ok = outcomeAttributes(toolOutcome(mcp({ successful: true })));
+  assert.equal(ok['agent_i32pz9.tool.result.declared'], true);
+  assert.equal(ok['agent_i32pz9.tool.result.ok'], true);
+  assert.equal(ok['agent_i32pz9.tool.result.items'], 1);
+  assert.equal(ok['agent_i32pz9.tool.result.failed'], 0);
+
+  const bad = outcomeAttributes(toolOutcome(mcp({ successful: false, error: 'boom' })));
+  assert.equal(bad['agent_i32pz9.tool.result.items'], 1);
+  assert.equal(bad['agent_i32pz9.tool.result.failed'], 1);
+});
+
+test('a THROWN call is declared false with failed=1, not an absent measurement', () => {
+  const thrown = outcomeAttributes(toolOutcome('anything', true));
+  assert.equal(thrown['agent_i32pz9.tool.result.declared'], true);
+  assert.equal(thrown['agent_i32pz9.tool.result.ok'], false);
+  assert.equal(thrown['agent_i32pz9.tool.result.failed'], 1);
+});
+
+test('an UNDECLARED batch keeps `items` but emits no `failed` — 0 would read as "nothing failed"', () => {
+  // The batch's `failed` is a count of explicit falses. On a batch that declared nothing that count
+  // is 0, which is exactly the false-green one layer down.
+  const a = outcomeAttributes(toolOutcome(batch({ data_preview: {} }, { data_preview: {} })));
+  assert.equal(a['agent_i32pz9.tool.result.declared'], false);
+  assert.equal(a['agent_i32pz9.tool.result.items'], 2);
+  assert.equal('agent_i32pz9.tool.result.failed' in a, false);
+  assert.equal('agent_i32pz9.tool.result.ok' in a, false);
+});
+
+test('a partially-failed batch still reports its real counts', () => {
+  const a = outcomeAttributes(toolOutcome(batch({ successful: true }, { successful: false, error: 'no' }, { successful: true })));
+  assert.equal(a['agent_i32pz9.tool.result.declared'], true);
+  assert.equal(a['agent_i32pz9.tool.result.ok'], false);
+  assert.equal(a['agent_i32pz9.tool.result.items'], 3);
+  assert.equal(a['agent_i32pz9.tool.result.failed'], 1);
 });

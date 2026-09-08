@@ -144,10 +144,26 @@ export function toolOutcome(result, isError = false) {
   const out = {
     ok: isError ? false : null, code: null, message: null, chars: text.length, items: null, failed: null,
   };
-  if (!text) return out;
+  // EVERY exit goes through this. A DECLARED outcome gets the batch's shape (`items`/`failed`) even
+  // when it came from a single call, so one span query answers "how many tool calls failed" across
+  // both envelopes instead of needing a branch per tool kind. Undeclared stays undeclared —
+  // inventing items=1/failed=0 is the false-green this module exists to stop.
+  //
+  // A HELPER RATHER THAN A LINE BEFORE THE LAST `return`, because there are four exits and the two
+  // early ones can still carry a declared outcome: `isError` sets ok=false before the body is even
+  // parsed, so a THROWN call whose result is not JSON leaves at `if (!body)`. Written inline first,
+  // that call came out declared-but-uncounted and its own test caught it.
+  const finish = (o) => {
+    if (typeof o.ok === 'boolean' && o.items === null) {
+      o.items = 1;
+      o.failed = o.ok ? 0 : 1;
+    }
+    return o;
+  };
+  if (!text) return finish(out);
 
   const body = peel(text);
-  if (!body) return out;   // not JSON, or no object at any depth — size is all there is
+  if (!body) return finish(out);   // not JSON, or no object at any depth — size is all there is
 
   // ── MULTI-EXECUTE: one call, N inner tools, N outcomes ───────────────────────────────────────
   //
@@ -185,7 +201,7 @@ export function toolOutcome(result, isError = false) {
       }
     }
     if (isError) out.ok = false;
-    return out;
+    return finish(out);
   }
 
   // ── SINGLE CALL ──────────────────────────────────────────────────────────────────────────────
@@ -209,7 +225,7 @@ export function toolOutcome(result, isError = false) {
   if (out.ok === null && (out.message || out.code)) out.ok = false;
   // And a THROWN call stays false whatever the body says.
   if (isError) out.ok = false;
-  return out;
+  return finish(out);
 }
 
 /**
@@ -218,11 +234,30 @@ export function toolOutcome(result, isError = false) {
  */
 export function outcomeAttributes(outcome, prefix = 'agent_i32pz9.tool.result') {
   if (!outcome) return {};
-  const a = { [`${prefix}.chars`]: outcome.chars };
-  if (typeof outcome.ok === 'boolean') a[`${prefix}.ok`] = outcome.ok;
-  // Batch shape, when there was one: `items=3 failed=1` is the case a single boolean erases.
+  const declared = typeof outcome.ok === 'boolean';
+  // ALWAYS PRESENT, and the reason the rest can stay honest.
+  //
+  // `ok` is emitted only when the result actually stated an outcome, because coercing an absent
+  // measurement makes every envelope-less tool a green span. That is right, and it left the span set
+  // RAGGED: `CONNECTOR_SEARCH_TOOLS` and `CONNECTOR_MANAGE_CONNECTIONS` carry no `ok` at all, so a
+  // query asking "did this tool call succeed" cannot tell "it failed" from "nobody said" from "the
+  // attribute is missing for some other reason" — measured on dm-urbnxvak3l5's 5-minute cron,
+  // 2026-09-08, where 4 of 10 tool spans in one window had no `ok`.
+  //
+  // `declared` makes the absence itself a first-class, uniformly-present measurement. Every tool span
+  // now answers the question — `declared = 0` means the tool told us nothing, which is a fact about
+  // the TOOL and worth its own alarm, rather than a hole in the telemetry.
+  const a = { [`${prefix}.chars`]: outcome.chars, [`${prefix}.declared`]: declared };
+  if (declared) {
+    a[`${prefix}.ok`] = outcome.ok;
+    // Gated on `declared` TOO. An undeclared batch has a real `items` but its `failed` is only a
+    // count of explicit falses — emitting `failed: 0` there says "nothing failed" about a batch that
+    // said nothing at all, which is the same false-green one layer down.
+    if (typeof outcome.failed === 'number') a[`${prefix}.failed`] = outcome.failed;
+  }
+  // `items` is a fact about the ENVELOPE, not the outcome, so it survives an undeclared result:
+  // "2 items, nothing declared" is a more useful span than "nothing declared".
   if (typeof outcome.items === 'number') a[`${prefix}.items`] = outcome.items;
-  if (typeof outcome.failed === 'number') a[`${prefix}.failed`] = outcome.failed;
   if (outcome.code) a[`${prefix}.code`] = outcome.code;
   if (outcome.message) a[`${prefix}.message`] = outcome.message;
   return a;
