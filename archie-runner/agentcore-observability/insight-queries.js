@@ -228,13 +228,12 @@ const INSIGHTS = {
       // HIT/MISS IS A GROUPING KEY, NOT AN AGGREGATE, and that is not a style choice.
       //
       // This first shipped as `sum(cached > 0) as hit_turns`, on the precedent of
-      // `sum(receives > 1)` in sqs_queue_wait below. Insights accepts it and returns ZERO — and
+      // `sum(receives > 1)` in ttfm_queue_wait below. Insights accepts it and returns ZERO — and
       // worse, it zeroed `sum(cached)` and `avg(ratio)` in the same stats line, so the query
       // reported "0 cached tokens, 0% hit rate" against prod spans that plainly carried
       // cached=27,924 / ratio=0.886. Caught live 2026-09-09 by disbelieving the aggregate and
       // re-running the same window without that one term. Do NOT reintroduce sum() over a
-      // comparison here; `sum(receives > 1)` in sqs_queue_wait is the same bug, unfixed, and is
-      // why that query's `redelivered` column should not be trusted either.
+      // comparison here; ttfm_queue_wait carried the same bug and is fixed in the same commit.
       //
       // Grouping by the comparison is evaluated correctly and reads better anyway: one row per
       // (model, hit) with its own turn count and token sums, so a model that writes cache entries
@@ -722,8 +721,20 @@ const INSIGHTS = {
       '| fields attributes.dispatcher.queue_wait_ms as wait_ms, attributes.dispatcher.trigger as trigger,',
       '    attributes.dispatcher.queue_receive_count as receives',
       '| stats count(*) as turns, pct(wait_ms,50) as p50_ms, pct(wait_ms,95) as p95_ms,',
-      '    pct(wait_ms,99) as p99_ms, max(wait_ms) as max_ms, sum(receives > 1) as redelivered',
+      '    pct(wait_ms,99) as p99_ms, max(wait_ms) as max_ms, sum(receives) as recv_total',
       '  by trigger',
+      // REDELIVERIES BY ARITHMETIC, because `sum(receives > 1) as redelivered` — what this line was
+      // until 2026-09-09 — is silently ZERO. Logs Insights accepts sum() over a comparison and
+      // evaluates it to nothing, and it also zeroes sibling aggregates over the same field, so that
+      // column always read 0 no matter how many messages were redelivered (proven on the prompt-cache
+      // query, which reported 0 cached tokens for spans carrying 27,924).
+      //
+      // Every delivery increments queue_receive_count, so `sum(receives) - turns` is the number of
+      // EXTRA deliveries — a first delivery contributes 0, a message delivered three times
+      // contributes 2. That is a slightly different figure from the old column's intent (messages
+      // redelivered at least once) and a more actionable one: it counts the redundant work. Derived
+      // after stats, which is the one place Insights does evaluate arithmetic on aggregates.
+      '| fields recv_total - turns as redeliveries',
       '| sort turns desc',
     ].join('\n'),
   },
