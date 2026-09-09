@@ -110,7 +110,10 @@ const SSM_PARAMETERS = [
   // hindsight entry and no `slots.memory` at all, which is the documented off state. Setting an
   // empty string would NOT be equivalent in SSM (it cannot hold one) and is not needed.
   { key: 'HINDSIGHT_API_URL', required: false },
-  { key: 'HINDSIGHT_ORG_BANK_ID', required: false },
+  // NO HINDSIGHT_ORG_BANK_ID. It was here, published by modules/archie/ssm.tf and passed through to
+  // the runtime spec, and it could only ever do one thing: point a deployment at a bank other than
+  // the `default-org` one OpenClaw writes — an agent that has memory and recalls nothing, silently.
+  // Removed 2026-09-08; the bank is a constant in config-resolver/boot-config.mjs.
 ];
 
 // ── §4.3, second category: handles to Terraform resources with no name to look them up by ────────

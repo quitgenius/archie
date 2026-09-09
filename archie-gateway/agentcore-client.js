@@ -136,7 +136,6 @@ function baseConfig() {
     // in-account (§9.7(a): real prod cross-account read is the prod canary). Passed to runtimeEnv.
     readersAccount: process.env.AGENTCORE_READERS_ACCOUNT || '',
     hindsightApiUrl: process.env.HINDSIGHT_API_URL || '',
-    hindsightOrgBankId: process.env.HINDSIGHT_ORG_BANK_ID || '',
     // Optional injectable overrides consumed elsewhere:
     //   extraEnv        — extra runtime env vars merged into runtimeEnv()
     //   efsRootFor(name)→ path — override the AP root path (tests use run-tagged roots)
@@ -361,7 +360,9 @@ function createAgentCoreClient(overrides = {}) {
       // empty string would give the agent a memory slot pointing at a plugin it cannot use and a
       // "hindsight not configured" warning on every boot. Absent means absent.
       ...(config.hindsightApiUrl ? { HINDSIGHT_API_URL: config.hindsightApiUrl } : {}),
-      ...(config.hindsightOrgBankId ? { HINDSIGHT_ORG_BANK_ID: config.hindsightOrgBankId } : {}),
+      // The BANK is not passed. It is `default-org` for every agent in every deployment (a constant in
+      // config-resolver/boot-config.mjs), and the env var that used to override it is gone: the only
+      // outcome it had was one deployment recalling from a bank nothing writes to.
       ...(config.extraEnv || {}),
     };
   }
