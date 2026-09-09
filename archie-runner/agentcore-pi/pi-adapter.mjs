@@ -714,7 +714,15 @@ async function initHindsight() {
     // live permission state it could legitimately read — the deps are stashed and the extension is
     // built in getSession, where `decide` closes over the live grants Set and policy holder.
     HINDSIGHT_RECALL = recall;
-    HINDSIGHT_EXT_OPTS = { orgBankId, orgOnly: true, preamble: c.recallPromptPreamble, logger: console };
+    HINDSIGHT_EXT_OPTS = {
+      orgBankId, orgOnly: true, preamble: c.recallPromptPreamble, logger: console,
+      // Query-shaping knobs, ported with the plugin's own defaults (hindsight-extension.mjs applies
+      // them when absent). Read from config so a deployment can widen the budget without an image
+      // roll; sandra sets neither today, which is exactly why the defaults have to match the plugin.
+      recallContextTurns: c.recallContextTurns,
+      recallRoles: c.recallRoles,
+      recallMaxQueryChars: c.recallMaxQueryChars,
+    };
     // The knowledge TOOLS are org-bank-scoped, mirroring the plugin's factory (index.ts:2887-2898):
     // under orgOnly the bank is orgBankId and the url/token switch to the org ones when set. Unlike the
     // recall HOOK, which merges org + agent results, a tool reads exactly one bank.
