@@ -226,7 +226,8 @@ export function buildInjection({ results = [], orgResults = [], orgOnly = false,
 /**
  * Create the Pi extension factory for Hindsight recall.
  * @param recall  async (query) => { results?: Memory[], orgResults?: Memory[] }
- * @param opts    { orgBankId, agentBankId, orgOnly, preamble, minQueryChars, logger }
+ * @param opts    { orgBankId, agentBankId, orgOnly, preamble, minQueryChars, logger,
+ *                  getTurnKey, getNow }
  */
 export function createHindsightExtension(recall, opts = {}) {
   const {
@@ -236,6 +237,25 @@ export function createHindsightExtension(recall, opts = {}) {
     recallContextTurns = 1,
     recallRoles = ['user', 'assistant'],
     recallMaxQueryChars = 800,
+    // PROMPT-CACHE DISCIPLINE — the same rule clock-extension.mjs documents, which this extension
+    // was violating. `on('context')` fires ONCE PER PROVIDER REQUEST, so a tool-loop turn runs it
+    // again before every model call, and the injected block differed each time in two ways:
+    //   1. a fresh recall — same query (tool results are role 'toolResult', so the last USER message
+    //      does not move mid-turn), but a separate HTTP round trip whose results can differ; and
+    //   2. `Current time - …`, which is MINUTE precision. Archie turns run 20–50s, so this flips
+    //      inside a single turn routinely.
+    // The block is appended to the last user message, i.e. mid-history once tool results exist —
+    // so a block that changes per step rewrites the cached prefix ahead of every later message and
+    // the tail is re-processed uncached on every call of the loop. Memoising per TURN makes the
+    // injection byte-identical across that turn's requests, and cuts the recalls (and their
+    // latency) from one-per-model-call to one-per-turn.
+    //
+    // getTurnKey identifies the turn; the adapter passes the turn's start time, the same
+    // turn-stable value it hands the clock extension. Absent (unit tests, or a caller that wires
+    // neither), the memo is disabled and behaviour is exactly as before — never keyed on a
+    // fabricated constant, which would freeze one turn's memories into the whole session.
+    getTurnKey = null,
+    getNow = null,
   } = opts;
   // Tool-permission gate. Hindsight is not a tool (no tool_call hook), so recall/retain are gated
   // here: read = hindsight.read (baseline-allow), write = hindsight.write (default-deny). Default
@@ -245,10 +265,31 @@ export function createHindsightExtension(recall, opts = {}) {
     ? `(org bank: ${orgBankId})`
     : `(agent bank: ${agentBankId}${orgBankId ? `, org bank: ${orgBankId}` : ''})`;
 
+  // Per-turn memo: { key, injection }. `injection` may legitimately be '' (recall ran and found
+  // nothing) — the presence of the entry is what "already recalled this turn" means, so the
+  // empty-result case is remembered too rather than re-queried on every model call of the loop.
+  let memo = null;
+
   return (pi) => {
     pi.on('context', async (event) => {
       if (!can('hindsight.read')) { logger.info('hindsight recall: skipped (hindsight.read not granted)'); return; }
       const messages = event.messages;
+      // Turn already recalled → re-apply the SAME bytes. This is the cache-preserving path (see
+      // getTurnKey above); it is also why the log says `cached` rather than repeating the recall
+      // lines, so the @hindsight leg's signals still appear exactly once per turn.
+      const turnKey = getTurnKey ? getTurnKey() : null;
+      if (turnKey != null && memo && memo.key === turnKey) {
+        logger.info('hindsight recall: reusing this turn\'s memories (cached — prompt-cache stability)');
+        return memo.injection ? { messages: appendToLastUser(messages, memo.injection) } : undefined;
+      }
+      // Record the outcome for the rest of THIS turn. Called on every exit below, including the
+      // ones that inject nothing: a turn whose recall found nothing (or failed, or was skipped as
+      // noise) must not be retried before the next model call — a retry that later succeeded would
+      // insert a block mid-history and invalidate exactly the prefix this memo exists to protect.
+      const remember = (injection) => {
+        if (turnKey != null) memo = { key: turnKey, injection: injection || '' };
+        return injection ? { messages: appendToLastUser(messages, injection) } : undefined;
+      };
       const lastUser = [...messages].reverse().find((m) => m.role === 'user');
       const extracted = extractRecallQuery(textOf(lastUser));
       // The plugin's order: extract, then reject operational noise, then compose, then truncate.
@@ -256,7 +297,7 @@ export function createHindsightExtension(recall, opts = {}) {
       // whose recall found nothing.
       if (extracted && isEphemeralOperationalText(extracted)) {
         logger.info('hindsight recall: query is operational/ephemeral noise, skipping recall');
-        return;
+        return remember(null);
       }
       const composed = extracted
         ? composeRecallQuery(extracted, messages, recallContextTurns, recallRoles)
@@ -274,7 +315,7 @@ export function createHindsightExtension(recall, opts = {}) {
       }
       // Lifecycle marker the @hindsight leg waits for (recall runs at prompt-build time).
       logger.info(`hindsight recall (before_prompt_build): query=${query ? JSON.stringify(query.slice(0, 80)) : 'null'}`);
-      if (!query) return;
+      if (!query) return remember(null);
 
       let recalled;
       try {
@@ -283,20 +324,27 @@ export function createHindsightExtension(recall, opts = {}) {
         // Distinct wording — the leg asserts NOT /recall failed/i on the happy path; a
         // genuine failure SHOULD surface. Keep it greppable but out of the leg's negative.
         logger.warn(`hindsight recall error (bank ${orgBankId || agentBankId}): ${e?.message || e}`);
-        return;
+        return remember(null);
       }
 
       const results = recalled?.results ?? [];
       const orgResults = recalled?.orgResults ?? [];
       if (results.length === 0 && orgResults.length === 0) {
         logger.info('hindsight recall: No memories found for auto-recall');
-        return;
+        return remember(null);
       }
 
-      const injection = buildInjection({ results, orgResults, orgOnly, preamble });
+      // `now` is the TURN's clock, not this request's: the block carries a minute-precision
+      // "Current time - …" line, so a turn that crosses a minute boundary mid-tool-loop would
+      // otherwise emit different bytes for the same memories. Falls back to real now when the
+      // caller wires no clock.
+      const injection = buildInjection({
+        results, orgResults, orgOnly, preamble,
+        ...(getNow ? { now: new Date(getNow()) } : {}),
+      });
       const total = results.length + orgResults.length;
       logger.info(`hindsight recall: injecting ${total} memories into context ${bankLabel}`);
-      return { messages: appendToLastUser(messages, injection) };
+      return remember(injection);
     });
 
     // agent_end lifecycle observer (parity with the OpenClaw hindsight plugin's

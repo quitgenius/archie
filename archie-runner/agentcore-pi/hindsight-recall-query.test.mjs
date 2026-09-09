@@ -218,3 +218,97 @@ test('hook: the budget is configurable, and a wider one passes more through', as
   await handler({ messages: [{ role: 'user', content: 'y'.repeat(2000) }] });
   assert.equal(calls[0].length, 1500);
 });
+
+// ── PROMPT-CACHE STABILITY: one recall per TURN, not per provider request ──────────────────────
+//
+// `on('context')` fires before EVERY model call, so a tool-loop turn ran recall once per call and
+// injected a slightly different block each time (fresh results, and a minute-precision "Current
+// time" line). That block is appended to the last user message — mid-history once tool results
+// exist — so each rewrite invalidated the cached prefix ahead of every later message, on a turn
+// that had already paid to cache it. Same discipline clock-extension.mjs documents.
+//
+// The memo also cuts recall HTTP calls from one-per-model-call to one-per-turn, which is why the
+// call-count assertions matter as much as the byte-identity ones.
+
+const injectedText = (res) => res?.messages?.[0]?.content ?? null;
+const TURN_MS = Date.UTC(2026, 8, 9, 14, 30, 45); // a fixed turn clock; ms precision on purpose
+
+test('cache: three requests in one turn recall ONCE and inject byte-identical text', async () => {
+  const { handler, calls } = harness({
+    recalled: { orgResults: [{ text: 'pact is a contract testing tool' }] },
+    opts: { getTurnKey: () => TURN_MS, getNow: () => TURN_MS },
+  });
+  const msgs = [{ role: 'user', content: 'what do we know about pact?' }];
+  const a = await handler({ messages: msgs });
+  const b = await handler({ messages: msgs });
+  const c = await handler({ messages: msgs });
+  assert.equal(calls.length, 1, 'one recall for the whole turn, not one per model call');
+  assert.ok(injectedText(a).includes('<hindsight_memories>'));
+  assert.equal(injectedText(b), injectedText(a), 'byte-identical, or the cached tail is rewritten');
+  assert.equal(injectedText(c), injectedText(a));
+});
+
+test('cache: the next TURN recalls again — the memo is per turn, not per session', async () => {
+  let turn = TURN_MS;
+  const { handler, calls } = harness({
+    recalled: { orgResults: [{ text: 'a fact' }] },
+    opts: { getTurnKey: () => turn, getNow: () => turn },
+  });
+  const msgs = [{ role: 'user', content: 'what do we know about pact?' }];
+  await handler({ messages: msgs });
+  await handler({ messages: msgs });
+  assert.equal(calls.length, 1);
+  turn += 60_000;                       // a new turn, a minute later
+  await handler({ messages: msgs });
+  assert.equal(calls.length, 2, 'a new turn gets fresh memories');
+});
+
+test('cache: an empty recall is remembered, so the loop does not re-query all turn', async () => {
+  const { handler, calls, logs } = harness({
+    recalled: { orgResults: [] },
+    opts: { getTurnKey: () => TURN_MS, getNow: () => TURN_MS },
+  });
+  const msgs = [{ role: 'user', content: 'what do we know about pact?' }];
+  const first = await handler({ messages: msgs });
+  const second = await handler({ messages: msgs });
+  assert.equal(calls.length, 1);
+  assert.equal(first, undefined, 'nothing to inject');
+  assert.equal(second, undefined, 'and still nothing — not a retry that might now inject one');
+  assert.equal(logs.filter((l) => /No memories found for auto-recall/.test(l)).length, 1,
+    'and the leg-asserted signal appears once per turn, not once per model call');
+});
+
+test('cache: a failed recall is remembered too — a mid-turn retry would invalidate the prefix', async () => {
+  const logs = [];
+  const calls = [];
+  const factory = createHindsightExtension(async (q) => { calls.push(q); throw new Error('hindsight down'); }, {
+    orgBankId: 'default-org', orgOnly: true, can: () => true,
+    logger: { info: (m) => logs.push(m), warn: (m) => logs.push(m) },
+    getTurnKey: () => TURN_MS, getNow: () => TURN_MS,
+  });
+  let handler;
+  factory({ on: (name, fn) => { if (name === 'context') handler = fn; } });
+  const msgs = [{ role: 'user', content: 'what do we know about pact?' }];
+  await handler({ messages: msgs });
+  await handler({ messages: msgs });
+  assert.equal(calls.length, 1);
+  assert.equal(logs.filter((l) => /recall error/.test(l)).length, 1);
+});
+
+test('cache: the injected clock is the TURN clock, so it cannot tick mid-loop', async () => {
+  const { handler } = harness({
+    recalled: { orgResults: [{ text: 'a fact' }] },
+    opts: { getTurnKey: () => TURN_MS, getNow: () => TURN_MS },
+  });
+  const res = await handler({ messages: [{ role: 'user', content: 'what do we know about pact?' }] });
+  // 14:30:45 UTC renders at minute precision — the value a per-request clock would flip 15s later.
+  assert.ok(injectedText(res).includes('Current time - 2026-09-09 14:30 UTC'), injectedText(res));
+});
+
+test('cache: with no turn clock wired, behaviour is exactly as before (recall per request)', async () => {
+  const { handler, calls } = harness({ recalled: { orgResults: [{ text: 'a fact' }] } });
+  const msgs = [{ role: 'user', content: 'what do we know about pact?' }];
+  await handler({ messages: msgs });
+  await handler({ messages: msgs });
+  assert.equal(calls.length, 2, 'no memo is invented from a fabricated key');
+});
