@@ -168,7 +168,7 @@ const body = {
     // turn keeps succeeding — exactly what the Sonnet 5 default did on 2026-08-15 (92% hit rate the
     // day before, 0% after, discovered three weeks later). Appended rather than slotted next to row
     // 7b because inserting a row here renumbers every widget below it.
-    logWidget(0, 167, 24, 6, 'Prompt cache by MODEL — hit rate, cached share, cached vs uncached tokens, cost (0% = the gate is shut)', Q.INSIGHTS.prompt_cache_effect),
+    logWidget(0, 167, 24, 6, 'Prompt cache by MODEL × hit/miss — cached vs written vs uncached tokens, cached share, cost (no cache tokens at all = the gate is shut; writes with no reads = unstable prefix)', Q.INSIGHTS.prompt_cache_effect),
   ],
 };
 

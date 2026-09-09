@@ -225,21 +225,31 @@ const INSIGHTS = {
       // A no-op turn never reached the model, so it has no prompt and would drag hit_rate down for
       // a reason that has nothing to do with caching.
       '| filter ispresent(cached) and (cached > 0 or cache_write > 0 or uncached_in > 0)',
-      // hit_turns counts `cached > 0` rather than averaging the `agentcore.cache.hit` boolean
-      // attribute: sum() over a numeric comparison is the idiom Insights is known to evaluate here
-      // (same as `sum(receives > 1)` in sqs_queue_wait), whereas a JSON boolean's aggregate typing
-      // is not worth betting a dashboard on. The rate itself is computed AFTER stats, the pattern
-      // ttfm_phase_share already uses.
-      '| stats count(*) as turns, sum(cached > 0) as hit_turns, avg(ratio) as avg_cached_share,',
-      '    sum(cached) as cached_tokens, sum(cache_write) as written_tokens, sum(uncached_in) as uncached_tokens,',
+      // HIT/MISS IS A GROUPING KEY, NOT AN AGGREGATE, and that is not a style choice.
+      //
+      // This first shipped as `sum(cached > 0) as hit_turns`, on the precedent of
+      // `sum(receives > 1)` in sqs_queue_wait below. Insights accepts it and returns ZERO — and
+      // worse, it zeroed `sum(cached)` and `avg(ratio)` in the same stats line, so the query
+      // reported "0 cached tokens, 0% hit rate" against prod spans that plainly carried
+      // cached=27,924 / ratio=0.886. Caught live 2026-09-09 by disbelieving the aggregate and
+      // re-running the same window without that one term. Do NOT reintroduce sum() over a
+      // comparison here; `sum(receives > 1)` in sqs_queue_wait is the same bug, unfixed, and is
+      // why that query's `redelivered` column should not be trusted either.
+      //
+      // Grouping by the comparison is evaluated correctly and reads better anyway: one row per
+      // (model, hit) with its own turn count and token sums, so a model that writes cache entries
+      // and never reads them shows up as a big cache_hit=0 row with non-zero written_tokens —
+      // which is the prefix-instability signature, distinguishable from a shut gate (no rows with
+      // any cache tokens at all).
+      '| stats count(*) as turns, avg(ratio) as avg_cached_share,',
+      '    sum(cached) as cached_tokens, sum(cache_write) as written_tokens,',
+      '    sum(uncached_in) as uncached_tokens,',
       // NOT `sum(cost_usd) as cost_usd` — reusing the name of an already-defined ephemeral field is
       // a MalformedQueryException ("Ephemeral field is already defined"), caught by running this
       // against aws/spans before shipping it. Same reason for every other aggregate alias here.
-      '    sum(cost_usd) as cost_total_usd by model',
-      // ONLY the derived column here. Re-listing the stats columns to reorder them is also
-      // "Ephemeral field is already defined" — same lesson, one line further down.
-      '| fields hit_turns * 100 / turns as hit_rate_pct',
-      '| sort turns desc',
+      '    sum(cost_usd) as cost_total_usd',
+      '    by model, cached > 0 as cache_hit',
+      '| sort model asc, cache_hit desc',
     ].join('\n'),
   },
   // Turn outcome breakdown (P4): after error-disambiguation a benign empty/no-op turn reads
