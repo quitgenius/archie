@@ -121,6 +121,12 @@ const boundedMessage = (s) => {
   return t.length <= MAX_MESSAGE ? t : `${t.slice(0, MAX_MESSAGE)}…`;
 };
 
+/**
+ * FIRST LINE ONLY, for the thrown-tool message below. A stack trace or a multi-line body has its
+ * useful sentence first; taking the rest buys nothing and widens what can ride along.
+ */
+const firstLine = (s) => String(s).split('\n', 1)[0];
+
 const cleanCode = (v) => {
   if (typeof v === 'number' && Number.isFinite(v)) return String(v);
   if (typeof v !== 'string') return null;
@@ -158,6 +164,19 @@ export function toolOutcome(result, isError = false) {
       o.items = 1;
       o.failed = o.ok ? 0 : 1;
     }
+    // A THROWN tool with no envelope had NO message at all — `chars` and nothing else.
+    //
+    // Measured on dm-urbnxvak3l5, 2026-09-08/09: three `read` failures across two cron jobs, each
+    // `ok:false failed:1 chars:105` with `message` absent. The span's own status said "tool execution
+    // error"; the 105 characters naming the file went to the model and nowhere else, and they were not
+    // in the runtime logs either. Every non-Connector tool failure was permanently "something failed".
+    //
+    // GATED ON `isError`, NOT ON "no envelope". A thrown call's result text IS an error string by
+    // construction; an unparseable body from a call that merely returned something we could not read
+    // is DATA, and capturing that would widen this field from "the error an author wrote" to "any
+    // payload we failed to parse" — the one thing the note above MAX_MESSAGE rules out. First line
+    // only, and through the same cap as every other message.
+    if (isError && !o.message && text) o.message = boundedMessage(firstLine(text));
     return o;
   };
   if (!text) return finish(out);

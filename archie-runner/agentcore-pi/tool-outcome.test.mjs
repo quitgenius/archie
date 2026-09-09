@@ -254,3 +254,41 @@ test('a partially-failed batch still reports its real counts', () => {
   assert.equal(a['agent_i32pz9.tool.result.items'], 3);
   assert.equal(a['agent_i32pz9.tool.result.failed'], 1);
 });
+
+// ── thrown tools get a message (2026-09-09) ─────────────────────────────────────────────────────
+//
+// The gap: three `read` failures on dm-urbnxvak3l5 recorded `ok:false failed:1 chars:105` with NO
+// message. The span's status said "tool execution error"; the 105 characters naming the file reached
+// the model and nothing else — not the span, not the runtime log. Every non-Connector tool failure
+// read as "something failed".
+
+test('a THROWN tool with no envelope carries its error text as the message', () => {
+  const a = outcomeAttributes(toolOutcome('File not found: /workspace/notes/digest.md (ENOENT)', true));
+  assert.equal(a['agent_i32pz9.tool.result.ok'], false);
+  assert.equal(a['agent_i32pz9.tool.result.message'], 'File not found: /workspace/notes/digest.md (ENOENT)');
+});
+
+test('an UNPARSEABLE body that did NOT throw carries no message — that text is data, not an error', () => {
+  // The distinction the gate exists for. Capturing this would widen `message` from "the error an
+  // author wrote" to "any payload we failed to parse", which is what the MAX_MESSAGE note rules out.
+  const a = outcomeAttributes(toolOutcome('some,csv,data\n1,2,3', false));
+  assert.equal('agent_i32pz9.tool.result.message' in a, false);
+  assert.equal(a['agent_i32pz9.tool.result.declared'], false);
+});
+
+test('an envelope error still wins — the fallback never overwrites a real message', () => {
+  const a = outcomeAttributes(toolOutcome(mcp({ successful: false, error: 'upstream rejected the range' }), true));
+  assert.equal(a['agent_i32pz9.tool.result.message'], 'upstream rejected the range');
+});
+
+test('the thrown message is FIRST LINE only and capped', () => {
+  const long = `boom: ${'x'.repeat(400)}\nstack frame 1\nstack frame 2`;
+  const m = outcomeAttributes(toolOutcome(long, true))['agent_i32pz9.tool.result.message'];
+  assert.ok(!m.includes('stack frame'), 'must not carry the trace');
+  assert.ok(m.length <= 201, `capped, got ${m.length}`);
+  assert.ok(m.endsWith('…'), 'an elided marker says it was longer');
+});
+
+test('a thrown call with NO text gets no invented message', () => {
+  assert.equal('agent_i32pz9.tool.result.message' in outcomeAttributes(toolOutcome('', true)), false);
+});
