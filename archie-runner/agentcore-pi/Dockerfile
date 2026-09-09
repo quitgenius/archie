@@ -131,6 +131,15 @@ RUN npm install --omit=dev --no-fund --no-audit
 COPY agentcore-pi/patch-pi-ai-adaptive-thinking.mjs ./
 RUN node patch-pi-ai-adaptive-thinking.mjs && rm patch-pi-ai-adaptive-thinking.mjs
 
+# Teach the SAME pinned pi-ai that Claude 5 supports PROMPT CACHING — gated on the same kind of
+# hard-coded Claude 4 id list, in the same file. Its failure mode is the opposite of the one above,
+# and worse for it: turns keep succeeding, they just stop writing cache points and re-pay full price
+# for the entire prefix on every call. Measured 92% cache-hit before the fleet moved to Sonnet 5
+# (TURN-LATENCY-REPORT.md) and 0% after. Also FAILS THE BUILD if it cannot apply, because an
+# unpatched module is invisible at runtime.
+COPY agentcore-pi/patch-pi-ai-prompt-cache.mjs ./
+RUN node patch-pi-ai-prompt-cache.mjs && rm patch-pi-ai-prompt-cache.mjs
+
 # THIS LIST IS AN ALLOWLIST, and a module missing from it does not fail the build — it fails at
 # RUNTIME, on the agent's first invoke, as ERR_MODULE_NOT_FOUND. That is exactly how
 # config-fingerprint.mjs shipped broken: it was extracted out of pi-adapter.mjs (importing the
@@ -144,7 +153,8 @@ COPY agentcore-pi/pi-runtime.mjs agentcore-pi/pi-adapter.mjs agentcore-pi/config
      agentcore-pi/clock-extension.mjs \
      agentcore-pi/otel-export.cjs agentcore-pi/pi-entrypoint.mjs agentcore-pi/sse-contract.mjs \
      agentcore-pi/bedrock-dispatch-mark.mjs \
-     agentcore-pi/reply-usage.mjs agentcore-pi/turn-outcome.mjs agentcore-pi/tool-outcome.mjs \
+     agentcore-pi/reply-usage.mjs agentcore-pi/usage-attrs.mjs \
+     agentcore-pi/turn-outcome.mjs agentcore-pi/tool-outcome.mjs \
      agentcore-pi/dispatcher-client.mjs \
      agentcore-pi/cron-tool-core.mjs agentcore-pi/cron-tool.mjs agentcore-pi/workspace-seed.mjs \
      agentcore-pi/skill-sync.mjs agentcore-pi/skill-scope.mjs agentcore-pi/tls-scoped.mjs \

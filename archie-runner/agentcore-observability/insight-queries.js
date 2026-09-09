@@ -171,11 +171,19 @@ const TTFM_COLD_KEY = `prov_start < ${NO_SPAN} as cold`;
 // --- Logs Insights queries (name -> { logGroups, query }) ---
 // Field paths use CloudWatch's flattened dotted keys (verified against aws/spans).
 const INSIGHTS = {
+  // `in_tokens` IS NOT THE PROMPT SIZE. Under prompt caching it is the uncached remainder only —
+  // TURN-LATENCY-REPORT.md §3 measured a p50 of ONE token. Every column below that matters for
+  // "how big / how expensive was this turn" comes from the cache-aware attributes instead:
+  // prompt_tokens (the true prompt size), cached (read tokens), cache_ratio, cost_usd, calls.
   genai_turns: {
     logGroups: [SPANS_LG],
     query: [
       'fields @timestamp, attributes.session.id as session, attributes.agent_i32pz9.request.model as model,',
-      '  attributes.agent_i32pz9.usage.input_tokens as in_tokens, attributes.agent_i32pz9.usage.output_tokens as out_tokens,',
+      '  attributes.agent_i32pz9.usage.input_tokens as uncached_in, attributes.agent_i32pz9.usage.output_tokens as out_tokens,',
+      '  attributes.agent_i32pz9.usage.total_prompt_tokens as prompt_tokens,',
+      '  attributes.agent_i32pz9.usage.cache_read_tokens as cached, attributes.agent_i32pz9.usage.cache_write_tokens as cache_write,',
+      '  attributes.agentcore.cache.read_ratio as cache_ratio, attributes.agent_i32pz9.usage.cost_usd as cost_usd,',
+      '  attributes.agent_i32pz9.usage.model_calls as calls,',
       '  attributes.agent_i32pz9.response.finish_reasons as finish, durationNano/1000000 as duration_ms',
       "| filter attributes.agent_i32pz9.operation.name = 'agent_i073q7'",
       '| sort @timestamp desc | limit 50',
@@ -184,9 +192,54 @@ const INSIGHTS = {
   genai_tokens_over_time: {
     logGroups: [SPANS_LG],
     query: [
-      'fields attributes.agent_i32pz9.usage.input_tokens as in_tokens, attributes.agent_i32pz9.usage.output_tokens as out_tokens',
+      'fields attributes.agent_i32pz9.usage.input_tokens as uncached_in, attributes.agent_i32pz9.usage.output_tokens as out_tokens,',
+      '  attributes.agent_i32pz9.usage.cache_read_tokens as cached, attributes.agent_i32pz9.usage.cache_write_tokens as cache_write,',
+      '  attributes.agent_i32pz9.usage.cost_usd as cost_usd',
       "| filter attributes.agent_i32pz9.operation.name = 'agent_i073q7'",
-      '| stats sum(in_tokens) as input_tokens, sum(out_tokens) as output_tokens by bin(5m)',
+      // uncached_in + cached + cache_write is the whole billed prompt; splitting it three ways is
+      // the point — the same total costs ~10x less when it arrives as `cached`.
+      '| stats sum(uncached_in) as uncached_prompt_tokens, sum(cached) as cached_prompt_tokens,',
+      '    sum(cache_write) as cache_write_tokens, sum(out_tokens) as output_tokens,',
+      // `as cost_total_usd`, not `as cost_usd`: an aggregate may not reuse the name of the ephemeral
+      // field it reads from (MalformedQueryException). Verified against aws/spans.
+      '    sum(cost_usd) as cost_total_usd by bin(5m)',
+    ].join('\n'),
+  },
+  // THE CACHE-EFFECT VIEW, per model. This is the query that would have caught the Sonnet 5
+  // regression on the day it shipped (2026-08-15): pi-ai gates cache points on a hard-coded model
+  // list, so moving the fleet to a model it did not know silently dropped hit_rate to 0 while every
+  // turn kept succeeding. Cut by model because that is the axis the gate keys on.
+  //
+  // Read it as: hit_rate ≈ 1 and cached_share ≈ 1 is healthy. hit_rate 0 across a busy window means
+  // no cache points are being written at all (model gate, or caching switched off). hit_rate high
+  // with a LOW cached_share means the prefix keeps shifting — tool-set churn or a per-turn edit
+  // landing ahead of the breakpoint — so entries get written and never meaningfully read.
+  prompt_cache_effect: {
+    logGroups: [SPANS_LG],
+    query: [
+      'fields attributes.agent_i32pz9.request.model as model,',
+      '  attributes.agentcore.cache.read_ratio as ratio,',
+      '  attributes.agent_i32pz9.usage.cache_read_tokens as cached, attributes.agent_i32pz9.usage.cache_write_tokens as cache_write,',
+      '  attributes.agent_i32pz9.usage.input_tokens as uncached_in, attributes.agent_i32pz9.usage.cost_usd as cost_usd',
+      "| filter attributes.agent_i32pz9.operation.name = 'agent_i073q7'",
+      // A no-op turn never reached the model, so it has no prompt and would drag hit_rate down for
+      // a reason that has nothing to do with caching.
+      '| filter ispresent(cached) and (cached > 0 or cache_write > 0 or uncached_in > 0)',
+      // hit_turns counts `cached > 0` rather than averaging the `agentcore.cache.hit` boolean
+      // attribute: sum() over a numeric comparison is the idiom Insights is known to evaluate here
+      // (same as `sum(receives > 1)` in sqs_queue_wait), whereas a JSON boolean's aggregate typing
+      // is not worth betting a dashboard on. The rate itself is computed AFTER stats, the pattern
+      // ttfm_phase_share already uses.
+      '| stats count(*) as turns, sum(cached > 0) as hit_turns, avg(ratio) as avg_cached_share,',
+      '    sum(cached) as cached_tokens, sum(cache_write) as written_tokens, sum(uncached_in) as uncached_tokens,',
+      // NOT `sum(cost_usd) as cost_usd` — reusing the name of an already-defined ephemeral field is
+      // a MalformedQueryException ("Ephemeral field is already defined"), caught by running this
+      // against aws/spans before shipping it. Same reason for every other aggregate alias here.
+      '    sum(cost_usd) as cost_total_usd by model',
+      // ONLY the derived column here. Re-listing the stats columns to reorder them is also
+      // "Ephemeral field is already defined" — same lesson, one line further down.
+      '| fields hit_turns * 100 / turns as hit_rate_pct',
+      '| sort turns desc',
     ].join('\n'),
   },
   // Turn outcome breakdown (P4): after error-disambiguation a benign empty/no-op turn reads

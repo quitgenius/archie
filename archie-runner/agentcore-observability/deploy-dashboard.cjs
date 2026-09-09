@@ -162,6 +162,13 @@ const body = {
     // quotas in bedrock-agentcore have no AWS/Usage metric, so the dispatcher counts it itself.
     metricWidget(0, 161, 12, 6, 'AgentCore runtimes vs account quota (alarmed at 900 of 1,000)', [M.agentRuntimeCount, M.agentRuntimeQuota]),
     metricWidget(12, 161, 12, 6, 'Runtimes by status — DELETING holds its quota slot for ~5 min', [M.agentRuntimeByStatus]),
+    // Row 24 — PROMPT CACHE, cut BY MODEL (the metric widgets in row 7b are cut by agent, which is
+    // the wrong axis for the failure this catches). pi-ai gates Bedrock cache points on a hard-coded
+    // model list, so moving the fleet to a model it does not know silently stops caching while every
+    // turn keeps succeeding — exactly what the Sonnet 5 default did on 2026-08-15 (92% hit rate the
+    // day before, 0% after, discovered three weeks later). Appended rather than slotted next to row
+    // 7b because inserting a row here renumbers every widget below it.
+    logWidget(0, 167, 24, 6, 'Prompt cache by MODEL — hit rate, cached share, cached vs uncached tokens, cost (0% = the gate is shut)', Q.INSIGHTS.prompt_cache_effect),
   ],
 };
 

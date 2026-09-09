@@ -26,6 +26,9 @@ import { buildClientRecall } from './hindsight-client-recall.mjs';
 import { wantsStream, encodeSse, finalEvent, errorEvent, SSE_HEADERS } from './sse-contract.mjs';
 import * as bedrockMark from './bedrock-dispatch-mark.mjs';
 import { planReplyMetrics } from './reply-usage.mjs';
+import {
+  usageIn, usageOut, cacheCostAttrs, turnUsageAttrs,
+} from './usage-attrs.mjs';
 import { classifyTurn } from './turn-outcome.mjs';
 import { seedWorkspace } from './workspace-seed.mjs';
 import { syncSkills } from './skill-sync.mjs';
@@ -54,13 +57,8 @@ const PLUGINS_DIR = process.env.PI_PLUGINS_DIR || '/app/plugins';
 // observability queries/dashboard apply. AGENTCORE_OTEL_MODE: xray|stdout|off.
 const { createExporter } = requireCjs('./otel-export.cjs');
 let otel = null; // set in boot()
-// pi-ai usage shape: { input, output, cacheRead, cacheWrite, totalTokens, ... }
-const usageIn = (u) => (u ? (u.input ?? u.inputTokens ?? u.promptTokens) : undefined);
-const usageOut = (u) => (u ? (u.output ?? u.outputTokens ?? u.completionTokens) : undefined);
-// Prompt-cache token volumes (cache is a big chunk of real context + cost, and usage.input alone
-// hides it). Fall back across alt field names; undefined when usage absent (emit sites guard `|| 0`).
-const usageCacheRead = (u) => (u ? (u.cacheRead ?? u.cacheReadTokens ?? u.cacheReadInputTokens) : undefined);
-const usageCacheWrite = (u) => (u ? (u.cacheWrite ?? u.cacheWriteTokens ?? u.cacheCreationInputTokens) : undefined);
+// Token/cache/cost span attributes live in usage-attrs.mjs (importing this file runs boot(), so
+// they were untestable here, and the turn/per-call sites must not drift apart).
 
 // Resolve THIS runtime's own resource id for per-runtime span attribution (P0). The runtime ARN
 // carries a random suffix minted at CreateAgentRuntime, so the dispatcher can't inject it into
@@ -227,15 +225,26 @@ function emitBootFailed(err) {
 // AgentCore/Pi, dims Agent and Agent+Model (bounded cardinality — rich cuts stay in spans/logs).
 // TtftMs only carries on stream turns. TurnErrorCount counts only REAL errors (P4 classification),
 // so alarms don't fire on benign empty/no-op turns.
-function emitTurnMetrics({ latencyMs, ttftMs, tokensIn, tokensOut, cacheReadTokens, cacheWriteTokens, model, isError, costUsd }) {
+function emitTurnMetrics({
+  latencyMs, ttftMs, tokensIn, tokensOut, cacheReadTokens, cacheWriteTokens, contextTokens: contextTokensIn,
+  model, isError, costUsd,
+}) {
   try {
     // Prompt-cache token volumes + a cache-hit signal. cacheRead>0 means this turn reused a cached
     // prompt prefix; TurnCacheHit=1/0 makes cache-hit RATE a 1-line Average(TurnCacheHit) query.
-    // TurnTokensContext = input+cacheRead+cacheWrite = the TRUE prompt size (usage.input under-reports
-    // under prompt caching). All guarded `|| 0` — never NaN. TurnTokensInput/Output semantics unchanged.
+    // TurnTokensContext = the TRUE prompt size (usage.input under-reports under prompt caching).
+    // All guarded `|| 0` — never NaN. TurnTokensInput/Output semantics unchanged.
     const cacheRead = Math.max(0, Math.round(cacheReadTokens || 0));
     const cacheWrite = Math.max(0, Math.round(cacheWriteTokens || 0));
-    const contextTokens = (tokensIn || 0) + cacheRead + cacheWrite;
+    // PREFER the caller's contextTokens. planReplyMetrics computes it from the LAST model call
+    // (reply-usage.mjs: prompt size is not summable — each call re-sends the whole conversation), and
+    // this function used to ignore it and re-derive from the SUMMED billed tokens, which counts the
+    // same prompt once per call. A 4-call tool loop over a 30k prompt read as ~120k of "context",
+    // i.e. the metric that exists to answer "is this session getting too big" said yes for any turn
+    // that used tools. The sum stays as the fallback for callers with no per-call record.
+    const contextTokens = Number.isFinite(contextTokensIn)
+      ? Math.max(0, Math.round(contextTokensIn))
+      : (tokensIn || 0) + cacheRead + cacheWrite;
     const metricDefs = [
       // TurnLatencyMs is emitted ONLY when a latency was supplied. Per-reply metrics attribute the
       // per-invoke latency to the first reply alone (see planReplyMetrics), so later replies omit it;
@@ -503,8 +512,10 @@ async function emitModelCallSpans(parent, modelCalls, sessionId, turnStartMs) {
           'agent_i32pz9.response.finish_reasons': mc.stopReason,
           'agent_i32pz9.usage.input_tokens': usageIn(u),
           'agent_i32pz9.usage.output_tokens': usageOut(u),
-          'agent_i32pz9.usage.cache_read_tokens': usageCacheRead(u),
-          'agent_i32pz9.usage.cache_write_tokens': usageCacheWrite(u),
+          // Per-CALL cache + cost. Each Bedrock call is billed separately (a prefix re-read on call
+          // 3 costs money on call 3), so these are the honest per-request figures — and the place
+          // to look when a tool loop's later calls stop hitting cache while the first one did.
+          ...cacheCostAttrs(u),
           ...(dispatchMs != null && mc.startMs != null
             ? { 'agentcore.model.ttfb_ms': mc.startMs - dispatchMs } : {}),
           'agent_i32pz9.conversation.id': sessionId,
@@ -1275,6 +1286,12 @@ async function getSession(key, seed = {}) {
   if (HINDSIGHT_RECALL) {
     extensionFactories.push(createHindsightExtension(HINDSIGHT_RECALL, {
       ...HINDSIGHT_EXT_OPTS, can: makeCan(decide, { agent: AGENT_NAME, channel, surface: 'hindsight' }),
+      // Recall runs on Pi's `context` hook, which fires once per PROVIDER REQUEST — so a tool loop
+      // re-recalled (and re-timestamped) its injection before every model call, rewriting the
+      // cached prefix mid-turn. Both callbacks read the same turn-stable clock the clock extension
+      // uses, which makes the injected block byte-identical across the turn's requests.
+      getTurnKey: () => turnCtx.turnStartedAtMs,
+      getNow: () => turnCtx.turnStartedAtMs || Date.now(),
     }));
   }
   // Clock LAST: hindsight extracts its recall query from the last user message, so it must
@@ -1408,10 +1425,8 @@ async function handler(req, res) {
         'agent_i32pz9.conversation.id': sessionId,
         'session.id': sessionId,
         'agent_i32pz9.request.model': out.model || MODEL.id,
-        'agent_i32pz9.usage.input_tokens': usageIn(out.usage),
-        'agent_i32pz9.usage.output_tokens': usageOut(out.usage),
-        'agent_i32pz9.usage.cache_read_tokens': usageCacheRead(out.usage),   // prompt-cache reuse (big cost lever)
-        'agent_i32pz9.usage.cache_write_tokens': usageCacheWrite(out.usage), // prompt-cache creation
+        // Tokens/cache/cost for the WHOLE turn, not just its last model call — see turnUsageAttrs.
+        ...turnUsageAttrs(out),
         'agent_i32pz9.response.finish_reasons': cls.finishReasons,      // P4: 'stop' for empty no-ops
         'agentcore.turn.outcome': cls.outcome,                    // P4: reply|empty|error
         'agentcore.turn.trigger': trigger,                        // user|cron — cron-fire filterable on the runtime span
