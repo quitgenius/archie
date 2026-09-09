@@ -378,23 +378,54 @@ async function enumerateAgents(aws, ctx, values, deps = {}, out = null) {
 /**
  * Which agents still need staging — PURE, so the re-runnability rule is testable without AWS.
  *
- * SKIP means: this agent already has a binding for THIS tag that is both healthy
+ * SKIP means: this agent already has a binding for THIS SPEC that is both healthy
  * (`healthcheck === 'ok'`) and live (an `arn` is present). Anything else is re-staged, and the saga
  * is idempotent — it adopts an existing runtime by name rather than duplicating it
  * (`agentcore-provisioning.js:448-470`). A row whose arn was REMOVEd is history, not a binding: the
  * reaper strips the arn precisely so a rollback does not "invoke a corpse"
  * (`runtime-registry.js:30-37`), so it must re-provision.
+ *
+ * THIS SPEC, NOT THIS TAG — `expectedNameFor` is what makes that true, and without it the whole
+ * pre-warm silently does nothing whenever the spec moves under an unchanged tag.
+ *
+ * The runtime NAME is a fingerprint of the per-agent spec, of which the image is only one input
+ * (`agentcore-client.generationRuntimeName`), and bindings are "one row per agent per spec"
+ * (`lib/bindings.js:3`). So a `runtimeEnv` change — adding HINDSIGHT_API_URL, say — mints a new name
+ * while `tagOf(b)` still matches: every agent then had a healthy binding for the tag, every agent was
+ * skipped, and `fleet deploy` reported `staged 7/7 · gate passed · 0 stragglers` with six of seven
+ * agents not on the name their next turn would ask for. `fleet drift` reported exactly those six, and
+ * `fleet drift --fix` delegated here and printed `fixed` beside its own `not live 6`. Measured in prod
+ * 2026-09-09 (internal decision).
+ *
+ * Deriving the expected name is the caller's job and it must come from the SAME place the dispatcher
+ * derives from — the deployed task definition — which is the rule step 4 states for provisioning and
+ * which planning has to obey too, or planning and provisioning disagree about what is already done.
+ * A null/absent `expectedNameFor`, or one that throws for an agent, falls back to the tag-only
+ * behaviour rather than failing the run: a plan that cannot name the spec is still better than no
+ * plan, and that is also what keeps this function pure and testable.
  */
-function planStage(agents, bindings, tag) {
+function planStage(agents, bindings, tag, expectedNameFor = null) {
   const byAgent = new Map();
   for (const b of bindings) {
     if (tagOf(b) !== tag) continue;
-    byAgent.set(b.agent, b);
+    if (!byAgent.has(b.agent)) byAgent.set(b.agent, []);
+    byAgent.get(b.agent).push(b);
   }
   const todo = [];
   const skipped = [];
   for (const agent of agents) {
-    const b = byAgent.get(agent);
+    const rows = byAgent.get(agent) || [];
+    let want = null;
+    if (expectedNameFor) {
+      try { want = expectedNameFor(agent) || null; } catch { want = null; }
+    }
+    // With a derived name, only the row FOR THAT NAME counts. Without one, keep the historical
+    // last-row-wins behaviour.
+    const b = want ? rows.find((r) => r.runtimeName === want) : rows[rows.length - 1];
+    if (!b && want && rows.length) {
+      todo.push({ agent, reason: `spec changed — this spec derives ${want}, bindings are ${rows.map((r) => r.runtimeName).join(', ')}` });
+      continue;
+    }
     if (b && b.arn && b.healthcheck === 'ok') {
       skipped.push({ agent, runtimeName: b.runtimeName || null, reason: 'already staged and healthy' });
     } else if (b && b.arn) {
@@ -826,9 +857,16 @@ async function stage(ctx, args, out, deps = {}) {
   }
 
   // 3. THE ROSTER and what is already done.
+  //
+  // The dispatcher client is built HERE rather than at step 4 because planning needs the same derived
+  // name provisioning does — see planStage's note. Built once and reused, so there is exactly one
+  // answer to "what does this deployment derive" per run.
   const { agents } = await enumerateAgents(aws, ctx, values, deps, out);
   const bindings = await scanBindings(aws, ctx);
-  const { todo, skipped } = planStage(agents, bindings, tag);
+  const client = deps.client || dispatcherClientFor(ctx, account, deps);
+  const runtimeNameFor = runtimeNameFn(deps);
+  const expectedNameFor = (agent) => runtimeNameFor(agent, derivedSpecFor(client, agent, imageUri));
+  const { todo, skipped } = planStage(agents, bindings, tag, expectedNameFor);
 
   out.progress(`staging ${todo.length} of ${agents.length} agent(s) onto ${tag}  (concurrency ${concurrency})`
     + (skipped.length ? ` · ${skipped.length} already staged and healthy` : ''));
@@ -874,8 +912,8 @@ async function stage(ctx, args, out, deps = {}) {
   //    There is no stored spec to configure it from any more, and that is the point: the name this
   //    derives has to be the name the dispatcher will derive, which means deriving from the same
   //    place rather than from a record of what someone once declared.
-  const client = deps.client || dispatcherClientFor(ctx, account, deps);
-  const runtimeNameFor = runtimeNameFn(deps);
+  // `client` and `runtimeNameFor` are the ones step 3 planned with — deliberately not rebuilt, so
+  // planning and provisioning cannot disagree about the name.
   const digestOf = (declared) => specDigestFor(declared, deps).specDigest;
 
   const run = {
