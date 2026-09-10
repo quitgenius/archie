@@ -15,7 +15,7 @@
 //
 // It also pins the MAJOR version, because the policy semantics were verified against 4.12.0 — the
 // permit/forbid pair, the fail-closed ScopeGroup behaviour, `like` being case-sensitive, and enumerated
-// entity types all measured against that engine (archie-cedar-spike/README.md). A major bump could
+// entity types all measured against that engine (archie-docs/archie-cedar-spike/README.md). A major bump could
 // change evaluation, so it should be a deliberate act with the spike re-run, not a lockfile drift.
 
 const { test } = require('node:test');

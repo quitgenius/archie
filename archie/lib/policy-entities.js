@@ -5,7 +5,7 @@
 // Cedar splits a policy into three inputs: the POLICY TEXT (what is true), the SCHEMA (what the words
 // mean), and the ENTITY DATA (who is in which group). This module is the third. The whole design turns
 // on that split, because it is what lets one shared `semantics.cedar` mean the same thing in every
-// account while membership varies per environment — see archie-cedar-spike/README.md §1-4 for the
+// account while membership varies per environment — see archie-docs/archie-cedar-spike/README.md §1-4 for the
 // three ways the obvious alternative (a policy TEMPLATE) was measured to fail, one of them by meaning
 // the exact opposite of what was intended.
 //

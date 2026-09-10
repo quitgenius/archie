@@ -66,7 +66,7 @@ const BASELINE_GROUP = 'baseline';
  * `"type": "commonjs"`. Since `archie/` is CommonJS, going through the root would force
  * `await import()` and make every function in this file async for no gain. It is the same wasm — the
  * spike loaded `package/nodejs/cedar_wasm.js` directly and every measurement in
- * archie-cedar-spike/README.md came from it.
+ * archie-docs/archie-cedar-spike/README.md came from it.
  *
  * lib/policy-engine.test.js is what keeps this dependency in the CLI and out of both images, and pins
  * the major: the semantics below were verified against 4.12.0.

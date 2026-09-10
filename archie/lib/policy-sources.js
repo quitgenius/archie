@@ -29,7 +29,7 @@ const DOCKER = path.resolve(__dirname, '..', '..');
 /**
  * WHERE THE POLICY SOURCES LIVE — `docker/policy/`, and the location is now load-bearing (R8).
  *
- * They were authored beside the Cedar spike (`archie-cedar-spike/policy/`) and stayed there while their
+ * They were authored beside the Cedar spike (`archie-docs/archie-cedar-spike/policy/`) and stayed there while their
  * final home was undecided. Moved under `docker/` on 2026-08-18 for one concrete reason: `lib/digest.js`
  * resolves every declared input relative to `docker/`, so anything above it CANNOT be an image input.
  * While the sources sat outside:
