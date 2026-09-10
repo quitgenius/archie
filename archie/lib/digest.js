@@ -170,6 +170,12 @@ const IMAGES = {
       { path: 'archie-gateway/sdk-http.js' },
       { path: 'archie-gateway/slack-proxy-routes.js' },
       { path: 'archie-gateway/runtime-registry.js' },
+
+      // The custom-MCP client (Connector REST + the validators + key resolution). Declared the moment
+      // it joined the Dockerfile's COPY line, because the bidirectional test below is what would
+      // otherwise have caught it later: a change to ONLY this file would have produced an unchanged
+      // tag, and `gateway deploy` would have reported success having shipped nothing.
+      { path: 'archie-gateway/custom-mcp.js' },
       { path: 'archie-gateway/cron-service.js' },
       { path: 'archie-gateway/cron-runner.js' },
       { path: 'archie-gateway/cron-store.js' },

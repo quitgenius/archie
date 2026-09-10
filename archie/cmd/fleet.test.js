@@ -473,32 +473,40 @@ test('build: a derived tag already in ECR skips the build AND the push', async (
   assert.match(text, /already in ECR/);
 });
 
-test('build --dry-run: prints the make command and the push, and runs nothing', async () => {
-  // ALSO the guard on the Makefile itself: `assertMakeConstraints` reads the REAL Makefile before the
-  // dry-run branch, so this fails if the target stops passing --platform=linux/arm64, `lintroot=.`,
-  // the ./archie-runner context or $(AGENTCORE_PI_TAG) — the last of which would silently ignore our
-  // tag and publish content under a name it does not contain.
+test('build --dry-run: prints the docker command and the push, and runs nothing', async () => {
+  // The command is printed in full BECAUSE it is ours now: it used to be `make build-agentcore-pi`
+  // plus an assertMakeConstraints that read the real Makefile to prove the recipe still passed the
+  // three constraints. Owning the argv replaces that check — there is no recipe left to drift — so
+  // what this pins instead is that every constraint appears in what we would actually run.
   const { result, text } = await runBuild(ctxFor({ dryRun: true }), { push: true }, {
     ecr: fakeEcr(false), run: () => assert.fail('a dry run must not shell out'),
   });
-  assert.match(text, /would run: make -C .* build-agentcore-pi AGENTCORE_PI_TAG=content-[0-9a-f]{16}/);
+  assert.match(text, /would run: docker build --platform=linux\/arm64 --pull --build-context lintroot=\. -t agentcore-pi:content-[0-9a-f]{16} -f \.\/archie-runner\/agentcore-pi\/Dockerfile \.\/archie-runner/);
   assert.match(text, new RegExp(`would push: .*${NAME}-agentcore:content-[0-9a-f]{16}`));
   assert.equal(result.built, false);
   assert.equal(result.pushed, false);
   assert.equal(result.dryRun, true);
 });
 
-test('build --push: the Makefile builds, and the push goes to the CLI\'s registry, not the Makefile\'s', async () => {
-  // The build stays in `make` because the three constraints live there; the PUSH does not, and
-  // `make push-agentcore-pi` has been deleted for it — it hard-coded registry, account and profile as
-  // sandbox literals, whereas every resource this CLI touches comes from --name/--region/the caller.
+test('build --push: docker builds with all three constraints, and the push targets the CLI\'s registry', async () => {
+  // Both halves are the CLI's. `make push-agentcore-pi` went first (it hard-coded registry, account
+  // and profile as sandbox literals, whereas every resource this CLI touches comes from
+  // --name/--region/the caller) and `make build-agentcore-pi` followed on 2026-09-10.
   const ran = [];
   const { result } = await runBuild(ctxFor(), { push: true }, {
     ecr: fakeEcr(false),
     run: (cmd, argv) => { ran.push([cmd, argv]); return ''; },
   });
-  assert.equal(ran[0][0], 'make');
-  assert.ok(ran[0][1].includes('build-agentcore-pi'), `make target: ${ran[0][1].join(' ')}`);
+  assert.equal(ran[0][0], 'docker');
+  const argv = ran[0][1].join(' ');
+  // arm64: an amd64 agent image cannot run in a microVM at all.
+  assert.ok(argv.includes('--platform=linux/arm64'), argv);
+  // lintroot: the eslint gate's first `COPY --from=lintroot` fails without it.
+  assert.ok(argv.includes('--build-context lintroot=.'), argv);
+  // ./archie-runner, NOT agentcore-pi/ — the Dockerfile COPYs sibling packages.
+  assert.ok(argv.endsWith('./archie-runner'), argv);
+  // and OUR tag reaches the image, so a published tag names the content it contains.
+  assert.match(argv, /-t agentcore-pi:content-[0-9a-f]{16}/);
   assert.ok(ran.some(([c, a]) => c === 'docker' && a[0] === 'login'), 'ECR auth is per-account and per-region');
   assert.deepEqual(ran.filter(([c, a]) => c === 'docker' && a[0] === 'push').map(([, a]) => a[1]), [result.image]);
   assert.equal(result.built, true);
@@ -549,7 +557,7 @@ test('fleet deploy BUILDS an absent tag itself instead of refusing', async () =>
     run: (cmd, argv) => { ran.push(cmd); if (cmd === 'docker' && argv[0] === 'push') published = true; return ''; },
   });
 
-  assert.ok(ran.includes('make'), 'it built rather than telling the operator to run another command');
+  assert.ok(ran.includes('docker'), 'it built rather than telling the operator to run another command');
   assert.ok(published, 'and pushed, or staging would refuse the tag one step later');
   assert.equal(result.imageTag, TAG);
   assert.deepEqual(s.names(), ['gc', 'stage', 'publish'], 'and the release still completed');

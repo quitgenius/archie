@@ -56,15 +56,44 @@ const { diffObserved } = require('../../archie-gateway/spec-diff');
 const { adoptedRootFor, legacyEfsRootOf } = require('../lib/efs-root');
 const { runtimeIdOf } = require('../../archie-gateway/runtime-registry');
 
-// AgentCore microVMs are arm64. Not overridable — §2.6, Makefile:59-68.
+// ── the agent image build ────────────────────────────────────────────────────────────────────────
+//
+// THE BUILD IS THE CLI'S. It used to be `make build-agentcore-pi`, guarded by an
+// `assertMakeConstraints` that read the Makefile and refused a recipe which had stopped passing any
+// of the three constraints below. Both are gone (2026-09-10): the Makefile target was the last
+// archie-shaped thing left in a file that otherwise serves the OpenClaw stack, and checking a recipe
+// we could simply own was a longer way to reach the same guarantee. `archie gateway build` already
+// ran docker itself; this makes the two halves consistent.
+//
+// The three constraints §2.6 says this command "applies and does not let you override" are now
+// literals in one array, so there is nothing to delegate and nothing to verify:
+//
+//   1. PLATFORM — AgentCore microVMs are arm64. An amd64 agent image cannot run at all.
+//   2. BUILD_CONTEXT is ./archie-runner, NOT agentcore-pi/ — the Dockerfile COPYs the sibling
+//      plugin-sdk/ and connector-session-plugin/ sources, so a narrower context fails on the first
+//      COPY.
+//   3. `--build-context lintroot=.` — the eslint gate's first `COPY --from=lintroot` fails without
+//      it, because the config lives one level above this image's context.
+//
+// The local tag is ours too, and `LOCAL_IMAGE` is what the BDD harness matches on
+// (agentcore-tests/features/support/agent-image.js).
 const PLATFORM = 'linux/arm64';
-const MAKE_TARGET = 'build-agentcore-pi';
-// The build context, named ONCE because two places have to agree about it: `assertMakeConstraints`
-// refuses a Makefile that stopped passing it, and the `building` progress line reports it. They
-// disagreed until 2026-08-17 — the progress line still said `./clawdbot`, the pre-rename path
-// (b85027f97) — and that is exactly the detail an operator trusts when a COPY fails and they are
-// working out which tree the daemon was sent.
 const BUILD_CONTEXT = './archie-runner';
+const LOCAL_IMAGE = 'agentcore-pi';
+const DOCKERFILE = './archie-runner/agentcore-pi/Dockerfile';
+
+/** The docker argv for the agent image, tag included. One place, so the flags cannot drift. */
+function agentBuildArgs(tag) {
+  return [
+    'build',
+    `--platform=${PLATFORM}`,
+    '--pull',
+    '--build-context', 'lintroot=.',
+    '-t', `${LOCAL_IMAGE}:${tag}`,
+    '-f', DOCKERFILE,
+    BUILD_CONTEXT,
+  ];
+}
 
 /** The answer, shaped for the reader: an object under --json, a block otherwise. */
 const answer = (out, ctx, obj, text) => out.answer(ctx.json ? obj : text);
@@ -742,58 +771,6 @@ function runnerFor(deps = {}) {
   };
 }
 
-// ── the Makefile's three constraints ─────────────────────────────────────────────────────────────
-
-/** The recipe lines of a make target, with line continuations joined. */
-function makeRecipe(text, target) {
-  const lines = String(text).split('\n');
-  const start = lines.findIndex((l) => l.startsWith(`${target}:`));
-  if (start < 0) return null;
-  const recipe = [];
-  for (let i = start + 1; i < lines.length; i += 1) {
-    const l = lines[i];
-    if (l.startsWith('\t')) { recipe.push(l.slice(1)); continue; }
-    if (l.trim() === '' || l.startsWith('#')) continue;
-    break;
-  }
-  return recipe.join('\n').replace(/\s*\\\n\s*/g, ' ');
-}
-
-/**
- * Assert the build we are about to shell out to still applies all three constraints, and report the
- * local image name it produces.
- *
- * WHY CHECK RATHER THAN TRUST. §2.6 says the command "applies and does not let you override" three
- * things, and shelling out to `make` delegates them. If the target ever loses `--build-context
- * lintroot=.`, the build does not silently skip the lint gate — it fails on the first
- * `COPY --from=lintroot` (Makefile:267-270) — but if it lost `--platform=linux/arm64` it would build
- * a perfectly good amd64 image that no microVM can run, and if it stopped honouring
- * `$(AGENTCORE_PI_TAG)` our tag override would be silently ignored and we would push, and record,
- * a tag naming content it does not contain. Refusing here costs one file read.
- */
-function assertMakeConstraints(text) {
-  const recipe = makeRecipe(text, MAKE_TARGET);
-  if (!recipe) {
-    throw refused(`Makefile has no \`${MAKE_TARGET}\` target`,
-      { detail: 'the agent image build lives there (Makefile:271-276) — archie will not invent a docker command for it' });
-  }
-  const required = [
-    [`--platform=${PLATFORM}`, 'AgentCore microVMs are arm64 (Makefile:59-68)'],
-    ['--build-context lintroot=.', 'the lint gate\'s first `COPY --from=lintroot` fails without it (Makefile:267-270)'],
-    ['-f ./archie-runner/agentcore-pi/Dockerfile', 'the Dockerfile must be named explicitly, since the context is its parent'],
-    [BUILD_CONTEXT, `the build context is ${BUILD_CONTEXT}, NOT agentcore-pi/ — the Dockerfile COPYs sibling plugin-sdk/ and connector-session-plugin/`],
-    ['$(AGENTCORE_PI_TAG)', 'archie passes the tag as a make override; a hard-coded tag would silently ignore it'],
-  ];
-  for (const [needle, why] of required) {
-    if (!recipe.includes(needle)) {
-      throw refused(`Makefile \`${MAKE_TARGET}\` no longer passes \`${needle}\``, { detail: why });
-    }
-  }
-  const local = recipe.match(/-t\s+(\S+):\$\(AGENTCORE_PI_TAG\)/);
-  if (!local) throw refused(`cannot tell what local image \`${MAKE_TARGET}\` produces`, { detail: 'expected `-t <name>:$(AGENTCORE_PI_TAG)`' });
-  return { recipe, localImage: local[1] };
-}
-
 // ── tag items ─────────────────────────────────────────────────────────────────────────────
 
 /**
@@ -911,27 +888,25 @@ async function build(ctx, args, out, deps = {}) {
     return undefined;
   }
 
-  const { localImage } = assertMakeConstraints(fs.readFileSync(path.join(root, 'Makefile'), 'utf8'));
-  const makeArgs = ['-C', root, MAKE_TARGET, `AGENTCORE_PI_TAG=${tag}`];
+  const buildArgs = agentBuildArgs(tag);
 
   if (ctx.dryRun) {
-    out.progress(`would run: make ${makeArgs.join(' ')}`);
+    out.progress(`would run: docker ${buildArgs.join(' ')}  (cwd ${root})`);
     if (values.push) out.progress(`would push: ${uri}`);
     const planned = { ...base, built: false, pushed: false, skipped: false, dryRun: true };
     answer(out, ctx, planned, renderBuild(planned));
     return undefined;
   }
 
-  out.progress(`building    ${localImage}:${tag} (${PLATFORM}, context ${BUILD_CONTEXT}, lintroot=.)`);
-  run('make', makeArgs, { cwd: root });
+  out.progress(`building    ${LOCAL_IMAGE}:${tag} (${PLATFORM}, context ${BUILD_CONTEXT}, lintroot=.)`);
+  run('docker', buildArgs, { cwd: root });
 
   let pushed = false;
   if (values.push) {
-    // The push is the CLI's, not the Makefile's. `make push-agentcore-pi` used to exist and is now
-    // DELETED: it hard-coded the registry, account and profile as sandbox literals, while every
-    // resource name this CLI touches must come from `--name`/`--region`/the caller's account
-    // (context.js:12-16) — so it could only ever push to one place. The BUILD stays in the Makefile,
-    // because that is where the three build constraints (arm64, context, lintroot) live.
+    // Build and push are both the CLI's now. `make push-agentcore-pi` hard-coded the registry,
+    // account and profile as sandbox literals, while every resource name this CLI touches must come
+    // from `--name`/`--region`/the caller's account (context.js:12-16) — so it could only ever push
+    // to one place. `make build-agentcore-pi` followed it on 2026-09-10; see agentBuildArgs.
     const host = registryHostFor(account, ctx.region);
     const { GetAuthorizationTokenCommand } = require('@aws-sdk/client-ecr');
     const auth = await aws.ecr().send(new GetAuthorizationTokenCommand({}));
@@ -939,7 +914,7 @@ async function build(ctx, args, out, deps = {}) {
     if (!token) throw new CliError('ECR GetAuthorizationToken returned no token', { code: EXIT.FAILED });
     const decoded = Buffer.from(token, 'base64').toString('utf8');
     run('docker', ['login', '--username', 'AWS', '--password-stdin', host], { input: decoded.slice(decoded.indexOf(':') + 1) });
-    run('docker', ['tag', `${localImage}:${tag}`, uri]);
+    run('docker', ['tag', `${LOCAL_IMAGE}:${tag}`, uri]);
     out.progress(`pushing     ${uri}`);
     run('docker', ['push', uri]);
     pushed = true;
