@@ -2709,6 +2709,9 @@ if (bolt) bolt.action('custom_mcp_connect', async ({ ack, body, client }) => {
     const link = await customMcpClient.createConnectLink(fetch, apiKey, {
       connectorSlug: ctx.entry.connectorSlug, userId, authMode: ctx.entry.authMode,
     });
+    // Attributed BEFORE the DM: the binding is created by the link, so the record should exist even
+    // if the DM fails. `updatedBy` is who asked, which for a channel agent need not be who added it.
+    await marketplace.touchCustomMcp(configDoc(), AGENT_CONFIG_TABLE, ctx.agentId, ctx.slug, { by: userId, action: 'connect' });
     await client.chat.postMessage({
       channel: userId,
       text: `:key: Connect your account for *${ctx.entry.name}*: ${link.redirectUrl}\nAfter connecting, press *Re-sync tools* to load them.`,
@@ -2738,6 +2741,7 @@ if (bolt) bolt.action('custom_mcp_resync', async ({ ack, body, client }) => {
       connectorSlug: ctx.entry.connectorSlug,
       connectedAccountId: status.connection && status.connection.connectedAccountId,
     });
+    await marketplace.touchCustomMcp(configDoc(), AGENT_CONFIG_TABLE, ctx.agentId, ctx.slug, { by: userId, action: 'resync' });
     child.info({ slug: ctx.slug, syncedCount: out.syncedCount }, 'custom mcp resynced');
     await client.chat.postMessage({
       channel: userId,
