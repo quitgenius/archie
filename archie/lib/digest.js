@@ -3,7 +3,9 @@
 // Content digest of an image's DECLARED COPY inputs — plan §5 "Tags are derived, not typed",
 // reference §2.27.
 //
-// WHY THIS EXISTS. A release today means bumping `ARCHIE_GATEWAY_TAG` in the Makefile (Makefile:57)
+// WHY THIS EXISTS. A release USED TO mean bumping `ARCHIE_GATEWAY_TAG` in the Makefile — that
+// variable and its build/push targets were deleted on 2026-09-10 once this CLI owned the gateway
+// build; `archie gateway build` runs docker itself. The toil it describes is what the digest replaces
 // and `archie_dispatcher_image_tag` in sandbox.tfvars in lockstep, and forgetting one is a silent
 // no-op. `archie deploy` takes no tags: each image's tag is derived from its own inputs, so the
 // repos being IMMUTABLE stops being an obstacle and becomes the mechanism — same content, same tag,

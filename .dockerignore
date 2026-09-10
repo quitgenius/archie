@@ -1,4 +1,5 @@
-# Build context for `make build-archie-gateway` is docker/ (the dispatcher image COPYs from
+# Build context for the archie gateway image is docker/ (`archie gateway build`; the target that
+# used to live in the Makefile is gone). The dispatcher image COPYs from
 # clawdbot/ as well as slack-dispatcher/). Until this file existed, that context was ~1.2GB —
 # every package's installed node_modules was uploaded to the daemon on every build, and nothing
 # in the Dockerfile ever COPYs one: every stage runs its own npm install.
