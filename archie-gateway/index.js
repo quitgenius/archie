@@ -2496,7 +2496,282 @@ if (bolt) bolt.action('connector_uninstall', async ({ ack, body, client }) => {
   }
 });
 
+
+// ---------- Custom MCP servers: add / connect / resync / uninstall ----------
+//
+// Phase 4 of archie-custom-mcp-port-plan.md. The Connector calls live in custom-mcp.js; this is the
+// Slack half plus the DDB write.
+//
+// WHAT IS NOT HERE, and it is most of v1: no `triggerDispatch`, no `pollForPrMerge`, no
+// `startCustomMcpMergePoller`, no ECS restart. v1 needed all of it because the registration had to
+// reach a GitHub PR before an agent could see it. `customMcp` is in the config fingerprint now, so a
+// row written here is live on the agent's next turn.
+
+const customMcpClient = require('./custom-mcp');
+
+/**
+ * The agent's Connector key, resolved the way the RUNTIME resolves it (plan D2): pointer, then derived
+ * name, then the shared base. Resolving differently would register the toolkit into a project the
+ * agent never reads.
+ */
+async function connectorKeyFor(agentId, child) {
+  const { GetCommand } = require('@aws-sdk/lib-dynamodb');
+  const readPointer = async (id) => {
+    // MISSING ROW -> null (fall through to the next candidate). A FAILED read throws, and
+    // resolveConnectorKey deliberately does not catch it: silently landing on the shared key because
+    // the pointer was unreadable is the exact failure D2 exists to prevent.
+    const r = await configDoc().send(new GetCommand({
+      TableName: AGENT_CONFIG_TABLE, Key: { pk: `AGENT#${id}`, sk: 'CONNECTOR' },
+    }));
+    return r.Item && r.Item.data ? JSON.parse(r.Item.data) : null;
+  };
+  const getSecret = async (secretId) => {
+    const { SecretsManagerClient, GetSecretValueCommand } = require('@aws-sdk/client-secrets-manager');
+    const sm = new SecretsManagerClient({ region: process.env.CONNECTOR_API_KEY_SECRET_REGION || process.env.AWS_REGION });
+    const r = await sm.send(new GetSecretValueCommand({ SecretId: secretId }));
+    return r.SecretString;
+  };
+  const out = await customMcpClient.resolveConnectorKey(agentId, {
+    readPointer, getSecret, base: process.env.CONNECTOR_API_KEY_SECRET, log: child,
+  });
+  // `scope: shared` means this toolkit will be visible to every agent on that key (D2's accepted
+  // consequence). Logged rather than blocked, so it is at least answerable after the fact.
+  child.info({ via: out.via, scope: out.scope, secretId: out.secretId }, 'connector key resolved for custom mcp');
+  return out;
+}
+
+/** One entry + the key, or null after telling the user why not. */
+async function customMcpContext(userId, slugRaw, client, child) {
+  const agentId = await homeTargetFor(userId, 'app_home');
+  if (!agentId) { await client.chat.postMessage({ channel: userId, text: NO_AGENT_MSG }); return null; }
+  const slug = marketplace.parseCustomMcpSlugValue(slugRaw);
+  const mkt = await marketplace.fetchAgentMarketplace(configDoc(), AGENT_CONFIG_TABLE, agentId);
+  const entry = marketplace.getCustomMcpEntries(mkt)[slug] || null;
+  if (!entry) {
+    await client.chat.postMessage({ channel: userId, text: `:x: I can't find a custom server called *${slug}* on your agent.` });
+    return null;
+  }
+  return { agentId, slug, entry };
+}
+
+if (bolt) bolt.action('custom_mcp_add_open', async ({ ack, body, client }) => {
+  await ack();
+  await client.views.open({ trigger_id: body.trigger_id, view: marketplace.buildCustomMcpAddModal() });
+});
+
+// Re-render the modal when the auth mode changes, so only that mode's fields show. The state
+// round-trip is what stops the user losing what they already typed.
+if (bolt) bolt.action('auth_input', async ({ ack, body, client }) => {
+  await ack();
+  if (!body.view || body.view.callback_id !== 'custom_mcp_add_submit') return;
+  const v = body.view.state.values;
+  const state = {
+    name: v.name_block?.name_input?.value || '',
+    appUrl: v.url_block?.url_input?.value || '',
+    authMode: body.actions?.[0]?.selected_option?.value || 'NO_AUTH',
+    headerTemplate: v.header_block?.header_input?.value || '',
+    discoveryUrl: v.discovery_block?.discovery_input?.value || '',
+  };
+  try {
+    await client.views.update({ view_id: body.view.id, hash: body.view.hash, view: marketplace.buildCustomMcpAddModal(state) });
+  } catch (err) {
+    log.warn({ err: err.message }, 'custom mcp add modal re-render failed');
+  }
+});
+
+if (bolt) bolt.view('custom_mcp_add_submit', async ({ ack, body, view, client }) => {
+  const userId = body.user.id;
+  const v = view.state.values;
+  const submission = {
+    name: (v.name_block?.name_input?.value || '').trim(),
+    appUrl: marketplace.sanitizeUrlInput(v.url_block?.url_input?.value),
+    authMode: v.auth_block?.auth_input?.selected_option?.value || 'NO_AUTH',
+    headerTemplate: v.header_block?.header_input?.value?.trim() || '',
+    discoveryUrl: marketplace.sanitizeUrlInput(v.discovery_block?.discovery_input?.value),
+  };
+  const { errors } = marketplace.validateCustomMcpSubmission(submission);
+  if (Object.keys(errors).length > 0) return ack({ response_action: 'errors', errors });
+
+  const agentId = await homeTargetFor(userId, 'app_home');
+  if (!agentId) return ack({ response_action: 'errors', errors: { name_block: 'No personal agent configured for you.' } });
+  await ack();
+
+  const child = log.child({ action: 'custom_mcp_add', user: userId, agent: agentId });
+  // Provenance, at info, with the URL — D3's control in place of an approval gate.
+  child.info({ name: submission.name, appUrl: submission.appUrl, authMode: submission.authMode }, 'custom mcp registration requested');
+
+  try {
+    // OAuth with no discovery URL: follow the RFC 9728 chain. All six servers registered on v1 are
+    // DCR_OAUTH and none of their owners supplied one by hand, so this is the normal path, not a
+    // fallback.
+    let discoveredNote = '';
+    if (submission.authMode === 'DCR_OAUTH' && !submission.discoveryUrl) {
+      const detected = await customMcpClient.discoverOAuthDiscoveryUrl(submission.appUrl);
+      if (!detected) {
+        await client.chat.postMessage({
+          channel: userId,
+          text: `:x: Couldn't auto-detect the OAuth discovery URL for *${submission.name}*. Open *Add Custom Server* again and paste it — usually \`https://<auth-host>/.well-known/oauth-authorization-server\`.`,
+        });
+        return;
+      }
+      submission.discoveryUrl = detected;
+      discoveredNote = ` (discovery URL auto-detected: ${detected})`;
+      child.info({ discoveryUrl: detected }, 'oauth discovery url auto-detected');
+    }
+
+    const { apiKey } = await connectorKeyFor(agentId, child);
+    const slug = marketplace.customMcpSlug(agentId, submission.name);
+
+    let connectorSlug;
+    try {
+      ({ connectorSlug } = await customMcpClient.registerCustomToolkit(fetch, apiKey, { slug, ...submission }));
+    } catch (err) {
+      // Idempotent retry: a previous attempt registered the toolkit but failed before the row was
+      // written. Proceed with the derived slug so the retry converges instead of stranding a toolkit
+      // Connector holds and nothing references.
+      if (/already exists/i.test(err.message)) {
+        connectorSlug = `CUSTOM_${slug}`;
+        child.warn({ err: err.message, connectorSlug }, 'toolkit already registered; continuing with the derived slug');
+      } else throw err;
+    }
+
+    // The toolkit exists, so the row can point at something. Order matters: a row written first would
+    // render a Details modal whose every button 404s.
+    await marketplace.addCustomMcp(configDoc(), AGENT_CONFIG_TABLE, agentId, slug, {
+      name: submission.name,
+      appUrl: submission.appUrl,
+      authMode: submission.authMode,
+      connectorSlug,
+      addedBy: userId,
+      addedAt: new Date().toISOString(),
+    });
+    child.info({ slug, connectorSlug }, 'custom mcp registered (DDB)');
+
+    if (submission.authMode === 'NO_AUTH') {
+      await client.chat.postMessage({
+        channel: userId,
+        text: `:white_check_mark: *${submission.name}* is registered on *${agentId}*${discoveredNote}. Its tools are available on your agent's next message.`,
+      });
+    } else {
+      // Authed: the tools only appear once an account is connected AND synced, so say that rather
+      // than reporting success and leaving the user waiting for tools that cannot arrive.
+      let linkLine = 'Open *Connectors → Details* to connect it.';
+      try {
+        const link = await customMcpClient.createConnectLink(fetch, apiKey, { connectorSlug, userId, authMode: submission.authMode });
+        linkLine = `:key: Connect your account: ${link.redirectUrl}`;
+      } catch (err) {
+        child.warn({ err: err.message }, 'connect link failed');
+      }
+      await client.chat.postMessage({
+        channel: userId,
+        text: `:white_check_mark: *${submission.name}* is registered on *${agentId}*${discoveredNote}.\n${linkLine}\nAfter connecting, press *Re-sync tools* to load them.`,
+      });
+    }
+    await refreshHome(userId, agentId, 'connectors', client, child);
+  } catch (err) {
+    child.error({ err: err.message }, 'custom mcp register failed');
+    await client.chat.postMessage({ channel: userId, text: `:x: Couldn't register *${submission.name}*: ${err.message}` });
+  }
+});
+
+if (bolt) bolt.action('custom_mcp_detail', async ({ ack, body, client }) => {
+  await ack();
+  const userId = body.user.id;
+  const child = log.child({ action: 'custom_mcp_detail', user: userId });
+  const ctx = await customMcpContext(userId, body.actions[0].value, client, child);
+  if (!ctx) return;
+
+  // A FAILED status check renders as "unknown", never as "not connected" — see the modal builder.
+  let status = null;
+  try {
+    const { apiKey } = await connectorKeyFor(ctx.agentId, child);
+    status = await customMcpClient.getStatus(fetch, apiKey, { connectorSlug: ctx.entry.connectorSlug, userId });
+  } catch (err) {
+    child.warn({ err: err.message, slug: ctx.slug }, 'custom mcp status fetch failed; rendering without it');
+  }
+  const modal = marketplace.buildCustomMcpDetailModal(ctx.slug, ctx.entry, status);
+  try {
+    if (body.view && body.view.type === 'modal') await client.views.push({ trigger_id: body.trigger_id, view: modal });
+    else await client.views.open({ trigger_id: body.trigger_id, view: modal });
+  } catch (err) {
+    child.error({ err: err.message, slug: ctx.slug }, 'failed to open custom mcp detail modal');
+  }
+});
+
+if (bolt) bolt.action('custom_mcp_connect', async ({ ack, body, client }) => {
+  await ack();
+  const userId = body.user.id;
+  const child = log.child({ action: 'custom_mcp_connect', user: userId });
+  const ctx = await customMcpContext(userId, body.actions[0].value, client, child);
+  if (!ctx) return;
+  try {
+    const { apiKey } = await connectorKeyFor(ctx.agentId, child);
+    const link = await customMcpClient.createConnectLink(fetch, apiKey, {
+      connectorSlug: ctx.entry.connectorSlug, userId, authMode: ctx.entry.authMode,
+    });
+    await client.chat.postMessage({
+      channel: userId,
+      text: `:key: Connect your account for *${ctx.entry.name}*: ${link.redirectUrl}\nAfter connecting, press *Re-sync tools* to load them.`,
+    });
+  } catch (err) {
+    child.error({ err: err.message, slug: ctx.slug }, 'custom mcp connect failed');
+    await client.chat.postMessage({ channel: userId, text: `:x: Couldn't create a connect link for *${ctx.entry.name}*: ${err.message}` });
+  }
+});
+
+if (bolt) bolt.action('custom_mcp_resync', async ({ ack, body, client }) => {
+  await ack();
+  const userId = body.user.id;
+  const child = log.child({ action: 'custom_mcp_resync', user: userId });
+  const ctx = await customMcpContext(userId, body.actions[0].value, client, child);
+  if (!ctx) return;
+  try {
+    const { apiKey } = await connectorKeyFor(ctx.agentId, child);
+    // The ACTIVE account, via getStatus: syncing an authed toolkit without it discovers nothing, and
+    // users accumulate EXPIRED link attempts that getStatus already knows to skip.
+    const status = await customMcpClient.getStatus(fetch, apiKey, { connectorSlug: ctx.entry.connectorSlug, userId });
+    if (ctx.entry.authMode !== 'NO_AUTH' && !status.connection) {
+      await client.chat.postMessage({ channel: userId, text: `:warning: *${ctx.entry.name}* has no connected account yet — press *Connect* first.` });
+      return;
+    }
+    const out = await customMcpClient.syncCustomToolkit(fetch, apiKey, {
+      connectorSlug: ctx.entry.connectorSlug,
+      connectedAccountId: status.connection && status.connection.connectedAccountId,
+    });
+    child.info({ slug: ctx.slug, syncedCount: out.syncedCount }, 'custom mcp resynced');
+    await client.chat.postMessage({
+      channel: userId,
+      text: `:arrows_counterclockwise: *${ctx.entry.name}*: ${out.syncedCount ?? 'some'} tool(s) synced. They are available on your agent's next message.`,
+    });
+  } catch (err) {
+    child.error({ err: err.message, slug: ctx.slug }, 'custom mcp resync failed');
+    await client.chat.postMessage({ channel: userId, text: `:x: Couldn't re-sync *${ctx.entry.name}*: ${err.message}` });
+  }
+});
+
+if (bolt) bolt.action('custom_mcp_uninstall', async ({ ack, body, client }) => {
+  await ack();
+  const userId = body.user.id;
+  const child = log.child({ action: 'custom_mcp_uninstall', user: userId });
+  const ctx = await customMcpContext(userId, body.actions[0].value, client, child);
+  if (!ctx) return;
+  try {
+    // Connector first, then the row. Both are idempotent (delete treats 404 as success), so a failure
+    // between them leaves a retryable state rather than a row pointing at nothing.
+    const { apiKey } = await connectorKeyFor(ctx.agentId, child);
+    await customMcpClient.deleteCustomToolkit(fetch, apiKey, ctx.entry.connectorSlug);
+    await marketplace.removeCustomMcp(configDoc(), AGENT_CONFIG_TABLE, ctx.agentId, ctx.slug);
+    child.info({ slug: ctx.slug }, 'custom mcp uninstalled');
+    await client.chat.postMessage({ channel: userId, text: `:white_check_mark: *${ctx.entry.name}* removed from *${ctx.agentId}*.` });
+    await refreshHome(userId, ctx.agentId, 'connectors', client, child);
+  } catch (err) {
+    child.error({ err: err.message, slug: ctx.slug }, 'custom mcp uninstall failed');
+    await client.chat.postMessage({ channel: userId, text: `:x: Couldn't remove *${ctx.entry.name}*: ${err.message}` });
+  }
+});
+
 // ---------- Model selection ----------
+
 
 if (bolt) bolt.action('model_select', async ({ ack, body, client }) => {
   await ack();
