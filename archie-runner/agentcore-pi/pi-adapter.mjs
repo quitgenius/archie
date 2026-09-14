@@ -10,6 +10,7 @@ import { join, basename } from 'node:path';
 import { createRequire } from 'node:module';
 import { createHash } from 'node:crypto';
 import { registerBedrock, getModel, runTurn, withModel, pca } from './pi-runtime.mjs';
+import { refreshSessionConfig } from './session-config-refresh.mjs';
 import { resolveSessionPath, writeIndexEntry } from './session-store.mjs';
 import { outcomeAttributes } from './tool-outcome.mjs';
 import { resolveModelSpec, resolveAllowedTools, buildBuiltinTools, buildCustomTools, readBootstrapContext, makeResourceLoader, resolvePluginManifest, findUnavailablePlugins, resolveMcpPrefixes } from './config-map.mjs';
@@ -17,6 +18,7 @@ import { loadAgentConfig } from './agent-config.mjs';
 import { buildCompatPlugins, prewarmCompatPlugins } from './openclaw-compat/plugin-host.mjs';
 import { createHindsightExtension } from './hindsight-extension.mjs';
 import { createClockExtension } from './clock-extension.mjs';
+import { createModelContextExtension } from './model-context-extension.mjs';
 import { makeCapabilityResolver, makeDecider, makeAllowCheck, policyRef } from './permissions/capabilities.mjs';
 import { loadPolicyTable } from './permissions/policy-table.mjs';
 import { createPermissionsExtension, makeCan } from './permissions/permissions-extension.mjs';
@@ -1176,20 +1178,18 @@ async function getSession(key, seed = {}) {
   // warm + skills unchanged + config unchanged → fast path
   if (cached && cached.skillFp === skill.fp && cached.configFp === cfg.fp) return cached;
 
-  // Config changed (or first turn on this microVM): re-resolve from DDB and re-bind, so the rebuilt
-  // session below binds the NEW model / allow-set / plugins. On failure keep serving —
-  // a warm session on the previous config beats failing the turn, and the next turn retries.
-  if (cfg.fp && configState.fp && cfg.fp !== configState.fp) {
+  // Never acknowledge a new fingerprint while retaining the old model, including the first
+  // turn on a prewarmed microVM. A failed re-bind aborts the turn and retries on the next request.
+  if (cfg.fp && cfg.fp !== configState.fp) {
     try {
-      const info = await reloadConfigFromDdb();
-      configState = { fp: cfg.fp };
+      const refreshed = await refreshSessionConfig(configState, cfg.fp, reloadConfigFromDdb);
+      configState = refreshed.state;
+      const info = refreshed.info;
       console.log(JSON.stringify({ level: 'info', component: 'pi-adapter', msg: 'config re-resolved (per-turn)', key, fp: cfg.fp, ...info }));
     } catch (e) {
-      console.error(JSON.stringify({ level: 'warn', component: 'pi-adapter', msg: 'config re-resolve FAILED — serving on previous config', key, fp: cfg.fp, err: e.message }));
-      if (cached && cached.skillFp === skill.fp) return cached; // nothing else changed → keep serving
+      console.error(JSON.stringify({ level: 'error', component: 'pi-adapter', msg: 'config re-resolve FAILED — refusing to use previous model', key, fp: cfg.fp, err: e.message }));
+      throw e;
     }
-  } else if (!configState.fp) {
-    configState = { fp: cfg.fp }; // first turn: boot already resolved this fingerprint
   }
 
   const gsT0 = Date.now();
@@ -1297,6 +1297,7 @@ async function getSession(key, seed = {}) {
   // Clock LAST: hindsight extracts its recall query from the last user message, so it must
   // read the human's text before we append the <current_time> block to it. Reads the
   // turn-stable timestamp off turnCtx (prompt-cache stability across tool-loop steps).
+  extensionFactories.push(createModelContextExtension());
   extensionFactories.push(createClockExtension({ getNow: () => turnCtx.turnStartedAtMs || Date.now() }));
   const resourceLoader = makeResourceLoader({ cwd: CWD, bootstrap, extensionFactories, skillPaths: SKILL_PATHS });
   if (typeof resourceLoader.reload === 'function') await resourceLoader.reload();

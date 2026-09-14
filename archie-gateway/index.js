@@ -2804,7 +2804,9 @@ if (bolt) bolt.action('model_select', async ({ ack, body, client }) => {
     await refreshHome(userId, agentId, 'models', client, child);
   } catch (err) {
     child.error({ err: err.message }, 'model select failed');
-    await client.chat.postMessage({ channel: userId, text: `:x: Something went wrong changing the model. Please try again or ask in *#sandra-management* for help.` });
+    await client.chat.postMessage({ channel: userId, text: err.code === 'UNSUPPORTED_MODEL'
+      ? `:x: ${err.message}`
+      : `:x: Something went wrong changing the model. Please try again or ask in *#sandra-management* for help.` });
   }
 });
 

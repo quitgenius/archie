@@ -145,12 +145,13 @@ RUN node patch-pi-ai-prompt-cache.mjs && rm patch-pi-ai-prompt-cache.mjs
 # config-fingerprint.mjs shipped broken: it was extracted out of pi-adapter.mjs (importing the
 # adapter runs boot() at module load, so the fingerprint had to move to be testable) and adding it
 # here was forgotten. Nothing caught it until a from-scratch stack ran its first turn.
-COPY agentcore-pi/pi-runtime.mjs agentcore-pi/pi-adapter.mjs agentcore-pi/config-map.mjs \
+COPY agentcore-pi/pi-runtime.mjs agentcore-pi/bedrock-model-registry.mjs agentcore-pi/session-config-refresh.mjs agentcore-pi/pi-adapter.mjs agentcore-pi/config-map.mjs \
      agentcore-pi/config-fingerprint.mjs agentcore-pi/agent-config.mjs \
      agentcore-pi/memory-tool.mjs agentcore-pi/session-store.mjs \
      agentcore-pi/hindsight-extension.mjs agentcore-pi/hindsight-client-recall.mjs \
      agentcore-pi/knowledge-tools.mjs agentcore-pi/knowledge-write-tools.mjs agentcore-pi/fetch-error.mjs \
      agentcore-pi/clock-extension.mjs \
+     agentcore-pi/model-context-extension.mjs \
      agentcore-pi/otel-export.cjs agentcore-pi/pi-entrypoint.mjs agentcore-pi/sse-contract.mjs \
      agentcore-pi/bedrock-dispatch-mark.mjs \
      agentcore-pi/reply-usage.mjs agentcore-pi/usage-attrs.mjs \

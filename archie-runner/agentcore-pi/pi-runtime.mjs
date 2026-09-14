@@ -11,6 +11,7 @@ import { deltaEvent, toolEvent } from './sse-contract.mjs';
 // A second unwrapper here would be a second thing to keep in step with Connector's shapes.
 import { toolSlugField } from './permissions/third-party-slug.mjs';
 import { toolOutcome } from './tool-outcome.mjs';
+import { resolveRegisteredModel } from './bedrock-model-registry.mjs';
 
 const VENDOR = process.env.PI_VENDOR_DIR; // unset in image → bare package imports
 const spec = (pkg, sub) => {
@@ -183,6 +184,11 @@ function bedrockClaudeModel(id) {
 export function getModel(id) {
   const m = piAi.getModel('amazon-bedrock', id);
   if (m) return m;
+  const registered = resolveRegisteredModel(id, (baseId) => piAi.getModel('amazon-bedrock', baseId));
+  if (registered) {
+    console.log(JSON.stringify({ component: 'pi-runtime', msg: 'Bedrock model registered', id, source: registered._registeredFrom }));
+    return registered;
+  }
   const synth = synthesiseFromSibling(id);
   if (synth) {
     console.error(JSON.stringify({
