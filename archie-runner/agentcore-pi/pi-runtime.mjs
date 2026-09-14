@@ -269,6 +269,11 @@ export async function withModel(session, modelId, fn) {
 // byte-identical to before: the returned aggregate is driven solely by `message_end`, so the
 // buffered-JSON path is unaffected.
 export async function runTurn(session, prompt, onEvent) {
+  // Old saved configurations and cron overrides can bypass the picker. Refuse a Global
+  // profile before Pi can send a prompt, including automatic compaction/model requests.
+  if (String(session?.model?.id || '').startsWith('global.')) {
+    throw new Error('Global Bedrock profiles are disabled. Select a US model before running this agent or job.');
+  }
   let text = '';
   let stopReason = null;
   let usage = null;
