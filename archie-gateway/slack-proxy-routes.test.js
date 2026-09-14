@@ -73,6 +73,23 @@ test('proxy applies the Pi session thread before chat.postMessage reaches Slack'
   ]]);
 });
 
+test('interleaved sessions retain their own thread on repeated sends', async () => {
+  const calls = [];
+  const slack = { apiCall: async (_method, body) => { calls.push(body); return { ok: true }; } };
+  const handler = makeSlackProxyHandler({ slack, log: silent });
+  const send = (root) => handler(reqFor(
+    'chat.postMessage',
+    { channel: 'D0ABC', text: 'reply' },
+    { 'x-archie-session-key': `slack:thread:D0ABC:${root}` },
+  ), mockRes());
+
+  await send('100.1');
+  await send('200.2');
+  await send('100.1');
+
+  expect(calls.map((body) => body.thread_ts)).toEqual(['100.1', '200.2', '100.1']);
+});
+
 test('chat.postMessage is proxied through, body verbatim, and the Slack result returned', async () => {
   const calls = [];
   const slack = { apiCall: async (m, b) => { calls.push([m, b]); return { ok: true, ts: '1.2', channel: 'D1' }; } };

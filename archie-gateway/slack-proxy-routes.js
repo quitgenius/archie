@@ -43,9 +43,7 @@ const ALLOWED_METHODS = new Set([
   'users.info',
 ]);
 
-// A normal Pi turn uses this logical key shape. Cron turns deliberately replace the numeric
-// timestamp with `cron-<jobId>`, so they do not match and continue to deliver as standalone
-// messages. Prefixed legacy keys are accepted for approval wakes and migrated sessions.
+// Numeric Slack roots only: synthetic cron-<jobId> sessions have no reply thread.
 function slackThreadTargetFromSessionKey(sessionKey) {
   if (typeof sessionKey !== 'string') return null;
   const match = sessionKey.match(/(?:^|:)slack:thread:(?:dm:)?([^:]+):([0-9]+\.[0-9]+)(?::|$)/i);
@@ -53,14 +51,7 @@ function slackThreadTargetFromSessionKey(sessionKey) {
   return { channel: match[1], threadTs: match[2] };
 }
 
-/**
- * Preserve the originating DM message as the reply target for Pi's direct Slack-send path.
- *
- * `slack_send` is meant for out-of-band and cross-channel delivery, so explicit thread_ts wins
- * and a different destination is untouched. The default applies only when the tool posts back to
- * the same DM from a user-triggered Slack session. This closes the path that otherwise turns an
- * omitted optional model argument into a top-level DM message.
- */
+// Default same-DM replies to the session's root; preserve explicit and cross-channel targets.
 function anchorDmPostMessage(method, body, sessionKey) {
   if (method !== 'chat.postMessage' || !body || body.thread_ts) return body;
   const channel = body.channel;
