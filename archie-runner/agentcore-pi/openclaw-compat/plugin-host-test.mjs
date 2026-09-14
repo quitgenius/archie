@@ -49,6 +49,45 @@ check('before_tool_call hook throw is isolated — the tool still executes', asy
   assert.equal(r.content[0].text, 'ok');
 });
 
+// Task #28 regression: one Pi session is one Slack THREAD, not one Slack user. The mutable
+// turnCtx must therefore reach both prompt construction and the tool wrapper on every turn.
+// Otherwise the second person in a shared channel inherits the first person's Connector entity.
+check('two senders in one warm Pi session keep run-scoped tool identities separate', async () => {
+  const promptRunIds = [];
+  const executedAs = [];
+  const turnCtx = { runId: 'u:U_FIRST:first-run', sender: 'U_FIRST', trigger: 'message' };
+  const plugin = { id: 'connector-session-plugin', register: (api) => {
+    api.on('before_prompt_build', async (_event, ctx) => { promptRunIds.push(ctx.runId); });
+    api.on('before_tool_call', async (event, ctx) => {
+      const userId = String(ctx.runId || '').match(/^u:([^:]+):/)?.[1];
+      return userId ? { params: { ...event.params, externalUserId: userId } } : undefined;
+    });
+    api.registerTool({
+      name: 'mcp_connector__JIRA_GET_PROJECTS', label: 'jira', description: '', parameters: {},
+      execute: async (_id, params) => {
+        executedAs.push(params.externalUserId);
+        return { content: [{ type: 'text', text: 'ok' }] };
+      },
+    });
+  } };
+  const { customTools, extensionFactory } = buildCompatPlugins(
+    [{ entry: plugin }],
+    { sessionCtx: { agentId: 'ch-c0shared', sessionKey: 'slack:thread:C0SHARED:123.456' }, turnCtx, logSink: sink },
+  );
+  const pi = fakePi(); extensionFactory(pi);
+
+  await pi.handlers.context[0]({ messages: [{ role: 'user', content: 'first' }] });
+  await customTools[0].execute('call-first', {});
+
+  turnCtx.runId = 'u:U_SECOND:second-run';
+  turnCtx.sender = 'U_SECOND';
+  await pi.handlers.context[0]({ messages: [{ role: 'user', content: 'second' }] });
+  await customTools[0].execute('call-second', {});
+
+  assert.deepEqual(promptRunIds, ['u:U_FIRST:first-run', 'u:U_SECOND:second-run']);
+  assert.deepEqual(executedAs, ['U_FIRST', 'U_SECOND']);
+});
+
 check('a tool-factory that throws on resolve is isolated — other tools survive', () => {
   const p = { id: 'connector-session-plugin', register: (api) => {
     api.registerTool(() => { throw new Error('factory 401'); }); // throwing factory
