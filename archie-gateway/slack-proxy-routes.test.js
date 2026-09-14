@@ -4,7 +4,12 @@
 // decide whether an agent's message reaches Slack at all, and the one that keeps /simulate honest.
 
 const assert = require('node:assert/strict');
-const { ALLOWED_METHODS, makeSlackProxyHandler } = require('./slack-proxy-routes');
+const {
+  ALLOWED_METHODS,
+  slackThreadTargetFromSessionKey,
+  anchorDmPostMessage,
+  makeSlackProxyHandler,
+} = require('./slack-proxy-routes');
 
 const silent = { info() {}, warn() {}, error() {}, child() { return silent; } };
 
@@ -14,7 +19,59 @@ function mockRes() {
   res.json = (b) => { res.body = b; return res; };
   return res;
 }
-const reqFor = (method, body = {}) => ({ params: { method }, body });
+const reqFor = (method, body = {}, headers = {}) => ({
+  params: { method },
+  body,
+  headers,
+  get(name) { return headers[name.toLowerCase()]; },
+});
+
+test('extracts the immutable Slack reply target from Pi and migrated session keys', () => {
+  expect(slackThreadTargetFromSessionKey('slack:thread:DEBRG0LOAX7:1789039774.094039'))
+    .toEqual({ channel: 'DEBRG0LOAX7', threadTs: '1789039774.094039' });
+  expect(slackThreadTargetFromSessionKey('agent:a:slack:thread:dm:D0ABC:1712.5:dm:U1'))
+    .toEqual({ channel: 'D0ABC', threadTs: '1712.5' });
+  expect(slackThreadTargetFromSessionKey('slack:thread:D0ABC:cron-job-1')).toBeNull();
+});
+
+test('anchors an unthreaded post back to the originating DM message', () => {
+  const original = { channel: 'DEBRG0LOAX7', text: 'step 1' };
+  expect(anchorDmPostMessage(
+    'chat.postMessage',
+    original,
+    'slack:thread:DEBRG0LOAX7:1789039774.094039',
+  )).toEqual({ ...original, thread_ts: '1789039774.094039' });
+  expect(original).toEqual({ channel: 'DEBRG0LOAX7', text: 'step 1' });
+});
+
+test('does not override explicit, cross-channel, channel, or cron delivery targets', () => {
+  const key = 'slack:thread:D0ORIGIN:1789039774.094039';
+  expect(anchorDmPostMessage('chat.postMessage', {
+    channel: 'D0ORIGIN', text: 'explicit', thread_ts: '999.1',
+  }, key).thread_ts).toBe('999.1');
+  expect(anchorDmPostMessage('chat.postMessage', { channel: 'D0OTHER', text: 'cross-post' }, key))
+    .toEqual({ channel: 'D0OTHER', text: 'cross-post' });
+  expect(anchorDmPostMessage('chat.postMessage', { channel: 'C0CHANNEL', text: 'channel' }, key))
+    .toEqual({ channel: 'C0CHANNEL', text: 'channel' });
+  expect(anchorDmPostMessage('chat.postMessage', { channel: 'D0ORIGIN', text: 'cron' },
+    'slack:thread:D0ORIGIN:cron-job-1'))
+    .toEqual({ channel: 'D0ORIGIN', text: 'cron' });
+});
+
+test('proxy applies the Pi session thread before chat.postMessage reaches Slack', async () => {
+  const calls = [];
+  const slack = { apiCall: async (m, b) => { calls.push([m, b]); return { ok: true, ts: '1.3' }; } };
+  const res = mockRes();
+  await makeSlackProxyHandler({ slack, log: silent })(reqFor(
+    'chat.postMessage',
+    { channel: 'DEBRG0LOAX7', text: 'step 1' },
+    { 'x-archie-session-key': 'slack:thread:DEBRG0LOAX7:1789039774.094039' },
+  ), res);
+  assert.deepEqual(calls, [[
+    'chat.postMessage',
+    { channel: 'DEBRG0LOAX7', text: 'step 1', thread_ts: '1789039774.094039' },
+  ]]);
+});
 
 test('chat.postMessage is proxied through, body verbatim, and the Slack result returned', async () => {
   const calls = [];

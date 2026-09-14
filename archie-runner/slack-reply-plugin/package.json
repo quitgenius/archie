@@ -8,6 +8,7 @@
     "typescript": "^5.0.0"
   },
   "scripts": {
+    "test": "node --experimental-strip-types --test index.test.ts",
     "typecheck": "tsc --noEmit"
   }
 }

@@ -8,6 +8,11 @@ function createSlackMock({ startDelay = 0, appendDelay = 0, stopDelay = 0 } = {}
 
   return {
     calls,
+    assistant: {
+      threads: {
+        setStatus: async () => ({ ok: true }),
+      },
+    },
     chat: {
       startStream: async (args) => {
         calls.push({ method: 'startStream', args: { ...args } });
@@ -140,6 +145,35 @@ describe('StreamingManager', () => {
       mgr.destroy();
     });
 
+    it('starts a DM stream under the originating user message', async () => {
+      const slack = createSlackMock();
+      const mgr = createManager(slack, { updateIntervalMs: 0 });
+      mgr.registerSession('slack:thread:D1:1234.5678', {
+        channel: 'D1', threadTs: '1234.5678', userId: 'U1', isDM: true,
+      });
+      const { session } = mgr.findSession('slack:thread:D1:1234.5678');
+
+      mgr.startStream(session);
+      const run = mgr.getOrCreateRun(session, 'run-1');
+      mgr.handleDelta(run, session, 'Hello');
+      await session.stream.chain;
+
+      expect(slack.calls[0]).toEqual({
+        method: 'startStream',
+        args: {
+          channel: 'D1',
+          thread_ts: '1234.5678',
+          recipient_user_id: 'U1',
+          task_display_mode: 'plan',
+          chunks: [
+            { type: 'plan_update', title: 'Securing the mast' },
+            { type: 'markdown_text', text: 'Hello' },
+          ],
+        },
+      });
+      mgr.destroy();
+    });
+
     it('handleDelta ignores duplicate text', async () => {
       const slack = createSlackMock();
       const mgr = createManager(slack, { updateIntervalMs: 0 });
@@ -205,6 +239,23 @@ describe('StreamingManager', () => {
       expect(slack.calls).toHaveLength(1);
       expect(slack.calls[0].method).toBe('postMessage');
       expect(slack.calls[0].args.text).toBe('Fallback text');
+      mgr.destroy();
+    });
+
+    it('stopStream fallback keeps the originating DM thread anchor', async () => {
+      const slack = createSlackMock();
+      const mgr = createManager(slack);
+      mgr.registerSession('slack:thread:D1:1234.5678', {
+        channel: 'D1', threadTs: '1234.5678', userId: 'U1', isDM: true,
+      });
+      const { session } = mgr.findSession('slack:thread:D1:1234.5678');
+
+      await mgr.stopStream(session, 'Delayed fallback');
+
+      expect(slack.calls).toEqual([{
+        method: 'postMessage',
+        args: { channel: 'D1', thread_ts: '1234.5678', text: 'Delayed fallback' },
+      }]);
       mgr.destroy();
     });
 

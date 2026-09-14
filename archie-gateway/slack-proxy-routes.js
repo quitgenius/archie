@@ -43,6 +43,33 @@ const ALLOWED_METHODS = new Set([
   'users.info',
 ]);
 
+// A normal Pi turn uses this logical key shape. Cron turns deliberately replace the numeric
+// timestamp with `cron-<jobId>`, so they do not match and continue to deliver as standalone
+// messages. Prefixed legacy keys are accepted for approval wakes and migrated sessions.
+function slackThreadTargetFromSessionKey(sessionKey) {
+  if (typeof sessionKey !== 'string') return null;
+  const match = sessionKey.match(/(?:^|:)slack:thread:(?:dm:)?([^:]+):([0-9]+\.[0-9]+)(?::|$)/i);
+  if (!match) return null;
+  return { channel: match[1], threadTs: match[2] };
+}
+
+/**
+ * Preserve the originating DM message as the reply target for Pi's direct Slack-send path.
+ *
+ * `slack_send` is meant for out-of-band and cross-channel delivery, so explicit thread_ts wins
+ * and a different destination is untouched. The default applies only when the tool posts back to
+ * the same DM from a user-triggered Slack session. This closes the path that otherwise turns an
+ * omitted optional model argument into a top-level DM message.
+ */
+function anchorDmPostMessage(method, body, sessionKey) {
+  if (method !== 'chat.postMessage' || !body || body.thread_ts) return body;
+  const channel = body.channel;
+  if (typeof channel !== 'string' || !/^D[A-Z0-9]+$/i.test(channel)) return body;
+  const target = slackThreadTargetFromSessionKey(sessionKey);
+  if (!target || target.channel.toUpperCase() !== channel.toUpperCase()) return body;
+  return { ...body, thread_ts: target.threadTs };
+}
+
 /**
  * @param slack             the WebClient (or its simulate-aware proxy)
  * @param isSimulateChannel (channel) => bool — C_SIMULATE* short-circuit, see below
@@ -61,16 +88,23 @@ function makeSlackProxyHandler({ slack, isSimulateChannel = () => false, log }) 
     // so it comes back unwrapped and a C_SIMULATE* channel would reach real Slack and fail with
     // invalid_channel — silently breaking `/simulate`, whose whole job is to report which Slack
     // methods a turn calls.
-    const channel = req.body && req.body.channel;
+    const sessionKey = req.get ? req.get('x-archie-session-key') : req.headers?.['x-archie-session-key'];
+    const body = anchorDmPostMessage(method, req.body, sessionKey);
+    const channel = body && body.channel;
     if (isSimulateChannel(channel)) {
-      child.info({ channel, text: String((req.body && req.body.text) || '').slice(0, 200) },
+      child.info({ channel, text: String((body && body.text) || '').slice(0, 200) },
         '[simulate] slack proxy call intercepted');
       return res.json({ ok: true, ts: `sim-proxy-${Date.now()}` });
     }
     try {
       const started = Date.now();
-      const result = await slack.apiCall(method, req.body);
-      child.info({ latency_ms: Date.now() - started, ok: result && result.ok }, 'slack api call ok');
+      const result = await slack.apiCall(method, body);
+      child.info({
+        latency_ms: Date.now() - started,
+        ok: result && result.ok,
+        thread_ts: body && body.thread_ts,
+        thread_anchor_applied: Boolean(body && body.thread_ts && !(req.body && req.body.thread_ts)),
+      }, 'slack api call ok');
       return res.json(result);
     } catch (err) {
       child.error({ err: err.message }, 'slack api call failed');
@@ -84,4 +118,10 @@ function registerSlackProxyRoute({ web, slack, isSimulateChannel, log }) {
   web.post('/api/:method', makeSlackProxyHandler({ slack, isSimulateChannel, log }));
 }
 
-module.exports = { ALLOWED_METHODS, makeSlackProxyHandler, registerSlackProxyRoute };
+module.exports = {
+  ALLOWED_METHODS,
+  slackThreadTargetFromSessionKey,
+  anchorDmPostMessage,
+  makeSlackProxyHandler,
+  registerSlackProxyRoute,
+};

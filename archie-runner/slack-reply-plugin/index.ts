@@ -287,7 +287,7 @@ export default definePluginEntry({
       },
     }));
 
-    api.registerTool(() => ({
+    api.registerTool((toolContext) => ({
       name: "slack_send",
       // Read by Pi's PEP (pi-adapter builds toolCaps from every tool declaring `capability`).
       // Inert under OpenClaw, which has no capability model.
@@ -355,6 +355,13 @@ export default definePluginEntry({
             headers: {
               "content-type": "application/json",
               "x-dispatcher-secret": secret,
+              // Pi's logical session key contains the immutable Slack reply target for
+              // user-triggered turns. The dispatcher uses it to supply thread_ts when the
+              // model omits that optional argument. Keep it out of the Slack request body:
+              // it is transport context, not a Slack Web API field.
+              ...(toolContext?.sessionKey
+                ? { "x-archie-session-key": String(toolContext.sessionKey) }
+                : {}),
             },
             body: JSON.stringify({
               channel,
