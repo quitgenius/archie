@@ -126,8 +126,18 @@ export const CUSTOM_TOOLS = {
 //
 // PROVIDER_NAMES already carries them, but it is the PROVIDER identity set, not the capability set —
 // it also holds `core`, which is no capability at all — so it cannot serve as this source.
+//
+// `ec2` and `bedrock-mantle` JOINED THIS SET on 2026-09-15 by a different route: they were never
+// ported tools that lost their rows, they are OpenClaw per-agent IAM statements becoming
+// capabilities (archie-docs/archie-agent-iam-capability-port.md). Same end state — pin-only, no
+// token, no tool; the agent reaches EC2 and Mantle through bash plus the `aws` CLI / the
+// observer-annotate SDK. They must be here for the same reason the other five are: `grants.js`
+// builds the capability universe from tool rows, so a toolless capability missing here vanishes from
+// describeCapabilities and the Tools tab while its pins, POLICY verdicts and derived-role IAM all
+// keep working, and assertGrantable refuses it as "not a known capability".
 export const TOOLLESS_CAPABILITIES = new Set([
   'datadog', 'cloudwatch-logs', 'aws-person79b333-secrets', 'airflow', 'aws-readonly',
+  'ec2', 'bedrock-mantle',
 ]);
 
 // ── Plugin providers ─────────────────────────────────────────────────────────────────────────────

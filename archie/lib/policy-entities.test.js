@@ -45,9 +45,11 @@ const ask = (sources, entities, scope, capability, grants = []) =>
 
 test('the domain is capabilities ∪ slugs, and the slugs are really there', () => {
   const domain = capabilityDomain(PROD);
-  // 25 capabilities + 8 Connector comms slugs. Two blocks for review, one entity set (semantics.json:123).
-  // (25 since 2026-09-14: files.publish joined the baseline with save_artifact.)
-  assert.equal(domain.length, 33);
+  // 27 capabilities + 8 Connector comms slugs. Two blocks for review, one entity set (semantics.json:123).
+  // 24 → 25 on 2026-09-14: files.publish joined the baseline with save_artifact.
+  // 25 → 27 on 2026-09-15: `ec2` and `bedrock-mantle`, the first capabilities to arrive from OpenClaw's
+  // per-agent IAM map rather than from a tool or a skill.
+  assert.equal(domain.length, 35);
   assert.deepEqual(domain, [...domain].sort(), 'sorted, so the row key order cannot depend on JSON key order');
 
   // THE BUG THE POLICY DOCUMENT FOUND IN ITSELF (policy/README.md:129-146). The 8 slugs were listed as
@@ -60,7 +62,7 @@ test('the domain is capabilities ∪ slugs, and the slugs are really there', () 
 test('every Capability entity carries attrs.name, because A2 reads it', () => {
   const entities = capabilityEntities(PROD);
   const caps = entities.filter((e) => e.uid.type === TYPE.capability);
-  assert.equal(caps.length, 33);
+  assert.equal(caps.length, 35);
   for (const e of caps) {
     // archie.cedarschema:29-33 and spike README §5: omit this and the condition ERRORS, the permit
     // never applies, and you would "confirm" a pin that is doing nothing.
@@ -99,7 +101,7 @@ test('a capGroup member with no capability entity refuses loudly', () => {
   assert.equal(codeOf(() => capGroupParents(broken)), EXIT.PREFLIGHT);
 });
 
-test('the ScopeGroup vocabulary is the 12 pins PLUS the 5 skill groups, in both environments', () => {
+test('the ScopeGroup vocabulary is the 14 pins PLUS the 5 skill groups, in both environments', () => {
   // FIVE skill groups since 2026-08-19: comms-approval was removed as a zero-holder pin. It was also the
   // group the deployed gateway rejected, which made every POLICY row write fail non-fatally — so a group
   // nobody held was disabling the policy layer for whichever scope tried to use it.
@@ -108,10 +110,13 @@ test('the ScopeGroup vocabulary is the 12 pins PLUS the 5 skill groups, in both 
   // `skill.<id>` groups, which no statement references — they are compiled into the row's `skills` list and
   // consumed by the runtime's skill filter. Both are ScopeGroups because both are per-environment scope
   // membership; the difference is who reads them, and check 3 exempts the skill prefix for that reason.
+  // FOURTEEN pins since 2026-09-15 — pin.ec2 and pin.bedrock-mantle (B6/B7). Both are pin-only
+  // capabilities ported from OpenClaw's clawdbot_agent_iam_statements, so the group IS the authority:
+  // nothing else can confer them.
   const pins = [
-    'pin.airflow', 'pin.aws-person79b333-secrets', 'pin.aws-readonly', 'pin.cloudwatch-logs',
-    'pin.datadog', 'pin.demo_diagram_app', 'pin.hindsight.write', 'pin.demo_notes_app', 'pin.otel.fleet',
-    'pin.demo_cache', 'pin.sandbox-probe', 'pin.demo_mail_app',
+    'pin.airflow', 'pin.aws-person79b333-secrets', 'pin.aws-readonly', 'pin.bedrock-mantle',
+    'pin.cloudwatch-logs', 'pin.datadog', 'pin.ec2', 'pin.demo_diagram_app', 'pin.hindsight.write',
+    'pin.demo_notes_app', 'pin.otel.fleet', 'pin.demo_cache', 'pin.sandbox-probe', 'pin.demo_mail_app',
   ];
   const skills = [
     'skill.demo-crm', 'skill.sales-reengagement-briefing',
@@ -127,12 +132,12 @@ test('the ScopeGroup vocabulary is the 12 pins PLUS the 5 skill groups, in both 
 
 test('entitiesFor is the shared set plus exactly one principal', () => {
   const shared = sharedEntities(PROD);
-  // 33 capabilities + 2 CapGroups + 17 ScopeGroups (12 pin + 5 skill; comms-approval removed 2026-08-19,
+  // 35 capabilities + 2 CapGroups + 19 ScopeGroups (14 pin + 5 skill; comms-approval removed 2026-08-19,
   // a zero-holder pin that was also breaking POLICY row writes on the deployed gateway). The skill groups
   // get entities like any other ScopeGroup even though no Cedar statement references them: the entity set is
   // vocabulary, and omitting them would make a Scope's `parents` name a group that does not exist — which
   // spike README §5 records as a dangling parent that still ALLOWS, i.e. fails OPEN.
-  assert.equal(shared.length, 33 + 2 + 17);
+  assert.equal(shared.length, 35 + 2 + 19);
   const all = entitiesFor(MEMBER, PROD);
   assert.equal(all.length, shared.length + 1);
   assert.equal(all[all.length - 1].uid.id, MEMBER);
