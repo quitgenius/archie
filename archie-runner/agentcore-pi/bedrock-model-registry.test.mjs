@@ -56,3 +56,9 @@ test('unchanged config avoids reload; failed reload cannot acknowledge the new s
   await assert.rejects(refreshSessionConfig(previous, 'new', async () => { throw new Error('unsupported model'); }), /unsupported model/);
   assert.deepEqual(previous, { fp: 'old' });
 });
+
+test('US Fable 5 is selectable; global Fable and incompatible Fable 5.1 remain blocked', () => {
+  assert.equal(isSelectableModel('us.anthropic.claude-fable-5'), true);
+  assert.equal(isSelectableModel('global.anthropic.claude-fable-5'), false);
+  assert.equal(isSelectableModel('us.anthropic.claude-fable-5-1'), false);
+});

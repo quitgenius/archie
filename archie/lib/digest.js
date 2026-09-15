@@ -197,6 +197,7 @@ const IMAGES = {
       // correct, and the digest is what makes it visible.
       { path: 'archie-runner/config-seed/new-agent-skeleton', dir: true },
       { path: 'archie-runner/agentcore-pi/workspace-seed.mjs' },
+      { path: 'archie-runner/agentcore-pi/bedrock-model-registry.mjs' },
       { path: 'archie-runner/config-resolver/skill-iam-requirements.mjs' },
       { path: 'archie-runner/config-resolver/derive-exec-role.mjs' },
       { path: 'archie-runner/config-resolver/caps-from-config.mjs' },

@@ -499,3 +499,7 @@ test('every archie-gateway module the Dockerfile COPYs is a DECLARED digest inpu
     undeclared.join('\n  '),
   );
 });
+
+test('gateway digest includes the shared model registry copied by its Dockerfile', () => {
+  assert.ok(IMAGES.gateway.inputs.some((input) => input.path === 'archie-runner/agentcore-pi/bedrock-model-registry.mjs'));
+});
