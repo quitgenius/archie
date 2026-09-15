@@ -66,16 +66,16 @@ describe('expired Slack stream delivery', () => {
     expect(slack.chat.postMessage).not.toHaveBeenCalled();
   });
 
-  it('retains tool progress and updates it after expiry without needing text deltas', async () => {
+  it('keeps internal tool progress out of the recovered answer', async () => {
     await expire();
     manager.handleTask(session, 'tool', 'Query database', 'in_progress', 'Fetching results');
     await session.stream.chain;
     await vi.advanceTimersByTimeAsync(1500);
-    expect(slack.chat.update.mock.lastCall[0].text).toContain('Fetching results');
+    expect(slack.chat.update.mock.lastCall[0].text).toBe('Hello world');
     manager.handleTask(session, 'tool', 'Query database', 'complete');
     await session.stream.chain;
     await vi.advanceTimersByTimeAsync(1500);
-    expect(slack.chat.update.mock.lastCall[0].text).toContain('complete: Query database');
+    expect(slack.chat.update.mock.lastCall[0].text).toBe('Hello world');
     expect(slack.chat.update.mock.lastCall[0].text).not.toContain('in_progress');
   });
 

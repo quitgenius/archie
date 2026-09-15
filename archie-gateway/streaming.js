@@ -345,7 +345,7 @@ class StreamingManager {
 
   _makeStream() {
     return { ts: null, taskCounter: 0, chain: null, stopped: false, _taskStatuses: {}, _statusTimer: null,
-      text: '', tasks: new Map(), recovering: false, recoveryTimer: null, lastRecoveryUpdate: null };
+      text: '', recovering: false, recoveryTimer: null, lastRecoveryUpdate: null };
   }
 
   /**
@@ -382,12 +382,7 @@ class StreamingManager {
       if (s.userStopped || s.disposed) return;
       for (const chunk of chunks) {
         if (chunk.type === 'markdown_text') s.text += chunk.text || '';
-        if (chunk.type === 'plan_update') s.plan = chunk.title;
-        if (chunk.type === 'task_update') {
-          s.tasks.set(chunk.id, chunk);
-          // Keep progress bounded even for turns with hundreds of tools.
-          if (s.tasks.size > 10) s.tasks.delete(s.tasks.keys().next().value);
-        }
+
       }
       if (s.recovering) { await this._scheduleRecovery(session, s); return; }
       try {
@@ -458,11 +453,8 @@ class StreamingManager {
     const first = parts[0] || '';
     // Use ordinary message text so long code fences and tables are not cut into
     // independent 3,000-character section blocks. Clear the frozen native blocks.
-    const progress = [...s.tasks.values()].map((task) =>
-      `${task.status}: ${task.title}${task.details ? ` — ${task.details}` : ''}`).join('\n');
-    const escapedProgress = progress.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-    const status = splitText(escapedProgress || (final ? 'Complete' : 'Working…'), 3000)[0];
-    const rendered = final ? first || status : [first, progress || !first ? status : ''].filter(Boolean).join('\n\n');
+    // Internal tool names/statuses belong to native progress cards, not the answer.
+    const rendered = first || (final ? 'Complete' : 'Working…');
     s.lastRecoveryUpdate = Date.now();
     try {
       await this._slack.chat.update({ channel: session.channel, ts: s.ts, text: rendered, blocks: [] });
