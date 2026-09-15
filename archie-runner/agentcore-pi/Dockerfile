@@ -79,6 +79,15 @@ RUN cd slack-reply-plugin \
   && npx esbuild index.ts --bundle --format=cjs --platform=node --target=node22 \
        --outfile=/build/plugins/slack-reply-plugin.cjs
 
+# file-publish-plugin: `save_artifact` — S3 upload + a 24h presigned URL. @aws-sdk/client-s3 and
+# s3-request-presigner are pure JS and bundle fine (demo-cache-plugin already bundles the former).
+COPY file-publish-plugin/ ./file-publish-plugin/
+RUN cd file-publish-plugin \
+  && npm install --omit=dev --no-fund --no-audit \
+  && npm install esbuild --no-save --no-fund --no-audit \
+  && npx esbuild index.ts --bundle --format=cjs --platform=node --target=node22 \
+       --outfile=/build/plugins/file-publish-plugin.cjs
+
 # ── stage 2: runtime ──
 FROM node:22-slim
 WORKDIR /app

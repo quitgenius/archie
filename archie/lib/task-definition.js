@@ -21,8 +21,10 @@
 // carries the same list, and it must stay in step):
 //   AGENT_URLS, ECS_CLUSTER_NAME, ECS_AGENT_PREFIX  — the OpenClaw per-agent gateway model
 //   GH_CONFIG_REPO, GH_CONFIG_REF, CONFIG_SOURCE    — config moved to DynamoDB
-//   ARTIFACTS_S3_BUCKET                             — only consumers were file-publish-plugin and
-//                                                     admin-server.js, neither shipped
+//   (ARTIFACTS_S3_BUCKET was here, with "its only consumers were file-publish-plugin and
+//    admin-server.js, neither shipped". Both halves of that changed: the plugin now ships in the Pi
+//    image and the gateway reads the bucket itself for the Files tab, because an AgentCore runtime
+//    has no admin-server to ask. It is composed above, derived rather than published.)
 //   NODE_TLS_REJECT_UNAUTHORIZED                    — existed for the self-signed ALB certificate
 //   SLACK_ROUTES                                    — dropped (§4.5); an empty escape hatch
 //   CRON_ENABLED                                    — cut pending a per-agent flag (§4.6)
@@ -231,6 +233,20 @@ const ROLLING = SERVICE.deploymentConfiguration.minimumHealthyPercent > 0;
  */
 const SSM_PREFIX = '/archie/gateway';
 
+/**
+ * The artifacts bucket `save_artifact` publishes to — `<name>-artifacts-<account>`.
+ *
+ * NOT in `resourcesFor` with every other name, and the exception is the whole point: an S3 bucket
+ * name is GLOBALLY unique, so `archie-artifacts` can exist in exactly one AWS account on earth while
+ * this module deploys to three. The account is therefore part of the name and the one-knob
+ * derivation cannot reach it. modules/archie/s3.tf composes the same two parts; if one changes, both
+ * must, and the failure mode is a gateway listing a bucket that does not exist.
+ */
+function artifactsBucketName(name, account) {
+  if (!name || !account) throw new CliError('artifactsBucketName needs a deployment name and an account');
+  return `${name}-artifacts-${account}`;
+}
+
 // ── composition ──────────────────────────────────────────────────────────────────────────────────
 
 /**
@@ -293,6 +309,26 @@ function composeEnvironment({ resources, region, facts, ssm }) {
     AGENTCORE_VPC_ID: facts.vpcId,
     AGENTCORE_SECURITY_GROUP_ID: facts.runtimeSecurityGroupId,
     TURN_QUEUE_URL: facts.turnQueueUrl,
+
+    // The artifacts bucket — read by the Files tab (files-store.js) and written into every derived
+    // per-agent role (derived-role.js) and every runtime's env (agentcore-client.js runtimeEnv), all
+    // three from THIS one variable, so the grant, the destination and the listing cannot disagree.
+    //
+    // DERIVED, not published in SSM, and the extra `-<account>` is the reason it needs `facts`: an
+    // S3 bucket name is globally unique, so `archie-artifacts` can exist in one account on earth
+    // while this module deploys to three. modules/archie/s3.tf composes the same two parts.
+    //
+    // ADDING A VARIABLE THE AGENT HALF READS COSTS TWO PASSES, and this one did. `archie deploy`
+    // runs agents BEFORE the gateway (cmd/deploy.js: "the order is a constraint"), and the agent half
+    // seeds its own configuration from the DEPLOYED dispatcher's task definition rather than from the
+    // shell (lib/dispatcher-env.js, `needsFleetEnv`) — deliberately, because reading the shell is how
+    // one laptop's exported variable bakes itself into a fleet-wide generation. So on the deploy that
+    // FIRST introduces a variable, the agent half reads the task definition that predates it: the
+    // derived roles were written with no S3 statement and the runtimes with no bucket, and nothing
+    // failed. It self-corrects on the next run, because the variable is inside the runtime-name
+    // fingerprint, so those agents no longer look staged and are re-provisioned with it. Observed in
+    // the sandbox 2026-09-14; run `archie deploy` twice when adding one of these.
+    ARTIFACTS_S3_BUCKET: artifactsBucketName(resources.name, facts.account),
   };
 
   // Connector's fallback key. Conditional on the secret EXISTING, mirroring Terraform's
@@ -588,7 +624,7 @@ function requireFacts(facts, keys) {
 module.exports = {
   CONSTANTS, SSM_PARAMETERS, SSM_HANDLES, SSM_SERVICE, SERVICE, ROLLING, DEPLOYMENT_SHAPES,
   PORT, CONTAINER_NAME, CPU, MEMORY,
-  SSM_PREFIX, dispatcherBaseUrl, healthCheckCommand,
+  SSM_PREFIX, dispatcherBaseUrl, healthCheckCommand, artifactsBucketName,
   composeEnvironment, composeTaskDefinition, composeCronHydratorTaskDefinition,
   composeCronPurgeTaskDefinition,
 };

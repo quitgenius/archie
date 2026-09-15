@@ -144,6 +144,12 @@ export const TOOLLESS_CAPABILITIES = new Set([
 // know them.
 export const PLUGIN_PROVIDERS = {
   connector: { capabilities: ['connector', 'health'], kind: 'plugin' },
+  // file-publish is a STATIC plugin surface, unlike the three below it: it registers exactly one
+  // tool, `save_artifact`, whatever the agent's config says (config-map ALWAYS_ATTACH_PLUGINS). It
+  // is here rather than in CUSTOM_TOOLS because that map is the adapter-native surface and
+  // tool-registry.test.mjs asserts it matches allCustomTools() in both directions — a plugin tool
+  // listed there fails that test.
+  'file-publish': { capabilities: ['files.publish'], kind: 'plugin', tools: ['save_artifact'] },
   'demo-cache': { capabilities: ['demo_cache'], kind: 'plugin' },
   'mcp-auth': { capabilities: ['demo_warehouse'], kind: 'plugin' },
   hindsight: { capabilities: ['hindsight.read', 'hindsight.write'], kind: 'plugin-hooks' },
@@ -176,6 +182,10 @@ export const PROVIDER_NAMES = new Set([
   // provider is a tool the dispatcher cannot describe or grant against.
   'hindsight.write',
   'connector', 'demo-cache', 'mcp-auth', 'hindsight',
+  // `file-publish` — save_artifact's provider. Needed here for the same reason as the two above:
+  // provider-registry's closure check requires every capability that has tools to have a provider,
+  // and grants.js derives the universe the Tools tab describes from this set.
+  'file-publish',
 ]);
 
 // The plugin-enable tokens that appear as `requires.plugins` keys (and the equivalent alsoAllow
@@ -188,6 +198,7 @@ export const PLUGIN_TOKEN_PROVIDER = {
   'mcp-auth-plugin': 'mcp-auth', // bare-id alias (the G7 mcp-auth alias)
   'connector-session-plugin': 'connector',
   'hindsight-openclaw': 'hindsight',
+  'file-publish-plugin': 'file-publish',
 };
 
 /**

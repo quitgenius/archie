@@ -435,6 +435,41 @@ test('without git the digest still works, and --pure refuses rather than guessin
   assert.throws(() => assertPure(ALPHA, opts(root)), (e) => e.exitCode === EXIT.REFUSED);
 });
 
+test('every context directory the AGENT Dockerfile COPYs is a DECLARED digest input', () => {
+  // THE SAME MISSING DIRECTION as the gateway test below, on the other image — and it had already
+  // gone wrong: slack-reply-plugin was bundled into stage 1 on 2026-09-03 and never declared, so for
+  // eleven days an edit to `slack_send` left the agent tag unchanged and `archie deploy` would have
+  // reported the image current while rolling onto the old one.
+  //
+  // Only COPYs FROM THE BUILD CONTEXT count. `--from=lintroot` / `--from=plugins` / `--from=amazon/…`
+  // read from another stage or image, not from the tree, so their sources are not inputs — the stages
+  // they come from are covered by the directories those stages themselves COPY.
+  const root = path.resolve(__dirname, '..', '..');
+  const dockerfile = fs.readFileSync(path.join(root, 'archie-runner/agentcore-pi/Dockerfile'), 'utf8');
+
+  const copied = new Set();
+  for (const line of dockerfile.split('\n')) {
+    const m = /^COPY\s+(?!--from=)(?:--[^\s]+\s+)*([^\s]+)/.exec(line.trim());
+    if (!m) continue;
+    const top = m[1].replace(/^\.\//, '').split('/')[0];
+    if (top && !top.startsWith('-')) copied.add(`archie-runner/${top}`);
+  }
+
+  const declared = new Set(IMAGES.agent.inputs.map((e) => e.path));
+  // A declared FILE inside a copied directory counts as covering it only if the directory itself is
+  // declared; `insight-queries.js` is declared as a file and its directory deliberately is not, so
+  // the check is on the directory the COPY names.
+  const undeclared = [...copied].filter((p) => !declared.has(p)
+    && ![...declared].some((d) => p.startsWith(`${d}/`) || d.startsWith(`${p}/`))).sort();
+
+  assert.deepEqual(
+    undeclared, [],
+    'COPYed from the build context by archie-runner/agentcore-pi/Dockerfile but NOT declared in '
+    + 'digest.js IMAGES.agent.inputs — edits to these would not change the tag, so deploy would '
+    + `silently skip the build:\n  ${undeclared.join('\n  ')}`,
+  );
+});
+
 test('every archie-gateway module the Dockerfile COPYs is a DECLARED digest input', () => {
   // THE MISSING DIRECTION, and the reason this failure keeps recurring.
   //

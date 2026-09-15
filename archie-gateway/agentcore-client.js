@@ -111,6 +111,12 @@ function baseConfig() {
     datadogApiKeySecret: process.env.DATADOG_API_KEY_SECRET || 'agent-4ggvzl-datadog-api-key',
     datadogAppKeySecret: process.env.DATADOG_APP_KEY_SECRET || 'agent-4ggvzl-datadog-app-key',
     datadogKeySecretRegion: process.env.DATADOG_KEY_SECRET_REGION || 'us-east-1',
+    // The artifacts bucket for `save_artifact` (file-publish-plugin). NO DEFAULT, deliberately: an
+    // S3 bucket name is account-global, so a baked-in fallback would either point a deployment at
+    // another account's bucket or at one that does not exist. Unset = the feature is off, and the
+    // tool says so at call time. The derived role's S3 statement is keyed off the SAME env var
+    // (derived-role.js artifactsBucket), so the grant and the destination cannot disagree.
+    artifactsBucket: process.env.ARTIFACTS_S3_BUCKET || '',
     // Dispatcher connectivity for the runtime's cron tool (pi-cron-migration-plan §2b): the
     // tool calls the dispatcher manager API to schedule jobs. Base URL is the dispatcher's
     // own FQDN (same one it's reached at); the secret is resolved at boot from Secrets Manager
@@ -333,6 +339,9 @@ function createAgentCoreClient(overrides = {}) {
       DATADOG_APP_KEY_SECRET: config.datadogAppKeySecret,
       DATADOG_KEY_SECRET_REGION: config.datadogKeySecretRegion,
       EFS_DIR: config.efsMountPath,
+      // save_artifact's destination. Conditional: an empty value would make the plugin build an
+      // S3 client against a nameless bucket instead of returning "not configured".
+      ...(config.artifactsBucket ? { ARTIFACTS_S3_BUCKET: config.artifactsBucket } : {}),
       // Cron tool → dispatcher manager API (secret resolved at boot by pi-entrypoint).
       DISPATCHER_BASE_URL: config.dispatcherBaseUrl,
       DISPATCHER_SHARED_SECRET_ID: config.dispatcherSecretId,

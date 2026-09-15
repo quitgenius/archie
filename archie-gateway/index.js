@@ -67,6 +67,7 @@ const { diffObserved, specDiff } = require('./spec-diff');
 const { createDispatcherMetrics } = require('./dispatcher-metrics');
 const { createRuntimeQuotaSampler } = require('./runtime-quota-metrics');
 const { generateFileRef: _generateFileRef, parseFileRef } = require('./file-ref');
+const { createFilesStore } = require('./files-store');
 const { Readable } = require('node:stream');
 const { pipeline } = require('node:stream/promises');
 // @opentelemetry/api only (no-op tracer until ./tracing registers a provider) — M2 phase spans.
@@ -289,6 +290,15 @@ const owners = createOwners({
 const bedrockClient = new BedrockClient({ region: process.env.AWS_REGION || 'us-east-1' });
 // Bedrock Runtime — used for conversation title summarization via Claude Haiku.
 const bedrockRuntimeClient = new BedrockRuntimeClient({ region: process.env.AWS_REGION || 'us-east-1' });
+
+// The Files tab's S3 access. The gateway reads the artifacts bucket DIRECTLY — an AgentCore runtime
+// has no HTTP surface for the dispatcher to ask (the OpenClaw path went through admin-server.js in
+// the ECS task, which does not exist here). ARTIFACTS_S3_BUCKET unset = the feature is off, and the
+// tab says so rather than showing an empty list.
+const filesStore = createFilesStore({
+  bucket: process.env.ARTIFACTS_S3_BUCKET || '',
+  region: process.env.AWS_REGION || 'us-east-1',
+});
 
 // How long we wait for an agent before giving up + retrying once.
 const FORWARD_TIMEOUT_MS = parseInt(process.env.FORWARD_TIMEOUT_MS || '30000', 10);
@@ -1491,6 +1501,9 @@ if (bolt) bolt.event('app_home_opened', async ({ event, client }) => {
     if (activeTab === 'tools' && agentId) {
       opts.tools = await fetchToolPermissions(agentId);
     }
+    if (activeTab === 'files' && agentId) {
+      opts.files = await fetchAgentFiles(agentId);
+    }
     if (activeTab === 'approvals') {
       opts.approvalsStore = approvalsStore;
       opts.approverUserId = userId;
@@ -1589,15 +1602,22 @@ if (bolt) bolt.action(marketplace.AGENT_SELECT_ACTION, async ({ ack, body, clien
   // resolve the new agent themselves through homeTargetFor — nothing here passes an agent id.
   // Jobs and Tools have their own refreshers because those tabs need data fetched; every other tab
   // renders from state buildHomeView already has.
-  // Jobs, Tools, Owners and Approvals all FETCH their tab's data, so each has its own publisher.
-  // Routing them through refreshHome would render the new agent's tab with the data absent — which
-  // Owners and Tools deliberately draw as "could not read this", so the switch would look like a
-  // permissions failure rather than a fetch that was never made.
+  // Jobs, Tools, Owners, Approvals and Files all FETCH their tab's data, so each has its own
+  // publisher. Routing them through refreshHome would render the new agent's tab with the data absent
+  // — which Owners and Tools deliberately draw as "could not read this", so the switch would look
+  // like a permissions failure rather than a fetch that was never made.
+  //
+  // FILES WAS MISSING FROM THIS LIST and fell through to refreshHome, which publishes with no `files`
+  // — and buildFilesTab renders absent data as "Couldn't load files — the artifacts bucket is
+  // unreachable or not configured". So switching agent while on the Files tab reported a broken
+  // bucket for a read nobody had made, and clicking another tab and back fixed it because the tab
+  // button's own handler does fetch. Reported and reproduced 2026-09-15.
   const tab = userActiveTab.get(userId) || 'conversations';
   if (tab === 'jobs') await refreshJobsTab(userId, client);
   else if (tab === 'tools') await refreshToolsTab(userId, client);
   else if (tab === 'owners') await publishOwnersTab(userId, client);
   else if (tab === 'approvals') await publishApprovalsTab(userId, client);
+  else if (tab === 'files') await refreshFilesTab(userId, client);
   else await refreshHome(userId, scopeId, tab, client, child);
 });
 
@@ -2288,6 +2308,127 @@ if (bolt) bolt.view('jobs_delete_confirm', async ({ ack, body, client, view }) =
     await refreshJobsTab(userId, client);
   } catch (err) {
     log.error({ err: err.message, jobId }, 'jobs_delete_confirm failed');
+  }
+});
+
+// ---------- Files tab ----------
+//
+// All three handlers talk to S3 through `filesStore`, never to the agent: an AgentCore runtime is
+// reachable only via InvokeAgentRuntime, so the OpenClaw design (dispatcher → admin-server → aws
+// CLI) has no equivalent here. See files-store.js for what that buys.
+//
+// The prefix is ALWAYS `homeTargetFor(userId)` — the viewer's own scope, resolved server-side. The
+// filename is the only thing taken from the Slack payload, and files-store sanitizes it.
+
+/** A failed list must stay `null`: the tab renders that as an error, not as "no files yet". */
+async function fetchAgentFiles(agentId) {
+  if (!agentId) return null;
+  try {
+    return await filesStore.listFiles(agentId);
+  } catch (err) {
+    log.warn({ agent: agentId, err: err.message }, 'failed to list agent files');
+    return null;
+  }
+}
+
+if (bolt) bolt.action('marketplace_tab_files', async ({ ack, body, client }) => {
+  await ack();
+  const userId = body.user.id;
+  const agentId = await homeTargetFor(userId, 'app_home');
+  userActiveTab.set(userId, 'files');
+  const files = await fetchAgentFiles(agentId);
+  try {
+    const view = marketplace.buildHomeView(agentId, 'files', await homeViewOptionsAsync(userId, agentId, { files }));
+    await client.views.publish({ user_id: userId, view });
+  } catch (err) {
+    log.error({ err: err.message }, 'failed to switch to files tab');
+  }
+});
+
+async function refreshFilesTab(userId, client) {
+  const agentId = await homeTargetFor(userId, 'app_home');
+  if (!agentId) return;
+  const files = await fetchAgentFiles(agentId);
+  const view = marketplace.buildHomeView(agentId, 'files', await homeViewOptionsAsync(userId, agentId, { files }));
+  await client.views.publish({ user_id: userId, view });
+}
+
+// A MODAL, not an ephemeral message. chat.postEphemeral is silently not delivered in an
+// assistant/agent-mode Slack app — which archie is — so the OpenClaw version's "Get Link" produced
+// nothing at all in agent mode while working in classic apps. A modal renders identically in both.
+const filesLinkModal = (blocks, closeText = 'Done') => ({
+  type: 'modal',
+  title: { type: 'plain_text', text: 'File Link' },
+  close: { type: 'plain_text', text: closeText },
+  blocks,
+});
+
+if (bolt) bolt.action('files_presign', async ({ ack, body, client }) => {
+  await ack();
+  const userId = body.user.id;
+  const agentId = await homeTargetFor(userId, 'app_home');
+  if (!agentId) return;
+  let filename;
+  try {
+    filename = JSON.parse(body.actions[0].value).filename;
+  } catch { return; }
+
+  // Open the loading view FIRST: trigger_id expires in ~3s. Presigning from here is sub-second
+  // (it is a local signature, not a call), but views.open is the only step that needs the
+  // trigger_id, so doing it first costs nothing and removes the whole class of expiry failure.
+  let viewId;
+  try {
+    const opened = await client.views.open({
+      trigger_id: body.trigger_id,
+      view: filesLinkModal([
+        { type: 'section', text: { type: 'mrkdwn', text: `:hourglass_flowing_sand: Generating a download link for *${filename}*…` } },
+      ]),
+    });
+    viewId = opened.view.id;
+  } catch (err) {
+    log.error({ err: err.message, filename }, 'files_presign views.open failed');
+    return;
+  }
+
+  try {
+    const url = await filesStore.presignFile(agentId, filename);
+    await client.views.update({
+      view_id: viewId,
+      view: filesLinkModal([
+        { type: 'section', text: { type: 'mrkdwn', text: `:link: *${filename}*\n\n<${url}|Download this file>` } },
+        { type: 'actions', elements: [{ type: 'button', text: { type: 'plain_text', text: 'Open file', emoji: true }, url, action_id: 'files_link_open' }] },
+        { type: 'context', elements: [{ type: 'mrkdwn', text: 'This link is valid for 24 hours.' }] },
+      ]),
+    });
+  } catch (err) {
+    log.error({ err: err.message, agent: agentId, filename }, 'files_presign failed');
+    await client.views.update({
+      view_id: viewId,
+      view: filesLinkModal([
+        { type: 'section', text: { type: 'mrkdwn', text: `:x: Couldn't generate a link for *${filename}*. Please try again.` } },
+      ], 'Close'),
+    }).catch((e2) => log.error({ err: e2.message, filename }, 'files_presign error-view update failed'));
+  }
+});
+
+// A URL button still emits an interaction; ack it or Slack shows a "not configured to handle this"
+// warning next to a link that opened perfectly well client-side.
+if (bolt) bolt.action('files_link_open', async ({ ack }) => { await ack(); });
+
+if (bolt) bolt.action('files_delete', async ({ ack, body, client }) => {
+  await ack();
+  const userId = body.user.id;
+  const agentId = await homeTargetFor(userId, 'app_home');
+  if (!agentId) return;
+  let filename;
+  try {
+    filename = JSON.parse(body.actions[0].value).filename;
+  } catch { return; }
+  try {
+    await filesStore.deleteFile(agentId, filename);
+    await refreshFilesTab(userId, client);
+  } catch (err) {
+    log.error({ err: err.message, agent: agentId, filename }, 'files_delete failed');
   }
 });
 

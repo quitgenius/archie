@@ -3,7 +3,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const {
-  CONSTANTS, SSM_PARAMETERS, PORT, SSM_PREFIX, dispatcherBaseUrl,
+  CONSTANTS, SSM_PARAMETERS, PORT, SSM_PREFIX, dispatcherBaseUrl, artifactsBucketName,
   composeEnvironment, composeTaskDefinition, composeCronPurgeTaskDefinition,
 } = require('./task-definition');
 const { resourcesFor } = require('./context');
@@ -137,10 +137,25 @@ test('the dropped and cut variables are gone, and stay gone', () => {
   assert.equal('SLACK_ROUTES' in env, false);
   assert.equal('CRON_ENABLED' in env, false);
   // Verified to have zero readers in the current image; a revival would be silent.
+  //
+  // ARTIFACTS_S3_BUCKET LEFT THIS LIST DELIBERATELY, and this note is the record of why rather than a
+  // test edited to suit code. It was dropped because its only two consumers — file-publish-plugin and
+  // admin-server.js — never shipped under archie. Both facts changed together: the plugin ships in the
+  // Pi image, and the gateway itself now reads the bucket for the Files tab, because an AgentCore
+  // runtime has no admin-server to ask. Its presence is asserted positively below.
   for (const dead of ['AGENT_URLS', 'ECS_CLUSTER_NAME', 'ECS_AGENT_PREFIX', 'GH_CONFIG_REPO',
-    'GH_CONFIG_REF', 'CONFIG_SOURCE', 'ARTIFACTS_S3_BUCKET', 'NODE_TLS_REJECT_UNAUTHORIZED']) {
+    'GH_CONFIG_REF', 'CONFIG_SOURCE', 'NODE_TLS_REJECT_UNAUTHORIZED']) {
     assert.equal(dead in env, false, `${dead} must not be composed`);
   }
+});
+
+test('the artifacts bucket is derived from the name AND the account', () => {
+  // The account is in the NAME because S3 bucket names are global — `archie-artifacts` can exist in
+  // one account on earth and this module deploys to three. modules/archie/s3.tf composes the same
+  // two parts, and a disagreement is a gateway listing a bucket that does not exist.
+  assert.equal(envMap(compose()).ARTIFACTS_S3_BUCKET, `${RESOURCES.name}-artifacts-${FACTS.account}`);
+  assert.throws(() => artifactsBucketName('archie', undefined), /needs a deployment name and an account/);
+  assert.throws(() => artifactsBucketName(undefined, '1'), /needs a deployment name and an account/);
 });
 
 test('a fact that discovery failed to resolve refuses rather than composing a hole', () => {

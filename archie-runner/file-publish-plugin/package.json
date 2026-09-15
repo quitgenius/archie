@@ -1,0 +1,18 @@
+{
+  "name": "@myorg/file-publish-plugin",
+  "version": "0.1.0",
+  "description": "Registers a save_artifact tool that publishes a file to the archie artifacts bucket under the agent's own prefix and returns a 24h presigned URL. All config from env (ARTIFACTS_S3_BUCKET, AGENT_NAME, AWS_REGION); the plugin itself takes no configSchema.",
+  "type": "module",
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.600.0",
+    "@aws-sdk/s3-request-presigner": "^3.600.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.0.0"
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --test artifact.test.ts",
+    "typecheck": "tsc --noEmit"
+  }
+}

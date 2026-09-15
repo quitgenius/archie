@@ -406,6 +406,37 @@ describe('putDerivedGrants — live update must PRESERVE the scoped config read'
     });
   });
 
+  // THE SAME SHAPE AGAIN, third grant: the artifacts prefix. It is derived from the SCOPE, not from
+  // `caps` (files.publish is baseline, so it never appears in a GRANT# row), which means a writer that
+  // forgot to pass the bucket would revoke save_artifact on a working agent with nothing failing at
+  // write time. Both writers read it from the same env var, so both are pinned here.
+  describe('with an artifacts bucket configured', () => {
+    const BUCKET = 'archie-artifacts-203366135563';
+    let prev;
+    beforeEach(() => { prev = process.env.ARTIFACTS_S3_BUCKET; process.env.ARTIFACTS_S3_BUCKET = BUCKET; });
+    afterEach(() => { if (prev === undefined) delete process.env.ARTIFACTS_S3_BUCKET; else process.env.ARTIFACTS_S3_BUCKET = prev; });
+
+    it('a live rewrite carries S3OwnArtifactsPrefix, scoped to THIS agent only', async () => {
+      const iam = fakeIam({ roleExists: true });
+      await putDerivedGrants({ clients: clientsWith(iam), ...args({ agentId: 'dm-u0abc', caps: [] }) });
+      const s = docFrom(iam).Statement.find((x) => x.Sid === 'S3OwnArtifactsPrefix');
+      expect(s).toBeTruthy();
+      expect(s.Resource).toEqual(`arn:aws:s3:::${BUCKET}/dm-u0abc/*`);
+      expect(s.Action).not.toContain('s3:ListBucket');
+    });
+
+    it('cold provision writes the same statement — the two writers cannot diverge', async () => {
+      const provIam = fakeIam({ roleExists: true });
+      await deriveExecRoleSpec({
+        account: ACCOUNT, agentId: 'a', caps: [], baseManagedPolicyArn: BASE_POLICY,
+        ddbScope: { ...DDB_SCOPE(), artifactsBucket: BUCKET },
+      }).ensure({ clients: clientsWith(provIam) });
+      const liveIam = fakeIam({ roleExists: true });
+      await putDerivedGrants({ clients: clientsWith(liveIam), ...args({ caps: [] }) });
+      expect(docFrom(liveIam)).toEqual(docFrom(provIam));
+    });
+  });
+
   // A grant change for an agent that has never been provisioned has no role to update — and nothing to
   // lose, since the cold provision builds the full document from DDB itself. Report, don't throw (the
   // marketplace hook would otherwise log a scary non-fatal warning on every install for such agents).

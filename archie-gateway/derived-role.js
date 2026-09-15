@@ -145,6 +145,16 @@ function credentialSecretBase() {
   return process.env.CONNECTOR_API_KEY_SECRET || '';
 }
 
+// The artifacts bucket (`archie-artifacts-<account>`), read from the environment for exactly the
+// reasons above: it is a deployment constant identical for every agent, and it is the same value
+// dispatcher.tf passes to the runtime as ARTIFACTS_S3_BUCKET. Unset means the deployment has no
+// artifacts bucket and the statement is correctly omitted. BOTH writers of the `grants` policy must
+// set it — a rewrite that omitted it would silently revoke save_artifact on a working agent, which
+// is the failure mode credentialSecretBase's note describes and which cost a migrated agent its key.
+function artifactsBucket() {
+  return process.env.ARTIFACTS_S3_BUCKET || '';
+}
+
 // Build the role spec ensureExecRole consumes. ensure() is idempotent: get-or-create the role,
 // keep its (runtime) trust current, attach the base managed floor, and put the derived grants.
 // `ddbScope` ({agentId, account, region, table}) is REQUIRED: it is the ONLY config-table access the
@@ -245,7 +255,7 @@ async function putDerivedGrants({ clients, agentId, caps, account, region, table
   // written after its role was built (adoption and migration both write pointers out-of-band), and a
   // rewrite that dropped the ARN would revoke a working key exactly like the §9.9c downgrade.
   const pointerArn = await readCredentialPointerArn(clients.doc, table, agentId);
-  const doc = P.derivedGrantsPolicyDocument(caps, { agentId, account, region, table, credentialSecretBase: credentialSecretBase(), credentialSecretArn: pointerArn });
+  const doc = P.derivedGrantsPolicyDocument(caps, { agentId, account, region, table, credentialSecretBase: credentialSecretBase(), credentialSecretArn: pointerArn, artifactsBucket: artifactsBucket() });
   try {
     await iam.send(new C.PutRolePolicyCommand({ RoleName: roleName, PolicyName: 'grants', PolicyDocument: JSON.stringify(doc) }));
   } catch (e) {
@@ -279,6 +289,7 @@ async function resolveDerivedRole({ doc, tableName, account, agentId, baseManage
     agentId, account, region, table: tableName,
     credentialSecretBase: credentialSecretBase(),
     credentialSecretArn: await readCredentialPointerArn(doc, tableName, agentId),
+    artifactsBucket: artifactsBucket(),
   };
   if (logger && logger.info) logger.info({ agentId, caps, ddbScope }, 'derived exec role: per-agent role + scoped config read');
   return deriveExecRoleSpec({ account, agentId, caps, baseManagedPolicyArn, ddbScope });

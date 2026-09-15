@@ -22,7 +22,7 @@ import { buildSandboxProbeTools } from './sandbox-probe-tool.mjs';
 // The compat host is OPTIONAL: only plugins we ship a Pi bundle for are routed through
 // it; hindsight is Pi-NATIVE (own extension); everything else is logged as unsupported
 // (no silent gaps).
-const COMPAT_PLUGINS = new Set(['connector-session-plugin', 'demo-cache-plugin', 'openclaw-mcp-auth-plugin', 'slack-reply-plugin']); // have an esbuild bundle
+const COMPAT_PLUGINS = new Set(['connector-session-plugin', 'demo-cache-plugin', 'openclaw-mcp-auth-plugin', 'slack-reply-plugin', 'file-publish-plugin']); // have an esbuild bundle
 const DROPPED_PLUGINS = new Set([]); // empty today; the mechanism stays so a future drop is REPORTED, never silent
 
 // Attached to EVERY agent, whatever its per-agent plugin config says. `slack_send` is the only
@@ -31,13 +31,18 @@ const DROPPED_PLUGINS = new Set([]); // empty today; the mechanism stays so a fu
 // and Slack resolves a bare user id against the POSTING app, so "DM an operator" landed in Connector's DM
 // with an operator rather than ours. Live-caught 2026-09-03; see also the 2026-08-12 bash+curl incident
 // below, which was the same missing tool failing a different way.
-const ALWAYS_ATTACH_PLUGINS = ['slack-reply-plugin'];
+// file-publish-plugin is attached for the same reason and on the same evidence: `save_artifact` was
+// ambient across the whole OpenClaw fleet, its capability is baseline, and an agent that cannot
+// publish a report falls back to pasting a 400-line HTML file into Slack. What keeps one agent out
+// of another's files is the S3 prefix on its derived role, not withholding the tool.
+const ALWAYS_ATTACH_PLUGINS = ['slack-reply-plugin', 'file-publish-plugin'];
 const MEMORY_SLOT_NATIVE = 'hindsight-openclaw'; // handled by hindsight-extension.mjs
 
 // What a plugin PROVIDES, so the boot warning can name the missing tool rather than the plugin
 // nobody remembers the contents of. Only needs entries for plugins we drop or cannot load.
 const PLUGIN_TOOLS = {
   'slack-reply-plugin': ['slack_send'],
+  'file-publish-plugin': ['save_artifact'],
 };
 
 // Auto-injected bootstrap context files (verified in OpenClaw source). MEMORY.md/

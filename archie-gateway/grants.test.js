@@ -74,6 +74,17 @@ describe('describeCapabilities', () => {
     expect(grantable['fs.write'].derivedSources).toEqual(['agent-base', 'skill:understand']);
   });
 
+  it('names a plugin\'s static tools, and leaves the dynamic surfaces empty', async () => {
+    const { baseline } = await grants.describeCapabilities({});
+    // file-publish registers one fixed tool whatever the agent's config says, so the tab can say
+    // what the capability brings.
+    expect(baseline['files.publish'].provider).toBe('file-publish');
+    expect(baseline['files.publish'].tools).toEqual(['save_artifact']);
+    // connector's surface comes from the agent's connected toolkits, so an empty list is CORRECT
+    // here and is not the same thing as a missing declaration.
+    expect(baseline.connector.tools).toEqual([]);
+  });
+
   it('adds the agent\'s own MCP server capabilities, which no static catalogue can know', async () => {
     const { grantable } = await grants.describeCapabilities({}, ['demo_query_app', 'demo_warehouse']);
     expect(grantable.demo_query_app.policy).toBe('deny');

@@ -30,7 +30,11 @@ test('it reproduces the ported set, plus only deliberate additions', () => {
   // preserving, so every one must STILL be baseline. Anything added since is named separately and on
   // purpose — an accidental widening of the generally-available set still fails here.
   const PORTED = ['fs.read', 'memory', 'cron', 'otel', 'connector', 'health', 'hindsight.read'];
-  const ADDED_SINCE = ['slack.send']; // 2026-09-03: archie's own Slack send (slack-reply-plugin)
+  const ADDED_SINCE = [
+    'slack.send',     // 2026-09-03: archie's own Slack send (slack-reply-plugin)
+    'files.publish',  // 2026-09-14: save_artifact (file-publish-plugin) — ambient under OpenClaw; the
+                      // prefix on the agent's derived role is the isolation, not this flag
+  ];
   const { members, immutable } = baselineFrom(SANDBOX);
   assert.deepEqual(members, [...PORTED, ...ADDED_SINCE]);
   assert.deepEqual(immutable, ['otel', 'hindsight.read']);

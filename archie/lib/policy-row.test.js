@@ -69,7 +69,7 @@ test('three verdicts, and each one comes from a distinguishable place in the pol
   // `deny` — a pin whose group this scope is not in. Nothing can allow it.
   assert.equal(all['demo_cache'], VERDICT.DENY);
 
-  assert.equal(Object.keys(all).length, 32, 'the full map covers the whole domain');
+  assert.equal(Object.keys(all).length, 33, 'the full map covers the whole domain');
 });
 
 test('a pinned capability is never `grant`, in either environment', () => {

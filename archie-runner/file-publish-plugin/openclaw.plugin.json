@@ -1,0 +1,11 @@
+{
+  "id": "file-publish-plugin",
+  "name": "File Publish",
+  "description": "Registers a save_artifact tool. Uploads a file to the archie artifacts bucket under the agent's own prefix and returns a 24h presigned URL the agent can paste into Slack. All config from env (ARTIFACTS_S3_BUCKET, AGENT_NAME, AWS_REGION, EFS_DIR); the plugin itself takes no configSchema.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  },
+  "uiHints": {}
+}

@@ -43,6 +43,19 @@ check('slack-reply-plugin is attached even to an agent whose config never mentio
   assert.deepStrictEqual(findUnavailablePlugins(new Set(['slack-reply-plugin']), m), []);
 });
 
+// Same unconditional attach, and named with its tool for the same reason: "file-publish-plugin is
+// missing" does not tell anyone that `save_artifact` is the thing the agent lost.
+check('file-publish-plugin is attached even to an agent whose config never mentions it', () => {
+  const m = resolvePluginManifest({ plugins: { entries: {}, allow: [] } });
+  assert.ok(m.compat.some((c) => c.id === 'file-publish-plugin'), 'expected an unconditional attach');
+  assert.deepStrictEqual(findUnavailablePlugins(new Set(['file-publish-plugin']), m), []);
+});
+
+check('an allowed file-publish-plugin that did not load names save_artifact', () => {
+  const out = findUnavailablePlugins(new Set(['file-publish-plugin']), manifest());
+  assert.deepStrictEqual(out, [{ id: 'file-publish-plugin', reason: 'not-loaded', missingTools: ['save_artifact'] }]);
+});
+
 check('a loaded compat plugin is NOT reported', () => {
   const m = manifest({ compat: [{ id: 'connector-session-plugin' }] });
   assert.deepStrictEqual(findUnavailablePlugins(new Set(['connector-session-plugin']), m), []);

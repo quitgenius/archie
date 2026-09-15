@@ -163,6 +163,7 @@ const CAPABILITY_SUMMARY = {
   health: 'Report whether its own plugins loaded.',
   'hindsight.read': 'Recall facts from the read-only organisation knowledge bank.',
   'slack.send': 'Post Slack messages as Archie — used for cron jobs and cross-posting. Goes out under Archie\u2019s own bot identity, so it can only reach channels Archie is in, plus DMs with people who can DM Archie.',
+  'files.publish': 'Save files \u2014 reports, exports, diagrams \u2014 and share them by link. Files are private to this agent, listed on its Files tab, and expire after 90 days; each link works for 24 hours for anyone who has it.',
   // grant-required (default-deny)
   'fs.write': 'WRITE and edit files in its own workspace. Irreversible within the workspace; cannot reach anything outside it.',
   runtime: 'Run arbitrary shell commands in its sandbox \u2014 the broadest grant here. Anything the sandbox can reach, it can do, including network calls with its own credentials.',
@@ -212,6 +213,17 @@ async function toolCatalog() {
   }
   for (const [name, capability] of Object.entries(decl.CUSTOM_TOOLS)) {
     tools[name] = { capability, provider: reg.providerForCapability(registry, capability), kind: 'adapter' };
+  }
+  // Plugin tools that are STATIC — a plugin registering a fixed tool whatever the agent's config says.
+  // Most plugin surfaces are resolved per agent (connector's from its connected toolkits, mcp-auth's
+  // from its MCP servers) and correctly have no list here, which is why PLUGIN_PROVIDERS declares
+  // capabilities rather than tools. Where a plugin DOES name its tools, listing them means the Tools
+  // tab can say what the capability actually brings instead of showing a capability with no tools at
+  // all — which reads as a gap in the registry rather than as a dynamic surface.
+  for (const [provider, p] of Object.entries(decl.PLUGIN_PROVIDERS)) {
+    for (const name of p.tools || []) {
+      tools[name] = { capability: p.capabilities[0], provider, kind: 'plugin' };
+    }
   }
 
   // Every capability with a static policy, plus any a static tool or a plugin declares. Per-agent MCP

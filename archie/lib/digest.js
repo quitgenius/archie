@@ -126,6 +126,7 @@ const IMAGES = {
       { path: 'archie-gateway/conversations.js' },
       { path: 'archie-gateway/metrics.js' },
       { path: 'archie-gateway/file-ref.js' },
+      { path: 'archie-gateway/files-store.js' },
       { path: 'archie-gateway/agentcore-client.js' },
       { path: 'archie-gateway/agentcore-provisioning.js' },
       { path: 'archie-gateway/dispatcher-metrics.js' },
@@ -251,12 +252,21 @@ const IMAGES = {
       // Without it the agent digest would churn on every hydrate run and roll every agent in the fleet for nothing.
       { path: 'archie-runner/config-resolver', dir: true },
 
-      // Dockerfile:46-71 — stage 1 bundles the three compat plugins against the local plugin-sdk
-      // shim. Their sources are inputs even though only the bundled .cjs ships.
+      // Dockerfile:46-89 — stage 1 bundles every compat plugin against the local plugin-sdk shim.
+      // Their sources are inputs even though only the bundled .cjs ships.
+      //
+      // ONE PER BUNDLE, and the list must grow with the Dockerfile. slack-reply-plugin was bundled
+      // on 2026-09-03 and never added here, so for eleven days an edit to `slack_send` left the agent
+      // tag unchanged — `archie deploy` would have reported the image current and rolled onto the old
+      // one. That is the same silent-no-op class the gateway list has now hit three times, so it is
+      // asserted rather than trusted: digest.test.js walks this Dockerfile's context-directory COPYs
+      // and fails on any that nobody declared.
       { path: 'archie-runner/plugin-sdk', dir: true },
       { path: 'archie-runner/connector-session-plugin', dir: true },
       { path: 'archie-runner/demo-cache-plugin', dir: true },
       { path: 'archie-runner/openclaw-mcp-auth-plugin', dir: true },
+      { path: 'archie-runner/slack-reply-plugin', dir: true },
+      { path: 'archie-runner/file-publish-plugin', dir: true },
 
       // Dockerfile:101-106 — the single source of truth for the OTEL query corpus, shared with the
       // dashboard builder and the BDD suite so the tools and the dashboard cannot drift.

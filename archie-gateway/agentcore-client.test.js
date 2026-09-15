@@ -833,6 +833,36 @@ describe('session queue backlog alert', () => {
   });
 });
 
+// ── ARTIFACTS BUCKET ──────────────────────────────────────────────────────────
+//
+// THE ONE PLACE THE TWO HALVES OF THE FILES FEATURE COULD SILENTLY DISAGREE. The agent writes to
+// `<bucket>/<AGENT_NAME>/…` and the gateway's Files tab lists `<bucket>/<agentId>/…`. Those are the
+// same string only because runtimeEnv sets AGENT_NAME to the scope id — if that ever became a label
+// or a legacy efsRoot name, every agent would publish into a prefix its own tab could not see, with
+// nothing failing anywhere. Hence a test rather than a comment.
+describe('the artifacts prefix is the scope id, on both sides', () => {
+  let prev;
+  beforeEach(() => { prev = process.env.ARTIFACTS_S3_BUCKET; process.env.ARTIFACTS_S3_BUCKET = 'archie-artifacts-1'; });
+  afterEach(() => { if (prev === undefined) delete process.env.ARTIFACTS_S3_BUCKET; else process.env.ARTIFACTS_S3_BUCKET = prev; });
+
+  it('AGENT_NAME is the scope id the App Home addresses', () => {
+    const cl = createAgentCoreClient({ metrics: NOOP_METRICS });
+    for (const scope of ['dm-ux0mz5ckp2r', 'ch-cr89fluhion']) {
+      expect(cl.runtimeSpecFor(scope, TEST_IMAGE).envs.AGENT_NAME).toBe(scope);
+    }
+  });
+
+  it('carries the bucket when configured, and OMITS it when not', () => {
+    const cl = createAgentCoreClient({ metrics: NOOP_METRICS });
+    expect(cl.runtimeSpecFor('dm-ux0mz5ckp2r', TEST_IMAGE).envs.ARTIFACTS_S3_BUCKET).toBe('archie-artifacts-1');
+    delete process.env.ARTIFACTS_S3_BUCKET;
+    const off = createAgentCoreClient({ metrics: NOOP_METRICS });
+    // Absent, not empty: an empty bucket name would build an S3 client against nothing instead of
+    // producing the plugin's "ARTIFACTS_S3_BUCKET is not configured" result.
+    expect(Object.keys(off.runtimeSpecFor('dm-ux0mz5ckp2r', TEST_IMAGE).envs)).not.toContain('ARTIFACTS_S3_BUCKET');
+  });
+});
+
 // ── IMAGE GENERATIONS ─────────────────────────────────────────────────────────
 //
 // The runtime NAME encodes the image, so an image roll changes the name. That is what makes a roll
