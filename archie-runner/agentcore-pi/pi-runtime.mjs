@@ -258,6 +258,14 @@ export async function withModel(session, modelId, fn) {
   }
 }
 
+// Join whole assistant messages, never individual model chunks. Derive the separator
+// from completed text only so growing partial messages remain append-only.
+function appendAssistantMessage(completed, message) {
+  if (!completed || !message) return completed + message;
+  const separator = completed.endsWith('\n\n') ? '' : completed.endsWith('\n') ? '\n' : '\n\n';
+  return completed + separator + message;
+}
+
 // Subscribe, dispatch, collect the assistant reply + usage/model/stopReason off the
 // AgentSession event stream, unsubscribe. Returns the aggregate {text,usage,model,stopReason}.
 //
@@ -266,8 +274,7 @@ export async function withModel(session, modelId, fn) {
 // (per sse-contract), and tool start/end as `tool` events. onEvent does NOT receive the
 // terminal `final` event — the caller (adapter) emits that from the returned aggregate, so it
 // can also close the OTEL span with the same numbers. When `onEvent` is omitted, behaviour is
-// byte-identical to before: the returned aggregate is driven solely by `message_end`, so the
-// buffered-JSON path is unaffected.
+// driven by `message_end`, with the same message separators as the streamed path.
 export async function runTurn(session, prompt, onEvent) {
   // Old saved configurations and cron overrides can bypass the picker. Refuse a Global
   // profile before Pi can send a prompt, including automatic compaction/model requests.
@@ -315,11 +322,11 @@ export async function runTurn(session, prompt, onEvent) {
       // streaming delta — it does NOT surface a raw `text_delta` to subscribers (see
       // pi-agent-core agent-loop.js). Derive the accumulated assistant text and forward it
       // (contract: delta.text is the full text so far). `text` holds the already-completed
-      // assistant messages this turn, so `text + partial` stays monotonic across a
+      // assistant messages this turn; joining at that boundary stays monotonic across a
       // multi-message (tool-loop) turn.
       let partial = '';
       for (const b of ev.message?.content || []) if (b?.type === 'text') partial += b.text;
-      const acc = text + partial;
+      const acc = appendAssistantMessage(text, partial);
       if (acc.length > lastEmitted.length) { lastEmitted = acc; emit(deltaEvent(acc)); }
       return;
     }
@@ -356,9 +363,11 @@ export async function runTurn(session, prompt, onEvent) {
       if (emit) emit(toolEvent(ev.toolCallId, ev.toolName, ev.isError ? 'error' : 'done'));
       return;
     }
-    // Authoritative aggregate — unchanged; drives the return value, OTEL, and the buffered path.
+    // Authoritative aggregate uses the same message boundaries as streamed snapshots.
     if (t === 'message_end' && ev.message?.role === 'assistant') {
-      for (const b of ev.message.content || []) if (b?.type === 'text') text += b.text;
+      let messageText = '';
+      for (const b of ev.message.content || []) if (b?.type === 'text') messageText += b.text;
+      text = appendAssistantMessage(text, messageText);
       stopReason = ev.message.stopReason ?? stopReason;
       usage = ev.message.usage ?? usage;
       model = ev.message.model ?? model;

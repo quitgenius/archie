@@ -93,7 +93,7 @@ function assertAggregate(out, label) {
   assert.deepEqual(out.modelCalls.map((m) => m.usage), [{ input: 10, output: 2 }, { input: 15, output: 4 }],
     'tool-loop: per-request usage preserved (not the turn aggregate)');
   assert.deepEqual(out.modelCalls.map((m) => m.stopReason), ['toolUse', 'end_turn'], 'tool-loop: per-request stopReason');
-  assert.equal(out.text, 'step one done', 'tool-loop: turn text still aggregates');
+  assert.equal(out.text, 'step one \n\ndone', 'tool-loop: separate assistant messages have a blank line');
 }
 
 // (C) tool error → status 'error'
@@ -109,3 +109,26 @@ function assertAggregate(out, label) {
 }
 
 console.log('pi-runtime stream test: ALL PASS');
+
+// Message boundaries add paragraphs; chunks within a message remain byte-for-byte intact.
+for (const first of ['Progress 1.', 'Progress 1.\n', 'Progress 1.\n\n']) {
+  const prefix = first + (first.endsWith('\n\n') ? '' : first.endsWith('\n') ? '\n' : '\n\n');
+  const message = (type, content) => ({ type, message: { role: 'assistant', content } });
+  const blocks = (text) => [{ type: 'text', text }];
+  const script = [
+    message('message_update', blocks(first)), message('message_end', blocks(first)),
+    message('message_update', [{ type: 'toolCall', id: 't', name: 'bash' }]),
+    message('message_end', [{ type: 'toolCall', id: 't', name: 'bash' }]),
+    message('message_update', blocks('Hel')),
+    message('message_update', blocks('Hello\n```js\nconst x = 1;\n```')),
+    message('message_end', [{ type: 'text', text: 'Hel' }, { type: 'text', text: 'lo\n```js\nconst x = 1;\n```' }]),
+  ];
+  const events = [];
+  const streamed = await runTurn(fakeSession(script), 'test', (e) => events.push(e));
+  const buffered = await runTurn(fakeSession(script), 'test');
+  const expected = prefix + 'Hello\n```js\nconst x = 1;\n```';
+  assert.equal(streamed.text, expected);
+  assert.equal(buffered.text, expected);
+  assert.deepEqual(events.filter((e) => e.type === 'delta').map((e) => e.text), [first, prefix + 'Hel', expected]);
+}
+console.log('assistant message paragraph boundaries OK');
