@@ -32,10 +32,9 @@ export const foundationModelId = (id) => String(id || '').replace(/^(?:us|eu|ap|
 // These profiles still appear ACTIVE in ListInferenceProfiles, but live invocation on 2026-09-14
 // rejected them. Keep definitions for existing configs; do not offer them as working choices.
 // Re-enable only after the corresponding lifecycle/retention requirement is resolved and tested.
-// US Fable 5 verified with aws_review in production on 2026-09-15.
+// US Fable 5 verified in production and 5.1 in Austin sandbox with aws_review on 2026-09-15.
 // Other deployments must configure compatible Bedrock retention before invoking them.
 export const UNAVAILABLE_MODELS = {
-  'anthropic.claude-fable-5-1': 'Pi usage calculation fails because the model definition has no cost metadata',
   'anthropic.claude-3-sonnet-20240229-v1:0': 'Retired model',
   'anthropic.claude-3-haiku-20240307-v1:0': 'Legacy model access restricted by AWS',
   'anthropic.claude-opus-4-1-20250805-v1:0': 'Legacy model access restricted by AWS',

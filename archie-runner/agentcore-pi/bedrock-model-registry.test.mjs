@@ -57,8 +57,8 @@ test('unchanged config avoids reload; failed reload cannot acknowledge the new s
   assert.deepEqual(previous, { fp: 'old' });
 });
 
-test('US Fable 5 is selectable; global Fable and incompatible Fable 5.1 remain blocked', () => {
+test('US Fable 5 and 5.1 are selectable; global Fable remains blocked', () => {
   assert.equal(isSelectableModel('us.anthropic.claude-fable-5'), true);
   assert.equal(isSelectableModel('global.anthropic.claude-fable-5'), false);
-  assert.equal(isSelectableModel('us.anthropic.claude-fable-5-1'), false);
+  assert.equal(isSelectableModel('us.anthropic.claude-fable-5-1'), true);
 });
