@@ -84,6 +84,8 @@ function checkCompleteness(sources, caps) {
     ...Object.values(caps.ALSO_ALLOW_CAP).filter(Boolean),
     ...(caps.mcpCapabilities || []),
     ...(caps.hookOnly || []),
+    // Capabilities with no tool AND no token — see TOOLLESS_CAPABILITIES below.
+    ...(caps.toolless || []),
     ...(caps.slugs || []),
   ]);
   const out = [];
@@ -454,15 +456,23 @@ function runSourceChecks(sources, { caps, knownScopes = null, cedar } = {}) {
  *   hindsight.write           hook-only. It has no tool, no token and no prefix — the hindsight retain
  *                             gate names it directly (hindsight-extension.mjs) — so it appears in no
  *                             projection and must be added explicitly or it reads as dead.
+ *   TOOLLESS_CAPABILITIES     capabilities that are an IAM fact and a policy pin rather than a tool:
+ *                             the five reverted AWS/observability skills (which ALSO_ALLOW_CAP still
+ *                             projects, so they were never at risk) and the PIN-ONLY ones ported from
+ *                             OpenClaw's per-agent IAM map — `ec2`, `bedrock-mantle` — which no token
+ *                             map contains and which therefore read as dead declarations without this.
+ *                             Exactly the failure `grants.js` hit on 2026-09-08, which is why
+ *                             tool-declarations.mjs exports the set as data rather than a comment.
  *
  * The comms `slugs` are passed separately (semantics.json declares them) because they are connector
  * ACTION ids, not capabilities in the runtime's sense; check 2 treats them as part of the declared
  * universe so a typo'd slug is still caught.
  */
 async function capabilityUniverse(sources = null, { itemsDir = ITEMS_AGENTS } = {}) {
-  const [{ CAPABILITY_DEFAULTS }, { ALSO_ALLOW_CAP, prefixToCapability }] = await Promise.all([
+  const [{ CAPABILITY_DEFAULTS }, { ALSO_ALLOW_CAP, prefixToCapability }, { TOOLLESS_CAPABILITIES }] = await Promise.all([
     import(`file://${require.resolve('../../archie-runner/agentcore-pi/permissions/capabilities.mjs')}`),
     import(`file://${require.resolve('../../archie-runner/config-resolver/caps-from-config.mjs')}`),
+    import(`file://${require.resolve('../../archie-runner/agentcore-pi/tool-declarations.mjs')}`),
   ]);
   const data = sources?.data || {};
   // MCP prefixes are DERIVED from the agent configs, through the same prefixToCapability the runtime
@@ -475,6 +485,8 @@ async function capabilityUniverse(sources = null, { itemsDir = ITEMS_AGENTS } = 
     mcpCapabilities: [...new Set(prefixes.map((p) => prefixToCapability(p)))].sort(),
     // Hook-only: named directly by the hindsight retain gate, so it is in no token map and has no tool.
     hookOnly: ['hindsight.write'],
+    // No tool, and for the pin-only ones no token either — the runtime names them through IAM.
+    toolless: [...TOOLLESS_CAPABILITIES],
     slugs: Array.isArray(data.slugs) ? data.slugs : realKeys(data.slugs || {}),
     // TRUE when items/ was unavailable, so the reverse half of check 2 must report itself as partial
     // rather than claiming a capability is dead on incomplete evidence.
