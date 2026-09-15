@@ -5,7 +5,7 @@
 
 import http from 'node:http';
 import { mkdirSync, readFileSync, existsSync, statfsSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join, basename } from 'node:path';
 import { createRequire } from 'node:module';
 import { createHash } from 'node:crypto';
@@ -153,9 +153,24 @@ const SESSIONS_DIR = process.env.PI_SESSIONS_DIR || (EFS_DIR ? join(EFS_DIR, 'se
 // entrypoint (which sets PI_WORKSPACE=EFS_DIR).
 const CWD = process.env.PI_WORKSPACE || (EFS_DIR ? EFS_DIR : join(tmpdir(), 'pi-ws'));
 // Skills are ephemeral + per-agent now (sandra-repo-removal Phase 3): materialized from DDB to
-// local /tmp (NOT EFS), scoped to the agent's marketplace installs, refreshed per turn on change.
+// LOCAL DISK (NOT EFS), scoped to the agent's marketplace installs, refreshed per turn on change.
 // Local disk → no EFS round trips for skill reads; nothing to persist (DDB is the source).
-const SKILLS_DIR = process.env.PI_SKILLS_DIR || join(tmpdir(), 'pi-skills');
+//
+// `~/skills`, NOT `<tmp>/pi-skills`, since 2026-09-15 — the path OpenClaw uses. Every word of the
+// rationale above still holds (same container filesystem, same ephemerality, same DDB source); what
+// changes is that the fleet's PROSE becomes true. Skill and workspace files across the config repo
+// and the agents' own memories say `~/skills/<skill>/scripts/<x>.sh` — person79b333's MEMORY.md names that
+// path as her "primary lookup method" for secrets — and under `<tmp>/pi-skills` every one of those
+// was a confident instruction to a path that does not exist. Pi does inject each skill's absolute
+// <location> into the prompt, so the model could recover; but a wrong hint competing with a right
+// one is a bad trade when the alternative is one line.
+//
+// It also reaches what hydration CANNOT. `workspace-seed.mjs:51` is no-clobber ("never overwrite
+// live EFS state"), so an agent's own MEMORY.md is permanently out of reach of any config change we
+// could ship; moving the directory fixes those files without touching them.
+//
+// Overridable by PI_SKILLS_DIR, which nothing sets today — so this default IS the deployed path.
+const SKILLS_DIR = process.env.PI_SKILLS_DIR || join(homedir(), 'skills');
 
 // Cold-boot markers, shared epoch with any entrypoint (falls back to process start).
 const BOOT_EPOCH_MS = Number(process.env.BOOT_EPOCH_MS) || Date.now();
