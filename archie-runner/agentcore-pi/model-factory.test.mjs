@@ -52,12 +52,12 @@ test('factory prices match AWS, and the regional premium is applied', () => {
 });
 
 // The rule this protects: "a made-up cost that looks real is worse than a missing datapoint"
-// (pi-adapter resolveTurnCostUsd). An unknown family must carry NO cost, so pi-ai reports none and
+// (pi-adapter resolveTurnCostUsd). An unknown family needs non-finite cost fields, so
 // TurnCostUsd is simply not emitted — rather than a plausible, wrong number reaching a spend board.
-test('an unpriced family resolves but carries NO cost', () => {
+test('an unpriced family resolves with explicit unknown cost fields', () => {
   const m = getModel('global.anthropic.claude-mythos-9');
   assert.equal(src(m), 'factory:unpriced');
-  assert.equal(m.cost, undefined);
+  for (const key of ['input', 'output', 'cacheRead', 'cacheWrite']) assert.ok(Number.isNaN(m.cost[key]));
   // Conservative context: under-stating makes Pi compact early; over-stating builds requests
   // Bedrock rejects. A degraded turn beats a failed one.
   assert.ok(m.contextWindow <= 200000);
@@ -93,4 +93,17 @@ test('every synthesised Claude declares reasoning — including Claude 5', () =>
     'global.anthropic.claude-fable-5', 'anthropic.claude-opus-4-8', 'us.anthropic.claude-opus-4-7']) {
     assert.equal(getModel(id).reasoning, true, `${id} must request thinking`);
   }
+});
+test('Fable 5.1 completes Pi cost calculation without fabricating a spend metric', async () => {
+  const { calculateCost } = await import('@mariozechner/pi-ai');
+  const { aggregateReplyUsage } = await import('./reply-usage.mjs');
+  const model = getModel('us.anthropic.claude-fable-5-1');
+  const usage = { input: 100, output: 20, cacheRead: 10, cacheWrite: 5, totalTokens: 135, cost: {} };
+  assert.doesNotThrow(() => calculateCost(model, usage));
+  assert.ok(Number.isNaN(usage.cost.total));
+  const reply = aggregateReplyUsage([{ model: model.id, usage, stopReason: 'stop' }]);
+  assert.equal(reply.costUsd, undefined);
+  assert.equal(reply.input, 100);
+  assert.equal(reply.output, 20);
+  assert.equal(reply.stopReason, 'stop');
 });

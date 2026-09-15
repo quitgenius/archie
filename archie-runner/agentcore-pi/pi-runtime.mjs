@@ -100,8 +100,8 @@ function synthesiseFromSibling(id) {
 // made-up cost that looks real is worse than a missing datapoint" (pi-adapter resolveTurnCostUsd).
 // So a guessed price here would not be a small inaccuracy — it would defeat that rule fleet-wide.
 // The table is therefore transcribed from AWS's OWN published prices, and a family that is not in it
-// gets NO cost at all: pi-ai then reports none, the adapter emits none, and the datapoint is
-// honestly missing rather than quietly wrong.
+// gets NaN cost fields: Pi requires the object for usage calculation, while the adapter
+// omits non-finite cost metrics rather than reporting a fabricated price.
 //
 // SOURCE: AWS Price List, offer `AmazonBedrockFoundationModels`, us-east-1, published 2026-08-14.
 // Figures are the GLOBAL tier; regional (`us.`/`eu.`/`ap.` prefixes) is a uniform +10%, verified
@@ -175,8 +175,9 @@ function bedrockClaudeModel(id) {
     input: ['text', 'image'],
     contextWindow: (known || UNKNOWN_CLAUDE).contextWindow,
     maxTokens: (known || UNKNOWN_CLAUDE).maxTokens,
-    // Omitted entirely when the family is unknown — see the note above on why a guess is worse.
-    ...(known?.cost ? { cost: scale(known.cost) } : {}),
+    // Pi dereferences all four fields. NaN preserves unknown pricing without crashing or
+    // producing a false zero-cost metric (the adapter only emits finite costs).
+    cost: known?.cost ? scale(known.cost) : { input: NaN, output: NaN, cacheRead: NaN, cacheWrite: NaN },
     _synthesisedBy: known ? 'factory' : 'factory:unpriced',
   };
 }
@@ -202,10 +203,10 @@ export function getModel(id) {
   if (built) {
     console.error(JSON.stringify({
       level: 'warn', component: 'pi-runtime',
-      msg: built.cost
+      msg: built._synthesisedBy === 'factory'
         ? 'model not in Pi catalog and no sibling — synthesised from the Bedrock Claude factory'
-        : 'model not in Pi catalog, no sibling, and no published price for its family — synthesised WITHOUT cost (TurnCostUsd will not be emitted for it)',
-      id, contextWindow: built.contextWindow, maxTokens: built.maxTokens, priced: !!built.cost,
+        : 'model not in Pi catalog, no sibling, and no published price for its family — synthesised with unknown cost (TurnCostUsd will not be emitted for it)',
+      id, contextWindow: built.contextWindow, maxTokens: built.maxTokens, priced: built._synthesisedBy === 'factory',
     }));
     return built;
   }
