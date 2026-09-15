@@ -94,10 +94,10 @@ test('every synthesised Claude declares reasoning — including Claude 5', () =>
     assert.equal(getModel(id).reasoning, true, `${id} must request thinking`);
   }
 });
-test('Fable 5.1 completes Pi cost calculation without fabricating a spend metric', async () => {
+test('an unknown Claude completes Pi cost calculation without fabricating a spend metric', async () => {
   const { calculateCost } = await import('@mariozechner/pi-ai');
   const { aggregateReplyUsage } = await import('./reply-usage.mjs');
-  const model = getModel('us.anthropic.claude-fable-5-1');
+  const model = getModel('us.anthropic.claude-mythos-9');
   const usage = { input: 100, output: 20, cacheRead: 10, cacheWrite: 5, totalTokens: 135, cost: {} };
   assert.doesNotThrow(() => calculateCost(model, usage));
   assert.ok(Number.isNaN(usage.cost.total));
@@ -106,4 +106,18 @@ test('Fable 5.1 completes Pi cost calculation without fabricating a spend metric
   assert.equal(reply.input, 100);
   assert.equal(reply.output, 20);
   assert.equal(reply.stopReason, 'stop');
+});
+test('Fable 5.1 uses published AWS prices and produces a finite cost', async () => {
+  const { calculateCost } = await import('@mariozechner/pi-ai');
+  const { aggregateReplyUsage } = await import('./reply-usage.mjs');
+  const global = getModel('global.anthropic.claude-fable-5-1');
+  const model = getModel('us.anthropic.claude-fable-5-1');
+  assert.deepEqual(global.cost, { input: 10, output: 50, cacheRead: 0.25, cacheWrite: 12.5 });
+  assert.deepEqual(model.cost, { input: 11, output: 55, cacheRead: 0.275, cacheWrite: 13.75 });
+  assert.equal(model.contextWindow, 1000000);
+  assert.equal(model.maxTokens, 128000);
+  const usage = { input: 1000000, output: 1000000, cacheRead: 1000000, cacheWrite: 1000000, cost: {} };
+  calculateCost(model, usage);
+  assert.equal(usage.cost.total, 80.025);
+  assert.equal(aggregateReplyUsage([{ model: model.id, usage }]).costUsd, 80.025);
 });

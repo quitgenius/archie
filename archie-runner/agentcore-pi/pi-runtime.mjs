@@ -113,6 +113,11 @@ const CLAUDE_MODELS = {
   'opus-4-8':  { contextWindow: 1000000, maxTokens: 128000, cost: { input: 5,  output: 25, cacheRead: 0.5, cacheWrite: 6.25 } },
   'opus-4-7':  { contextWindow: 1000000, maxTokens: 128000, cost: { input: 5,  output: 25, cacheRead: 0.5, cacheWrite: 6.25 } },
   'fable-5':   { contextWindow: 1000000, maxTokens: 64000,  cost: { input: 10, output: 50, cacheRead: 1,   cacheWrite: 12.5 } },
+  // AWS us-east-1 Price List, published 2026-09-11 (effective 2026-09-01).
+  // Global standard rates per 1M tokens; cacheWrite is the default 5-minute TTL.
+  // https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonBedrockFoundationModels/current/us-east-1/index.json
+  // Model limits: https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-fable-5-1.html
+  'fable-5-1': { contextWindow: 1000000, maxTokens: 128000, cost: { input: 10, output: 50, cacheRead: 0.25, cacheWrite: 12.5 } },
 };
 
 // Conservative when the family is unknown. UNDER-stating is the safe direction: too small a context
