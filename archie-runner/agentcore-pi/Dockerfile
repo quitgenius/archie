@@ -218,9 +218,17 @@ RUN node -e "const fs=require('fs'),path=require('path');const seen=new Set(),mi
 RUN --mount=type=bind,from=lint,source=/lint,target=/lint \
     test -f /lint/PASSED && echo 'eslint gate OK'
 
-# MCP_AUTH_NONINTERACTIVE: openclaw-mcp-auth-plugin runs refresh-only (no inbound OAuth2
-# callback listener / browser flow) — ephemeral microVMs can't host it; tokens are pre-seeded on EFS.
-ENV NODE_ENV=production PORT=8080 PI_PLUGINS_DIR=/app/plugins MCP_AUTH_NONINTERACTIVE=1
+# MCP_AUTH_NONINTERACTIVE: no inbound OAuth2 callback listener / browser flow — an ephemeral
+# microVM can't host one. This stays set: it is what keeps the callback SERVER from starting.
+#
+# MCP_AUTH_BROKERED: completion goes through the public ingress instead. The flow may BEGIN (the
+# verifier is persisted to the agent's EFS dir, since the microVM won't outlive the browser round
+# trip) and a later turn exchanges the code the forwarder Lambda landed in DynamoDB. Without this
+# the plugin stays refresh-only off a hand-seeded token, which does not scale past a few agents.
+#
+# Both are needed, and they are not contradictory: NONINTERACTIVE governs the listener, BROKERED
+# governs where completion happens. See openclaw-mcp-auth-plugin/src/brokered.ts.
+ENV NODE_ENV=production PORT=8080 PI_PLUGINS_DIR=/app/plugins MCP_AUTH_NONINTERACTIVE=1 MCP_AUTH_BROKERED=1
 EXPOSE 8080
 # Entrypoint resolves config from DynamoDB, then hands off to the adapter (which seeds the
 # workspace + materializes the skill library onto EFS from DynamoDB once the mount attaches).

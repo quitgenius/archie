@@ -19,12 +19,14 @@ import {
   type Pkce,
 } from "./oauth2.js";
 import { registerPendingFlow } from "./callback-server.js";
+import { isBrokeredMode } from "./brokered.js";
 import {
   clearTokens,
   getClientId,
   getTokens,
   isAccessTokenFresh,
   saveClientId,
+  savePendingFlow,
   saveTokens,
   serverKeyFor,
   type StoredTokens,
@@ -538,7 +540,10 @@ async function kickoffOAuth2Flow(params: {
   // chokepoint for every per-user connect/getOrRestart path). OAuth2 servers are
   // refresh-only off a pre-seeded EFS token. The connect tool's catch surfaces this to
   // the user as a tool result. Unset under ECS/OpenClaw — fully backward-compatible.
-  if (process.env.MCP_AUTH_NONINTERACTIVE === "1") {
+  // BROKERED takes precedence: the flow is allowed to begin, but no inbound listener is started
+  // and the verifier is persisted so a later turn (in a different microVM) can finish the
+  // exchange. See brokered.ts.
+  if (process.env.MCP_AUTH_NONINTERACTIVE === "1" && !isBrokeredMode()) {
     throw new Error(
       `Interactive OAuth2 authorization is disabled under AgentCore (MCP_AUTH_NONINTERACTIVE). `
       + `Pre-seed a valid refresh token at ${params.agentDir}/mcp-auth-oauth2-tokens.json — `
@@ -599,6 +604,27 @@ async function kickoffOAuth2Flow(params: {
     expiresAt: Date.now() + PENDING_AUTH_TTL_MS,
   };
   getPendingForAgent(params.agentId).set(serverKey, pending);
+
+  // Brokered: the in-memory map above dies with this microVM, so the verifier goes to the agent's
+  // own directory as well. Persisted BEFORE the user is handed the auth URL — the browser round
+  // trip can outlive this process, and a code landed against a flow we never wrote down is
+  // unexchangeable.
+  if (isBrokeredMode()) {
+    savePendingFlow(
+      params.agentDir,
+      serverKey,
+      {
+        state,
+        verifier: pkce.verifier,
+        clientId,
+        redirectUri: oauth2.redirectUri,
+        tokenEndpoint: metadata.token_endpoint,
+        expiresAt: pending.expiresAt,
+      },
+      params.serverCfg.toolPrefix,
+    );
+    return pending;
+  }
 
   // If a callback port is configured, register a handler that completes the
   // exchange automatically when the browser is redirected back.
@@ -1010,7 +1036,10 @@ async function discoverOAuth2Server(params: {
   // (no inbound callback listener / co-located browser); OAuth2 servers are refresh-only
   // off a pre-seeded EFS token file. Surface a clear, actionable error rather than parking
   // a pending flow that can never complete.
-  if (process.env.MCP_AUTH_NONINTERACTIVE === "1") {
+  // Brokered mode leaves this path alone deliberately. This is the ANONYMOUS branch — no sender —
+  // and a brokered flow is still per-user: kicking one off here would register a junk DCR client
+  // and persist a verifier no user could ever complete. Users start flows from the connect tool.
+  if (process.env.MCP_AUTH_NONINTERACTIVE === "1" && !isBrokeredMode()) {
     return {
       kind: "error",
       error:

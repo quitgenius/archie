@@ -21,12 +21,37 @@ export type StoredTokens = {
   scope?: string;
 };
 
+/**
+ * An authorization the user has started but not yet completed, persisted so it can survive the
+ * process.
+ *
+ * Under OpenClaw the in-flight flow lives in memory (`getPendingForAgent`) because the container
+ * outlives the browser round-trip. Under AgentCore it does not: the microVM is torn down at the
+ * end of the turn, long before the user finishes authorizing. The verifier therefore has to be on
+ * disk, or the code that comes back can never be exchanged.
+ *
+ * It stays in the AGENT'S OWN directory and is never sent anywhere. That is the whole reason the
+ * forwarder Lambda can be trusted with an unauthenticated callback: it holds the code, this holds
+ * the verifier, and neither is sufficient alone.
+ */
+export type PersistedPendingFlow = {
+  state: string;
+  verifier: string;
+  clientId: string;
+  redirectUri: string;
+  tokenEndpoint: string;
+  /** Unix ms. A flow older than this is abandoned, not completed. */
+  expiresAt: number;
+};
+
 export type StoredServerEntry = {
   /** Human-readable identifier (toolPrefix or upstreamUrl) for log debugging only. */
   label?: string;
   /** Dynamic-registration client_id; absent when a fixed clientId is configured. */
   clientId?: string;
   tokens?: StoredTokens;
+  /** Brokered (AgentCore) flows only; cleared as soon as the exchange succeeds or is abandoned. */
+  pendingFlow?: PersistedPendingFlow;
 };
 
 type StoreFile = {
@@ -146,4 +171,39 @@ export function isAccessTokenFresh(tokens: StoredTokens | undefined, skewMs = 30
   if (!tokens?.accessToken) return false;
   if (tokens.expiresAt === undefined) return true; // no expiry → assume usable
   return tokens.expiresAt - skewMs > Date.now();
+}
+
+/**
+ * Persist an in-flight brokered authorization. See PersistedPendingFlow.
+ *
+ * One slot per serverKey, so a user restarting a flow replaces their own previous attempt rather
+ * than accumulating verifiers. serverKey already folds in the sender, so this cannot clobber a
+ * different user's flow in a shared agent.
+ */
+export function savePendingFlow(
+  agentDir: string,
+  serverKey: string,
+  pendingFlow: PersistedPendingFlow,
+  label?: string,
+): void {
+  updateEntry(agentDir, serverKey, (entry) => ({
+    ...entry,
+    ...(label ? { label } : {}),
+    pendingFlow,
+  }));
+}
+
+/** The in-flight flow, if one is still within its TTL. Expired flows read as absent. */
+export function getPendingFlow(
+  agentDir: string,
+  serverKey: string,
+  now = Date.now(),
+): PersistedPendingFlow | undefined {
+  const flow = getServerEntry(agentDir, serverKey)?.pendingFlow;
+  if (!flow) return undefined;
+  return flow.expiresAt > now ? flow : undefined;
+}
+
+export function clearPendingFlow(agentDir: string, serverKey: string): void {
+  updateEntry(agentDir, serverKey, ({ pendingFlow: _dropped, ...rest }) => rest);
 }
