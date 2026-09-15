@@ -207,3 +207,23 @@ export function getPendingFlow(
 export function clearPendingFlow(agentDir: string, serverKey: string): void {
   updateEntry(agentDir, serverKey, ({ pendingFlow: _dropped, ...rest }) => rest);
 }
+
+/**
+ * Every server slot that currently has an in-flight brokered flow, newest TTL first.
+ *
+ * The landed callback identifies itself by `state`, not by serverKey — the forwarder Lambda knows
+ * only what the IdP put in the redirect. So collection has to search the store for the slot whose
+ * flow claims that state. Expired flows are omitted: a code arriving against one is too late.
+ */
+export function listPendingFlows(
+  agentDir: string,
+  now = Date.now(),
+): Array<{ serverKey: string; flow: PersistedPendingFlow }> {
+  const store = readStore(agentDir);
+  return Object.entries(store.servers)
+    .flatMap(([serverKey, entry]) =>
+      entry.pendingFlow && entry.pendingFlow.expiresAt > now
+        ? [{ serverKey, flow: entry.pendingFlow }]
+        : [],
+    );
+}

@@ -1,6 +1,8 @@
 import { definePluginEntry, type PluginApi } from "../plugin-sdk/plugin-entry.mjs";
 import { parsePluginConfig } from "./src/config.js";
 import { SENDER_PARAM, bindToolForTurn, buildAuthTools, discoverAndCache, extractSenderFromRunId, getCachedTemplates, getPluginHealth, isMcpAuthTool, registerAgentCfg } from "./src/tool-cache.js";
+import { collectBrokeredCallbacks, isBrokeredMode } from "./src/brokered.js";
+import { makeCallbackQuery } from "./src/ddb.js";
 
 function maskKey(key: string): string {
   return key.length > 8 ? `${key.slice(0, 6)}...${key.slice(-2)}` : "***";
@@ -46,6 +48,29 @@ const NON_INTERACTIVE = process.env.MCP_AUTH_NONINTERACTIVE === "1";
  * `undefined` is a valid answer — discovery is schema-only and only OAuth2 servers need a
  * dir at all.
  */
+/**
+ * Finish any brokered OAuth2 flow whose code has landed. Never throws and never blocks discovery
+ * for long: a connection that cannot be completed must degrade to "not authorized yet", not stop
+ * the agent serving a turn.
+ */
+async function collectLanded(
+  api: PluginApi,
+  agentId: string,
+  agentDir: string | undefined,
+): Promise<void> {
+  if (!isBrokeredMode() || !agentDir) return;
+  const query = makeCallbackQuery();
+  if (!query) return; // no config table: OpenClaw forwards to a live container instead
+  const outcomes = await collectBrokeredCallbacks({ agentDir, agentId, query, logger: api.logger });
+  for (const o of outcomes) {
+    // Logged individually: "completed" is the only one a user can act on, and a silent decline is
+    // indistinguishable from a flow that was never started.
+    if (o.kind === "completed") api.logger.info(`mcp-auth-plugin: OAuth2 authorization completed for ${o.serverKey}`);
+    else if (o.kind === "declined") api.logger.warn(`mcp-auth-plugin: OAuth2 declined for ${o.serverKey}: ${o.error}`);
+    else if (o.kind === "failed") api.logger.warn(`mcp-auth-plugin: OAuth2 exchange failed for ${o.serverKey}: ${o.error}`);
+  }
+}
+
 function eagerAgentDirFor(api: PluginApi, agentId: string): string | undefined {
   if (typeof api.resolvePath === "function") {
     try {
@@ -129,7 +154,12 @@ export default definePluginEntry({
             `mcp-auth-plugin: eager discovery started for agent="${agentId}"`
             + `${NON_INTERACTIVE ? " (non-interactive)" : ""} agentDir=${eagerAgentDir ?? "none"}`,
           );
-          const p = discoverAndCache({ agentId, pluginCfg: cfg, agentCfg, agentDir: eagerAgentDir })
+          // Collect any OAuth2 callback the forwarder Lambda landed for this agent BEFORE
+          // discovery runs. Discovery is what builds the tool list, and Pi freezes a session's
+          // tools once — a token that arrives after it has run is a turn too late, which is the
+          // same lateness that made lazy discovery the prod bug described above.
+          const p = collectLanded(api, agentId, eagerAgentDir)
+            .then(() => discoverAndCache({ agentId, pluginCfg: cfg, agentCfg, agentDir: eagerAgentDir }))
             .then(() => {
               const t = getCachedTemplates(agentId) ?? [];
               api.logger.info(

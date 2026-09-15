@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { completeBrokeredFlow, isBrokeredMode } from "./brokered.js";
+import { collectBrokeredCallbacks, completeBrokeredFlow, isBrokeredMode } from "./brokered.js";
 import { getPendingFlow, getTokens, savePendingFlow } from "./token-store.js";
 import * as oauth2 from "./oauth2.js";
 
@@ -116,5 +116,80 @@ describe("completeBrokeredFlow", () => {
     expect(outcome.kind).toBe("failed");
     expect(getPendingFlow(dir, KEY), "retrying a spent code cannot succeed").toBeUndefined();
     expect(getTokens(dir, KEY)).toBeUndefined();
+  });
+});
+
+describe("collectBrokeredCallbacks", () => {
+  const queryReturning = (rows: Array<Record<string, unknown>>) => {
+    const seen: string[] = [];
+    return { seen, query: async (pk: string) => { seen.push(pk); return rows; } };
+  };
+
+  it("reads this agent's own drop-box partition, not AGENT#", async () => {
+    const { seen, query } = queryReturning([]);
+    await collectBrokeredCallbacks({ agentDir: dir, agentId: "dm-u1", query });
+    expect(seen).toEqual(["OAUTH#dm-u1"]);
+  });
+
+  it("matches a landed row to the flow holding its state, and completes it", async () => {
+    seedFlow();
+    vi.spyOn(oauth2, "exchangeCode").mockResolvedValue({ accessToken: "AT" });
+    const { query } = queryReturning([{ sk: "STATE#STATE-1", code: "CODE-1" }]);
+
+    const outcomes = await collectBrokeredCallbacks({ agentDir: dir, agentId: "dm-u1", query });
+
+    expect(outcomes).toEqual([{ kind: "completed", serverKey: KEY }]);
+    expect(getTokens(dir, KEY)?.accessToken).toBe("AT");
+  });
+
+  it("derives state from the sort key when no attribute is present", async () => {
+    seedFlow();
+    const spy = vi.spyOn(oauth2, "exchangeCode").mockResolvedValue({ accessToken: "AT" });
+    const { query } = queryReturning([{ sk: "STATE#STATE-1", code: "C" }]);
+    await collectBrokeredCallbacks({ agentDir: dir, agentId: "dm-u1", query });
+    expect(spy).toHaveBeenCalled();
+  });
+
+  it("ignores a row whose state matches no pending flow", async () => {
+    seedFlow();
+    const spy = vi.spyOn(oauth2, "exchangeCode");
+    const { query } = queryReturning([{ sk: "STATE#SOMEONE-ELSE", code: "C" }]);
+
+    const outcomes = await collectBrokeredCallbacks({ agentDir: dir, agentId: "dm-u1", query });
+
+    expect(outcomes).toEqual([]);
+    expect(spy).not.toHaveBeenCalled();
+    expect(getPendingFlow(dir, KEY)).toBeDefined();
+  });
+
+  it("a re-read of an already-collected row is a harmless no-op", async () => {
+    // Rows are never deleted — the runtime is read-only on that table — so this happens on
+    // every turn until the TTL sweeps them.
+    seedFlow();
+    vi.spyOn(oauth2, "exchangeCode").mockResolvedValue({ accessToken: "AT" });
+    const { query } = queryReturning([{ sk: "STATE#STATE-1", code: "CODE-1" }]);
+
+    await collectBrokeredCallbacks({ agentDir: dir, agentId: "dm-u1", query });
+    const second = await collectBrokeredCallbacks({ agentDir: dir, agentId: "dm-u1", query });
+
+    expect(second).toEqual([]);
+    expect(getTokens(dir, KEY)?.accessToken, "the first result survives").toBe("AT");
+  });
+
+  it("a DynamoDB failure degrades to no completions, never a throw", async () => {
+    seedFlow();
+    const warn = vi.fn();
+    const outcomes = await collectBrokeredCallbacks({
+      agentDir: dir, agentId: "dm-u1",
+      query: async () => { throw new Error("AccessDenied"); },
+      logger: { warn },
+    });
+    expect(outcomes).toEqual([]);
+    expect(warn).toHaveBeenCalled();
+  });
+
+  it("does nothing when the agent has no pending flows at all", async () => {
+    const { query } = queryReturning([{ sk: "STATE#X", code: "C" }]);
+    expect(await collectBrokeredCallbacks({ agentDir: dir, agentId: "dm-u1", query })).toEqual([]);
   });
 });

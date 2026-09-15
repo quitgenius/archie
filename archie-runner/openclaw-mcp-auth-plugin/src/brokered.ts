@@ -24,6 +24,7 @@ import { exchangeCode, type OAuth2Metadata } from "./oauth2.js";
 import {
   clearPendingFlow,
   getPendingFlow,
+  listPendingFlows,
   saveTokens,
   type PersistedPendingFlow,
 } from "./token-store.js";
@@ -117,4 +118,94 @@ export async function completeBrokeredFlow(params: {
   } finally {
     clearPendingFlow(agentDir, serverKey);
   }
+}
+
+/** One row of the forwarder Lambda's drop-box: OAUTH#<scope> / STATE#<state>. */
+type CallbackRow = { sk?: string; state?: string; code?: string; error?: string; errorDescription?: string };
+
+/**
+ * Read this agent's landed callbacks straight from DynamoDB.
+ *
+ * The runtime is READ-ONLY on that table by design (agentcore-base-policy.cjs), and this honours
+ * it: rows are read and never deleted. They expire by TTL instead, and re-reading a collected one
+ * is harmless because its pending flow is already gone — completeBrokeredFlow answers "no-pending".
+ *
+ * `query` is injected rather than constructed here so the plugin bundle carries no AWS SDK; the
+ * caller resolves the image's copy, the same way pi-entrypoint does rather than shipping a second.
+ */
+export async function readLandedCallbacks(params: {
+  agentId: string;
+  query: (partitionKey: string) => Promise<CallbackRow[]>;
+}): Promise<LandedCallback[]> {
+  const rows = await params.query(`OAUTH#${params.agentId}`);
+  return rows.flatMap((row) => {
+    // `state` is carried by the sort key; the attribute is a convenience, not the source of truth.
+    const state = row.state ?? (row.sk?.startsWith("STATE#") ? row.sk.slice("STATE#".length) : undefined);
+    if (!state) return [];
+    return [{
+      state,
+      ...(row.code ? { code: row.code } : {}),
+      ...(row.error ? { error: row.error } : {}),
+      ...(row.errorDescription ? { errorDescription: row.errorDescription } : {}),
+    }];
+  });
+}
+
+/**
+ * Complete every brokered flow this agent has a landed callback for.
+ *
+ * Matches by `state`: the drop-box row knows only what the IdP echoed back, while the verifier is
+ * filed under a serverKey. A landed callback with no matching pending flow is ignored — it is
+ * either already collected, expired, or was never ours.
+ *
+ * Never throws. A failure here must degrade to "this connection isn't authorized yet", not prevent
+ * the agent from serving a turn.
+ */
+export async function collectBrokeredCallbacks(params: {
+  agentDir: string;
+  agentId: string;
+  query: (partitionKey: string) => Promise<CallbackRow[]>;
+  metadataFor?: (flow: PersistedPendingFlow) => OAuth2Metadata;
+  logger?: { warn: (msg: string) => void; info?: (msg: string) => void };
+  now?: number;
+}): Promise<CompletionOutcome[]> {
+  let landed: LandedCallback[];
+  try {
+    landed = await readLandedCallbacks({ agentId: params.agentId, query: params.query });
+  } catch (err) {
+    params.logger?.warn(`mcp-auth-plugin: could not read landed OAuth2 callbacks: ${String(err)}`);
+    return [];
+  }
+  if (!landed.length) return [];
+
+  const pending = listPendingFlows(params.agentDir, params.now);
+  if (!pending.length) return [];
+
+  const outcomes: CompletionOutcome[] = [];
+  for (const { serverKey, flow } of pending) {
+    const match = landed.find((l) => l.state === flow.state);
+    if (!match) continue;
+    try {
+      outcomes.push(await completeBrokeredFlow({
+        agentDir: params.agentDir,
+        serverKey,
+        landed: match,
+        // The token endpoint was recorded when the flow started, so completion needs no second
+        // discovery round-trip against the IdP.
+        metadata: params.metadataFor?.(flow) ?? metadataFromFlow(flow),
+        ...(params.now !== undefined ? { now: params.now } : {}),
+      }));
+    } catch (err) {
+      params.logger?.warn(`mcp-auth-plugin: completing ${serverKey} failed: ${String(err)}`);
+    }
+  }
+  return outcomes;
+}
+
+/**
+ * Minimal metadata for the exchange leg. Only `token_endpoint` is read by exchangeCode; the
+ * authorization endpoint is already spent by the time a code exists.
+ */
+function metadataFromFlow(flow: PersistedPendingFlow): OAuth2Metadata {
+  return { authorization_endpoint: "", token_endpoint: flow.tokenEndpoint };
 }
