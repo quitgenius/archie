@@ -51,7 +51,11 @@ test('the domain is capabilities ∪ slugs, and the slugs are really there', () 
   // per-agent IAM map rather than from a tool or a skill.
   // 27 → 28 on 2026-09-16: `demo_sensitive_action`, once demo_sensitive_tool was ported and the capability had
   // a tool to govern. It is the LAST of the prod.tfvars statements, so NOT_PORTED is now empty.
-  assert.equal(domain.length, 36);
+  // 38, not 36: `spawn` and `agent-provisioning` were added 2026-09-16 (sessions_spawn carved out of
+  // `runtime` so the Tools tab can grant sub-sessions without granting shell; agent-provisioning is the
+  // one statement the estate-wide IAM audit found unported). A capability count is a deliberate-change
+  // ratchet — it moves when we add one, and it should be a red test when we did not mean to.
+  assert.equal(domain.length, 38);
   assert.deepEqual(domain, [...domain].sort(), 'sorted, so the row key order cannot depend on JSON key order');
 
   // THE BUG THE POLICY DOCUMENT FOUND IN ITSELF (policy/README.md:129-146). The 8 slugs were listed as
@@ -64,7 +68,7 @@ test('the domain is capabilities ∪ slugs, and the slugs are really there', () 
 test('every Capability entity carries attrs.name, because A2 reads it', () => {
   const entities = capabilityEntities(PROD);
   const caps = entities.filter((e) => e.uid.type === TYPE.capability);
-  assert.equal(caps.length, 36);
+  assert.equal(caps.length, 38);
   for (const e of caps) {
     // archie.cedarschema:29-33 and spike README §5: omit this and the condition ERRORS, the permit
     // never applies, and you would "confirm" a pin that is doing nothing.
@@ -136,12 +140,12 @@ test('the ScopeGroup vocabulary is the 15 pins PLUS the 5 skill groups, in both 
 
 test('entitiesFor is the shared set plus exactly one principal', () => {
   const shared = sharedEntities(PROD);
-  // 36 capabilities + 2 CapGroups + 20 ScopeGroups (15 pin + 5 skill; comms-approval removed 2026-08-19,
+  // 38 capabilities + 2 CapGroups + 20 ScopeGroups (15 pin + 5 skill; comms-approval removed 2026-08-19,
   // a zero-holder pin that was also breaking POLICY row writes on the deployed gateway). The skill groups
   // get entities like any other ScopeGroup even though no Cedar statement references them: the entity set is
   // vocabulary, and omitting them would make a Scope's `parents` name a group that does not exist — which
   // spike README §5 records as a dangling parent that still ALLOWS, i.e. fails OPEN.
-  assert.equal(shared.length, 36 + 2 + 20);
+  assert.equal(shared.length, 38 + 2 + 20);
   const all = entitiesFor(MEMBER, PROD);
   assert.equal(all.length, shared.length + 1);
   assert.equal(all[all.length - 1].uid.id, MEMBER);

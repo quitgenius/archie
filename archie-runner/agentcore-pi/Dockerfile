@@ -103,7 +103,26 @@ WORKDIR /app
 # back in service after the G3/G4 in-process ports were reverted, and while none of the five parses
 # JSON with jq TODAY, every one of them emits it — an agent following the prose will reach for jq
 # immediately, and its absence is the class of failure that presents as "the skill is broken".
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates python3 make g++ curl jq \
+# git is for the GITHUB SKILLS. `understand`/`understand-diff` shell out to `git rev-parse` and
+# `git diff` for staleness detection, and create-agent/agent-u0yebw clone, branch, commit and push.
+# Without the binary those are not degraded, they are impossible — measured on the live image
+# (2026-09-16): `git: not found`, `gh: not found`. See archie-agent-builder-port.md.
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates python3 make g++ curl jq git \
+  && rm -rf /var/lib/apt/lists/*
+
+# THE GITHUB CLI, for agent-u0yebw's `gh pr create`. From GitHub's own apt repo rather than a
+# tarball so the signature is checked and upgrades are an apt bump; pinned to the repo, not a
+# version, matching how the AWS CLI below is pinned to its image tag.
+#
+# ONE AGENT USES THIS. `gh` is on PATH for every runtime because the image is fleet-uniform, but the
+# TOKEN is not: GH_CONFIG_TOKEN resolves only for an agent holding `agent-provisioning`
+# (pi-entrypoint), so on every other agent `gh` is present and unauthenticated.
+RUN apt-get update && apt-get install -y --no-install-recommends curl gnupg \
+  && mkdir -p -m 755 /etc/apt/keyrings \
+  && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg > /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+  && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+  && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list \
+  && apt-get update && apt-get install -y --no-install-recommends gh \
   && rm -rf /var/lib/apt/lists/*
 
 # THE AWS CLI, for the shell skills. Copied from the official image rather than curl|unzip: no extra

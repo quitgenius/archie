@@ -120,6 +120,15 @@ const IMAGES = {
       // twice"). session-tracker.js appears TWICE on line 60 in the Dockerfile; it is listed once
       // here, and resolveInputs() dedupes anyway.
       { path: 'archie-gateway/index.js' },
+      // The per-turn credential + its consumers (archie-dispatcher-token-plan.md) and the spawn
+      // route. Added 2026-09-16 with the Dockerfile COPY; declaring them here is what makes an edit
+      // to one of them produce a new tag. Until it did, a change confined to these four would have
+      // deployed the PREVIOUS image and reported success — masked only because every change so far
+      // also touched index.js.
+      { path: 'archie-gateway/turn-token.js' },
+      { path: 'archie-gateway/turn-token-store.js' },
+      { path: 'archie-gateway/dispatcher-auth.js' },
+      { path: 'archie-gateway/spawn-api.js' },
       { path: 'archie-gateway/marketplace.js' },
       { path: 'archie-gateway/derived-role.js' },
       { path: 'archie-gateway/streaming.js' },

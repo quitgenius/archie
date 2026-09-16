@@ -333,6 +333,34 @@ async function main() {
     }
   }
 
+  // agent-builder's provisioning secrets (archie-agent-builder-port.md). Same shape as the DATADOG
+  // pair above and gated the same way: the ALLOW-SET, not the grant row, so adding the capability
+  // does not change `runtimeEnv` and therefore does not force a runtime roll — grants stay live on
+  // the next turn.
+  //
+  // ONLY THE GITHUB TOKEN IS RESOLVED HERE. The other three (example-iac, git-crypt, connector-org) are
+  // read by the SKILLS at the moment they need them, via `aws secretsmanager get-secret-value` — that
+  // is how the ported workflows already work, and pre-resolving them into env vars would put three
+  // long-lived credentials in every child process the turn spawns for no benefit. The IAM capability
+  // is what makes those reads succeed; this block only exists because `gh` and `git` expect a token
+  // in the environment rather than an API call.
+  if (agentAllowsTool('agent-provisioning')) {
+    const ghSecret = process.env.GH_CONFIG_TOKEN_SECRET;
+    if (ghSecret && !process.env.GH_CONFIG_TOKEN) {
+      try {
+        const v = await fetchSecret(ghSecret, process.env.GH_CONFIG_TOKEN_REGION || ddRegion);
+        if (v) {
+          process.env.GH_CONFIG_TOKEN = v;
+          // `gh` reads GH_TOKEN/GITHUB_TOKEN, never GH_CONFIG_TOKEN — which is OpenClaw's name for
+          // it. Setting all three means the ported skills work unchanged whichever they reach for.
+          process.env.GH_TOKEN = v;
+          process.env.GITHUB_TOKEN = v;
+          log({ level: 'info', msg: 'GH_CONFIG_TOKEN resolved from Secrets Manager', fp: await fingerprint(v) });
+        }
+      } catch (e) { log({ level: 'warn', msg: 'GH_CONFIG_TOKEN fetch failed', err: e.message }); }
+    }
+  }
+
   // NO DISPATCHER SECRET AT BOOT — DELIBERATELY REMOVED (phase 3 of
   // archie-docs/archie-dispatcher-token-plan.md). This used to resolve DISPATCHER_SHARED_SECRET_ID
   // from Secrets Manager into DISPATCHER_SHARED_SECRET, mirroring the CONNECTOR_API_KEY pattern above.
