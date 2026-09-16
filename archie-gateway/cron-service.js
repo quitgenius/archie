@@ -162,6 +162,12 @@ function createCronService(opts) {
   // pre-flag behaviour and what the older unit tests construct.
   const runnerFlags = opts.runnerFlags || null;
 
+  // EVERY DEP cron-fire READS MUST BE LISTED HERE. This is an explicit allowlist, not a spread, and
+  // that has already cost twice: `onTimeoutKill` (the cron-budget ceiling alarm) and `mintTurnToken`
+  // / `turnTokens` (the per-turn credential) were both wired index.js -> createCronService and never
+  // forwarded on, so both were silently inert in production while their unit tests passed — those
+  // tests build createCronFire directly and never traverse this call. `cron-service.test.js` now
+  // asserts the forwarding itself, which is the only thing that catches the NEXT one.
   const fireHandler = createCronFire({
     agentCore: opts.agentCore,
     ensureRuntime: opts.ensureRuntime,   // image-pointer-aware; see cron-fire
@@ -171,6 +177,15 @@ function createCronService(opts) {
     now: opts.now,
     runnerFlags,
     onRunnerGated: opts.onRunnerGated,
+    // The ONLY way a cron run is killed by us since the per-job budget was removed. Without this the
+    // CronTimeoutKill metric — and the alarm on it — can never fire.
+    onTimeoutKill: opts.onTimeoutKill,
+    // The per-turn dispatcher credential. Without these a cron turn reaches the runtime with NO
+    // token, pi-adapter deletes DISPATCHER_SHARED_SECRET (absent must look absent), and every
+    // dispatcher call the job makes fails with "DISPATCHER_SHARED_SECRET not set" — which is exactly
+    // how this was found, in a cron job's own note to its owner.
+    mintTurnToken: opts.mintTurnToken,
+    turnTokens: opts.turnTokens,
     log,
   });
   const runner = createCronRunner({

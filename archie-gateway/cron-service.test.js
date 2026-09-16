@@ -12,6 +12,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { createCronService } = require('./cron-service');
 const { FakeClock } = require('./fake-clock');
+const { mintTurnToken } = require('./turn-token');
 
 let dir;
 beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cron-svc-')); });
@@ -387,5 +388,42 @@ describe('cron-service purgeAgent (§E1 — hydration wipes the slate)', () => {
   it('purging an agent with nothing to purge is a clean no-op', async () => {
     const s = svc();
     expect(s.service.purgeAgent('nobody')).toMatchObject({ removed: 0, fileDeleted: false });
+  });
+});
+
+// ── The dep-forwarding contract (2026-09-16) ─────────────────────────────────
+//
+// createCronFire's deps are chosen HERE, from an explicit allowlist, and that allowlist has silently
+// dropped a dep twice: `onTimeoutKill` (the ceiling alarm — so CronTimeoutKill could never fire) and
+// `mintTurnToken`/`turnTokens` (the per-turn credential — so every cron turn reached the runtime with
+// no token and the job's own dispatcher calls failed with "DISPATCHER_SHARED_SECRET not set").
+//
+// Both were wired index.js -> createCronService correctly. Both had passing unit tests. Neither test
+// traversed THIS call, because cron-fire.test.js constructs createCronFire directly — so the one
+// place that can be wrong was the one place nothing looked. This asserts the seam itself.
+describe('cron service — forwards every dep cron-fire reads', () => {
+  it('passes the credential and telemetry hooks through to the fire path', async () => {
+    const seen = [];
+    const clock = new FakeClock(0);
+    const service = createCronService({
+      dir,
+      clock,
+      now: () => clock.now(),
+      agentCore: { ensureRuntime: vi.fn(async () => 'arn'), invokeStreaming: vi.fn(async () => ({ text: 'x' })) },
+      sessionIdFor: (j) => `sess-${j.agentId}`.padEnd(33, '0'),
+      deliver: vi.fn(async () => {}),
+      // A REAL token, not a stand-in string: cron-fire decodes it to get the row's id, so a fake
+      // would skip the open/close silently — which is the same shape as the bug this test is for.
+      mintTurnToken: (c) => { seen.push(['mint', c.scope]); return mintTurnToken({ ...c }, 'k'); },
+      turnTokens: { open: async () => { seen.push(['open']); }, close: async () => { seen.push(['close']); } },
+      onTimeoutKill: () => seen.push(['timeoutKill']),
+    });
+    await service.add({ agentId: 'a1', jobId: 'j1', schedule: { kind: 'every', everyMs: 3600000 },
+      payload: { kind: 'agentTurn', message: 'x' }, delivery: { mode: 'none' } });
+    await service.runNow('a1::j1');   // the store's composed id (agentId::jobId)
+
+    // The credential reached the fire path, and the row was opened and closed around the turn.
+    expect(seen.map((x) => x[0])).toEqual(['mint', 'open', 'close']);
+    expect(seen[0][1]).toBe('a1');   // scope comes from the JOB, never the payload
   });
 });
