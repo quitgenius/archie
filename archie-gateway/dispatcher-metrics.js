@@ -60,16 +60,12 @@ const M_INVOKE_ERROR = 'InvokeErrorCount';
 // Per-turn dispatcher credential (archie-dispatcher-token-plan.md §8.8). `Reason` is the dimension,
 // never the scope: in normal operation `revoked` and `unknown` cannot occur at all, so the alarm sits
 // at a threshold of zero and the scope belongs in the log line beside it.
-//   missing  no credential presented        — routine during dual-accept, a misconfiguration after it
-//   expired  outlived its turn's budget     — an overrun, or a background process outliving its turn
-//   revoked  the turn finished              — ALARM: a post-turn caller or a replay
-//   unknown  no valid signature             — ALARM: forged, guessed, or minted by nobody
+//   missing      no credential presented     — routine during dual-accept, a misconfiguration after
+//   expired      outlived its turn's budget  — an overrun, or a background process outliving its turn
+//   unavailable  revocation unreadable       — the config table is down, which breaks turns anyway
+//   revoked      the turn finished           — ALARM: a post-turn caller or a replay
+//   unknown      no valid signature          — ALARM: forged, guessed, or minted by nobody
 const M_TOKEN_REJECTED = 'DispatcherTokenRejected';
-// Revocation could not be consulted, so a signed unexpired token was accepted on its signature
-// alone. Not a rejection — a DEGRADED acceptance, and it is separate precisely so it cannot be
-// mistaken for one. Silent loss of revocation is the thing worth seeing here.
-const M_TOKEN_STORE_UNAVAILABLE = 'DispatcherTokenStoreUnavailable';
-
 // Per-session queue (per-message isolation). Turns for one Slack thread run strictly one at a time,
 // so a burst QUEUES rather than overlapping — which means a user's perceived latency is
 // SessionQueueWaitMs + InvokeLatencyMs, and InvokeLatencyMs alone stops telling the whole story the
@@ -307,10 +303,6 @@ function createDispatcherMetrics(deps = {}) {
     emitMetric(M_TOKEN_REJECTED, 1, 'Count', agent, { Reason: reason || 'unknown' }, [['Reason'], []]);
   }
 
-  function emitTokenStoreUnavailable({ agent } = {}) {
-    emitMetric(M_TOKEN_STORE_UNAVAILABLE, 1, 'Count', agent, {}, [[]]);
-  }
-
   // ── Per-session queue metrics ──────────────────────────────────────────────
   //
   // One call site per event, each emitting only the fields it knows:
@@ -501,7 +493,6 @@ function createDispatcherMetrics(deps = {}) {
     emitMessageReceived,
     emitOwnerAdded,
     emitTokenRejected,
-    emitTokenStoreUnavailable,
     _namespace: namespace,
   };
 }
@@ -525,7 +516,6 @@ const NOOP_METRICS = {
   emitMessageReceived() {},
   emitOwnerAdded() {},
   emitTokenRejected() {},
-  emitTokenStoreUnavailable() {},
   _namespace: NAMESPACE,
 };
 
@@ -549,7 +539,6 @@ module.exports = {
     M_INVOKE_COLD_RETRIES,
     M_INVOKE_ERROR,
     M_TOKEN_REJECTED,
-    M_TOKEN_STORE_UNAVAILABLE,
     M_SESSION_QUEUE_DEPTH,
     M_SESSION_QUEUE_WAIT_MS,
     M_SESSION_QUEUE_REJECTED,

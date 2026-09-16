@@ -21,19 +21,18 @@
 // work so phase 3 can flip the runtime and phase 4 can retire the secret. The hole closes in phase 4.
 
 const crypto = require('node:crypto');
-const { verifyTurnToken } = require('./turn-token');
+const { verifyTurnToken, VERSION } = require('./turn-token');
 
 // A token is recognisable by its version prefix, and nothing else is. The static secret is random
-// bytes from Secrets Manager and cannot collide with `v<n>.` unless someone chooses it to — and the
+// bytes from Secrets Manager and cannot collide with `v1.` unless someone chooses it to — and the
 // consequence if it did is a 401 on a misconfigured dispatcher, not a bypass.
 //
-// ANY version matches, not just the one we mint. The dispatcher rolls (two tasks briefly coexist), so
-// a token minted by a NEWER task will reach an older one — and routing it to the verifier is what
-// turns that into the precise `unknown_version` the version prefix exists to produce. Matching only
-// `v1.` would send it to the secret comparison instead and report `invalid`, which says "forged"
-// about a token we ourselves minted.
-const TOKEN_PREFIX = /^v[0-9]+\./;
-const looksLikeToken = (v) => typeof v === 'string' && TOKEN_PREFIX.test(v);
+// EXACTLY THE VERSION WE MINT. This briefly matched any `v<n>.` so that a token from a newer task
+// during a rolling deploy would reach the verifier and report `unknown_version` rather than
+// `invalid`. That was speculative: there is no v2, this API is not versioned (file-ref.js, the
+// module this is modelled on, carries no version at all), and both paths 401 regardless — only the
+// reason string differs. Whoever introduces a v2 can widen this deliberately.
+const looksLikeToken = (v) => typeof v === 'string' && v.startsWith(`${VERSION}.`);
 
 // The metric's vocabulary (§8.8), which is deliberately COARSER than the verifier's. `malformed`,
 // `unknown_version` and `invalid` all mean the same operationally — this did not come from us — and
@@ -43,6 +42,11 @@ const METRIC_REASON = {
   missing: 'missing',
   expired: 'expired',
   revoked: 'revoked',
+  // The revocation store could not be read. Its own dimension so it is triageable, but NOT alarmed:
+  // the config table being unreachable already breaks every turn at the runtime (pi-adapter reads
+  // grants, policy and config from it per turn, unguarded), so it will have alarmed long before this
+  // metric says anything. An alarm here would only restate that.
+  unavailable: 'unavailable',
   malformed: 'unknown',
   unknown_version: 'unknown',
   invalid: 'unknown',
@@ -81,12 +85,12 @@ function pathSubject(path) {
 /**
  * @param deps.secret      the fleet-wide shared secret (still accepted this phase)
  * @param deps.turnTokens  the revocation store (turn-token-store.js) — `isLive(claims)`
- * @param deps.metrics     dispatcher metrics (emitTokenRejected / emitTokenStoreUnavailable)
+ * @param deps.metrics     dispatcher metrics (emitTokenRejected)
  * @param deps.log         pino-shaped logger
  */
 function createDispatcherAuth(deps = {}) {
   const { secret, turnTokens } = deps;
-  const metrics = deps.metrics || { emitTokenRejected() {}, emitTokenStoreUnavailable() {} };
+  const metrics = deps.metrics || { emitTokenRejected() {} };
   const log = deps.log || { info() {}, warn() {}, error() {} };
   if (!secret) throw new Error('createDispatcherAuth: secret required');
 
@@ -140,23 +144,18 @@ function createDispatcherAuth(deps = {}) {
     if (!r.valid) return reject(req, res, r.reason);
 
     // Signature and expiry are settled; only revocation is left, and that is a store read.
+    //
+    // ANYTHING BUT `live` IS A REFUSAL — one rule, no degraded mode.
+    //
+    // An earlier version accepted on an unreadable store, reasoning that refusing would take the
+    // whole fleet's dispatcher calls down on one DynamoDB blip. That was wrong about the blast
+    // radius: the runtime reads its grants, policy and config from THIS SAME TABLE on every turn
+    // (pi-adapter.mjs readGrants/readPolicy/readConfigItems, unguarded), so a table that cannot be
+    // read is a table where turns are already failing. The window fail-open actually bought was an
+    // in-flight turn during a brief blip — bought with a second security mode that silently accepts
+    // revoked credentials, and with the operator having to know which mode was in force.
     const liveness = await turnTokens.isLive(r.claims);
-    if (liveness === 'revoked') return reject(req, res, 'revoked', { scope: r.claims.scope });
-    if (liveness === 'unavailable') {
-      // ACCEPT, DEGRADED — and this is a real decision, not an oversight.
-      //
-      // Refusing here would take every agent→dispatcher call in the fleet down with one DynamoDB
-      // blip: no cron CRUD, no approvals, no slack_send, for every scope at once. Accepting costs
-      // only the revocation WINDOW — the token is still signed, still scope-bound and still expires
-      // — which degrades to exactly the design D1 called "already a large improvement on a static
-      // fleet-wide secret". Availability of the whole fleet against a window measured in the turn's
-      // own budget is not a close trade.
-      //
-      // It is metered separately from rejections so it can never be read as one, and so silent loss
-      // of revocation is visible rather than inferred.
-      metrics.emitTokenStoreUnavailable({ agent: r.claims.scope });
-      log.error({ scope: r.claims.scope, path: req.path }, 'dispatcher auth: revocation unavailable — accepting on signature alone');
-    }
+    if (liveness !== 'live') return reject(req, res, liveness, { scope: r.claims.scope });
     req.dispatcherAuth = { kind: 'token', scope: r.claims.scope, claims: r.claims };
     return next();
   }

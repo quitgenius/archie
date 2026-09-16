@@ -9,18 +9,14 @@ const token = (over = {}) => mintTurnToken({ scope: 'dm-u1', sessionId: 's', run
 
 function harness(over = {}) {
   const rejected = [];
-  const degraded = [];
-  const metrics = {
-    emitTokenRejected: (reason, ctx) => rejected.push([reason, ctx && ctx.agent]),
-    emitTokenStoreUnavailable: (ctx) => degraded.push(ctx && ctx.agent),
-  };
+  const metrics = { emitTokenRejected: (reason, ctx) => rejected.push([reason, ctx && ctx.agent]) };
   const auth = createDispatcherAuth({
     secret: SECRET,
     turnTokens: { isLive: async () => over.liveness || 'live' },
     metrics,
     log: { info() {}, warn() {}, error() {} },
   });
-  return { auth, rejected, degraded };
+  return { auth, rejected };
 }
 
 const reqOf = (over = {}) => ({ headers: {}, path: '/cron', method: 'POST', ...over });
@@ -99,23 +95,24 @@ describe('dispatcher auth — revocation, and what happens when it cannot be con
     expect(rejected).toEqual([['revoked', 'dm-u1']]);
   });
 
-  // Refusing would take every agent→dispatcher call in the fleet down on one DynamoDB blip. The
-  // token is still signed, still scope-bound and still expiring — only the revocation window is lost.
-  it('an unavailable store ACCEPTS, and meters it separately so it cannot read as a rejection', async () => {
-    const { auth, rejected, degraded } = harness({ liveness: 'unavailable' });
-    const req = reqOf({ headers: { 'x-dispatcher-secret': token() } });
-    const { nexted } = await run(auth, req);
-    expect(nexted).toBe(true);
-    expect(req.dispatcherAuth.scope).toBe('dm-u1');
-    expect(rejected).toEqual([]);
-    expect(degraded).toEqual(['dm-u1']);
+  // ONE RULE: anything but `live` is a refusal. An earlier version accepted here, to avoid taking
+  // the fleet's dispatcher calls down on a DynamoDB blip — but the runtime reads its grants, policy
+  // and config from the same table every turn, so a table that cannot be read is a table where turns
+  // are already failing. All that bought was a second security mode that silently accepts revoked
+  // credentials.
+  it('an unavailable store REFUSES, with its own reason so it stays triageable', async () => {
+    const { auth, rejected } = harness({ liveness: 'unavailable' });
+    const { res, nexted } = await run(auth, reqOf({ headers: { 'x-dispatcher-secret': token() } }));
+    expect(nexted).toBe(false);
+    expect(res.code).toBe(401);
+    expect(rejected).toEqual([['unavailable', 'dm-u1']]);
   });
 
   // many scopes x 4 reasons is cardinality nobody wants, and the scope on a rejection is unverified
   // by definition — so it rides in the log fields, not the dimension.
   it('the metric vocabulary collapses every non-verifying token to one `unknown`', async () => {
     const { auth, rejected } = harness();
-    for (const bad of ['v1.garbage.sig', 'v2.abc.def', 'v1.' + Buffer.from('{').toString('base64url') + '.x']) {
+    for (const bad of ['v1.garbage.sig', 'not-a-token-at-all', 'v1.' + Buffer.from('{').toString('base64url') + '.x']) {
       await run(auth, reqOf({ headers: { 'x-dispatcher-secret': bad } }));
     }
     expect(rejected.map((r) => r[0])).toEqual(['unknown', 'unknown', 'unknown']);
@@ -125,8 +122,17 @@ describe('dispatcher auth — revocation, and what happens when it cannot be con
   // "my turn ended" is a different thing for a model to read than "someone forged this".
   it('but the RESPONSE keeps the precise reason', async () => {
     const { auth } = harness();
+    const { res } = await run(auth, reqOf({ headers: { 'x-dispatcher-secret': 'v1.garbage.sig' } }));
+    expect(res.body.reason).toBe('malformed');
+  });
+
+  // Only OUR version is treated as a token. Anything else falls to the secret comparison and is
+  // `invalid` — which is correct: this API is not versioned and there is no v2 to be lenient about.
+  it('a foreign version prefix is not treated as a token at all', async () => {
+    const { auth, rejected } = harness();
     const { res } = await run(auth, reqOf({ headers: { 'x-dispatcher-secret': 'v2.abc.def' } }));
-    expect(res.body.reason).toBe('unknown_version');
+    expect(res.body.reason).toBe('invalid');
+    expect(rejected[0][0]).toBe('unknown');
   });
 });
 
@@ -221,7 +227,7 @@ describe('dispatcher auth — an unexpected throw fails closed rather than hangi
     const auth = createDispatcherAuth({
       secret: SECRET,
       turnTokens: { isLive: async () => { throw new Error('unexpected'); } },
-      metrics: { emitTokenRejected() {}, emitTokenStoreUnavailable() {} },
+      metrics: { emitTokenRejected() {} },
       log: { info() {}, warn() {}, error() {} },
     });
     const res = resOf();
