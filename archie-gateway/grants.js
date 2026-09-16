@@ -3,7 +3,7 @@
 // WHAT A GRANT IS. Enforcement is capability-level, not tool-level: each tool declares one
 // `capability` (§8.6), the PEP allows a tool iff its capability is baseline-allow or present in this
 // agent's grant (pi-adapter's per-turn readGrants), and the mapping is many-to-one — so granting
-// `runtime` unlocks bash AND exec AND process AND sessions_spawn. The tab browses by tool because
+// `runtime` unlocks bash AND exec AND process. The tab browses by tool because
 // that is how people think, but every write here is a capability, and callers are responsible for
 // showing the blast radius (toolCatalog()'s capabilities[cap].tools) before asking.
 //

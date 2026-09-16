@@ -80,12 +80,18 @@ export const CUSTOM_TOOLS = {
   // cron-tool.mjs — baseline
   cron: 'cron',
 
-  // spawn-tool.mjs — `runtime`, and NOT a capability of its own. A spawned session runs as the same
+  // spawn-tool.mjs — ITS OWN capability, carved out of `runtime` (2026-09-16).
+  //
+  // The privilege argument for folding it into `runtime` still holds: a spawned session is the same
   // scope on the same runtime with the same derived role and grants, so it can do nothing the caller
-  // could not already do directly; a separate capability would imply an escalation that does not
-  // exist. It sat in CORE_TOOLS until 2026-09-16 as a Pi built-in, which it never was — Pi ships no
+  // could not already do directly. What that argument missed is that a capability is also the
+  // CONTROL surface — it is what the App Home Tools tab toggles — and `runtime` means "run arbitrary
+  // shell". Reaching sub-sessions through it would have meant granting shell to get them, which is a
+  // far bigger hammer than the feature. Its own capability is its own toggle and its own blast radius.
+  //
+  // It sat in CORE_TOOLS until 2026-09-16 as a Pi built-in, which it never was — Pi ships no
   // sessions_* tools at all, which is why this had to be built rather than enabled.
-  sessions_spawn: 'runtime',
+  sessions_spawn: 'spawn',
 
   // otel-tool.mjs — TWO TIERS, and the split is deliberate: otel_my_* is scope-pinned to the agent's
   // own telemetry (baseline), otel_fleet_* reads EVERY agent's and can run an arbitrary Logs Insights

@@ -51,8 +51,14 @@ describe('the tool catalogue ships with the module', () => {
     expect(Object.keys(c.tools).length).toBeGreaterThan(20);
     expect(c.capabilities.runtime.policy).toBe('deny');
     expect(c.capabilities['fs.read'].policy).toBe('allow');
-    // The blast radius the tab must show: one capability, four tools.
-    expect(c.capabilities.runtime.tools).toEqual(['bash', 'exec', 'process', 'sessions_spawn']);
+    // The blast radius the tab must show. THREE tools, not four: `sessions_spawn` was carved out
+    // into its own capability (2026-09-16) so an operator can grant sub-sessions without granting
+    // arbitrary shell — the two are no longer one switch.
+    expect(c.capabilities.runtime.tools).toEqual(['bash', 'exec', 'process']);
+    expect(c.capabilities.spawn.tools).toEqual(['sessions_spawn']);
+    // Default-deny, which is what makes building the tool unconditionally safe: with no grant the
+    // filter drops it and the PEP refuses it, so the tab's toggle is the only control.
+    expect(c.capabilities.spawn.policy).toBe('deny');
   });
 });
 
@@ -128,7 +134,7 @@ describe('grantCapability', () => {
     expect(doc.body()).toEqual({ runtime: { sources: ['manual:U123'] } });
     expect(r.caps).toEqual(['runtime']);
     expect(r.alreadyGranted).toBe(false);
-    expect(r.tools).toEqual(['bash', 'exec', 'process', 'sessions_spawn']);
+    expect(r.tools).toEqual(['bash', 'exec', 'process']);
   });
 
   it('adds to an existing capability without disturbing derived sources', async () => {

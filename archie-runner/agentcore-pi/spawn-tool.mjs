@@ -15,10 +15,11 @@ export function createSpawnTool(deps = {}) {
   return {
     name: 'sessions_spawn',
     label: 'sessions_spawn',
-    // No capability of its own. A spawned session runs as the SAME scope, on the same runtime, with
-    // the same derived role and the same grants — so it can do nothing the caller could not already
-    // do directly. Gating it separately would imply an escalation that does not exist.
-    capability: 'runtime',
+    // Its own capability, so the Tools tab can offer it WITHOUT offering arbitrary shell. Not an
+    // escalation — a child is the same scope with the same grants — but it is the thing an operator
+    // wants to switch on and off, and `runtime` is too coarse to be that switch. See
+    // tool-declarations.mjs.
+    capability: 'spawn',
     description:
       'Run a prompt in a fresh, separate session as yourself, and get its final answer back as this '
       + "tool's result. Use it to do a self-contained piece of work without spending your own "
@@ -52,8 +53,16 @@ export function createSpawnTool(deps = {}) {
   };
 }
 
-export function buildSpawnTools(allow) {
-  // Gated like every other custom tool: present only when the agent's resolved allow-set carries it.
-  const allowed = allow && typeof allow.has === 'function' ? allow.has('sessions_spawn') : true;
-  return allowed ? [createSpawnTool()] : [];
+export function buildSpawnTools() {
+  // ALWAYS BUILT — deliberately unlike the tools gated on the resolved allow-set.
+  //
+  // The allow-set is a CONFIG surface: changing it means a change to the agent's config repo and a
+  // hydrate. That made enabling sessions_spawn a two-place operation (a config token AND a grant),
+  // with only the grant visible in App Home — so the Tools tab could show the tool and still not be
+  // able to switch it on, which is worse than not showing it.
+  //
+  // Building it unconditionally is safe because the capability is default-deny: with no `spawn`
+  // grant, applyToolFilter drops it from the model's surface and the PEP refuses a call that arrives
+  // anyway. So the tab's toggle IS the control, and it is the only control.
+  return [createSpawnTool()];
 }
