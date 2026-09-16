@@ -8,10 +8,20 @@ import { makeSpawnExecute } from './spawn-tool-core.mjs';
 const T = piAi.Type;
 
 export function createSpawnTool(deps = {}) {
-  const execute = makeSpawnExecute({
+  const run = makeSpawnExecute({
     dispatcher: deps.dispatcher || createDispatcherClient(),
     log: deps.log,
   });
+
+  // PI'S TOOL RESULT SHAPE, which is NOT a bare value: `{ content: [{type:'text', text}], details }`.
+  // Returning the string directly type-errors inside Pi's agent loop — `Cannot read properties of
+  // undefined (reading 'map')` — which surfaces as `stopReason: error` and a turn that produces no
+  // reply at all. Live-caught 2026-09-16: three spawned children all succeeded and the PARENT turn
+  // died on its own tool result, so the agent looked frozen. Same wrapper as cron-tool.mjs:81.
+  const execute = async (toolCallId, params) => {
+    const text = await run(toolCallId, params);
+    return { content: [{ type: 'text', text }], details: { text } };
+  };
   return {
     name: 'sessions_spawn',
     label: 'sessions_spawn',
