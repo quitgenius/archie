@@ -137,13 +137,11 @@ const AGENT_NAME = process.env.AGENT_NAME || 'pi-agent';
 // ran. Do not default it to a literal account — a wrong guess would assert against the wrong value,
 // which is worse than not asserting.
 const EXPECTED_ACCOUNT = process.env.AGENTCORE_ACCOUNT || null;
-// OpenClaw stores sessions.json `sessionFile` as an ABSOLUTE path under its home
-// (observed: <OPENCLAW_HOME>/.openclaw/agents/<agent>/sessions/<file>). On a rollback to
-// the ECS gateway, OpenClaw opens the stored path as-is, so Pi writes the same absolute
-// form for rollback symmetry. Pi's own resolveSessionPath basenames it, so this is inert
-// for Pi. Override the home base via OPENCLAW_HOME_ABS if the ECS layout differs.
-const OPENCLAW_HOME_ABS = process.env.OPENCLAW_HOME_ABS || '/app/.openclaw';
-const ocSessionFile = (base) => (base ? `${OPENCLAW_HOME_ABS}/.openclaw/agents/${AGENT_NAME}/sessions/${base}` : undefined);
+// (Removed 2026-09-16.) Pi used to write `sessions.json` entries carrying an ABSOLUTE OpenClaw-style
+// path so a rollback to the ECS gateway could open them. That symmetry is no longer wanted — sandbox:
+// "it's fine if archie v1 can't read archie v2's session data" — and it was the reason archie shared
+// a read-modify-write index with a live OpenClaw gateway, which is what destroyed every entry it
+// ever wrote. Pointers are per-key files now and store a basename; see session-store.mjs.
 const SESSION_HEADER = 'x-amzn-bedrock-agentcore-runtime-session-id';
 const DEFAULT_SESSION_ID = 'local-pi-default-session-0000000000000';
 // EFS_DIR set only in VPC/EFS mode; else ephemeral /tmp (PUBLIC-mode boot POC).
@@ -1350,17 +1348,14 @@ async function getSession(key, seed = {}) {
     const sessionId = sm.sessionId ?? sm.getSessionId?.();
     const file = sm.sessionFile ?? sm.getSessionFile?.();
     try {
-      // Rollback symmetry: write NET-NEW Pi sessions under OpenClaw's wrapped key form
-      // (agent:<agentName>:<logicalKey>) so a rollback to the ECS gateway finds them too.
-      // (Pi's own resolveSessionPath strips the wrapper, so this stays Pi-readable.) If we
-      // RESTORED an existing entry, update that key in place instead.
-      writeIndexEntry({
-        sessionsDir: SESSIONS_DIR, key, sessionId,
-        sessionFile: ocSessionFile(file ? basename(file) : undefined),
-        indexKey: resolved.matchedKey || `agent:${AGENT_NAME}:${key}`,
-      });
+      // ONE POINTER FILE PER KEY (session-store.mjs). No shared index, so parallel threads and
+      // spawned suagent-zh8hwws cannot clobber each other's sessions — which the old single
+      // `sessions.json` did on every concurrent write, and why restore had never once succeeded.
+      writeIndexEntry({ sessionsDir: SESSIONS_DIR, key, sessionId, sessionFile: file });
     } catch (e) {
-      console.error(JSON.stringify({ level: 'warn', component: 'pi-adapter', msg: 'session index write failed', err: e.message }));
+      // ERROR, not warn: a lost pointer means this conversation silently starts over on the next
+      // microVM, which is exactly the failure that went unnoticed for months.
+      console.error(JSON.stringify({ level: 'error', component: 'pi-adapter', msg: 'session index write FAILED — this conversation will not survive a restart', key, err: e.message }));
     }
   }
   console.log(JSON.stringify({ level: 'info', component: 'pi-adapter', msg: 'session', key, mode: resolved.found ? 'restored' : 'created', reason, skills: skill.names.length, extensions: extensionFactories.length, customTools: customTools.map((t) => t.name) }));
