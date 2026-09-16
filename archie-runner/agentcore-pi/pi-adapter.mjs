@@ -39,6 +39,7 @@ import { skillFingerprint, scopeManifest, withAlwaysOn, filterPinnedSkills } fro
 // it — same reason skillFingerprint lives in skill-scope.mjs).
 import { configFingerprint } from './config-fingerprint.mjs';
 import { extractTraceContext } from './trace-context.mjs';
+import { applyDispatcherToken } from './dispatcher-token.mjs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 // CJS require for the esbuild-bundled compat plugins (connector etc.) baked at /app/plugins.
@@ -1464,6 +1465,14 @@ async function handler(req, res) {
         // dispatcher). Applied for the duration of THIS turn only and then restored; unresolvable
         // ids fall back to the agent's configured model rather than failing the turn.
         const modelOverride = body?.input?.model ?? body?.model ?? null;
+        // PHASE 3 of the per-turn credential: point DISPATCHER_SHARED_SECRET at THIS turn's token,
+        // in-process. See dispatcher-token.mjs for why the env var is the interface and why it is
+        // set-or-deleted rather than left alone.
+        const hasDispatcherToken = applyDispatcherToken(body?.input ?? body, process.env);
+        // Queryable in aws/spans: with no boot-resolved fallback, a turn that arrives without a
+        // token is a turn whose every dispatcher call will fail — and this is the only thing that
+        // distinguishes "the dispatcher did not send one" from "the call was refused".
+        if (span) span.attributes['dispatcher.token'] = hasDispatcherToken ? 'present' : 'absent';
         // Warm/cold BEFORE getSession creates the entry — the span attribute is otherwise always true.
         const sessionWasWarm = sessions.has(sessionId);
         const { session, turnCtx, sm, applyFilter } = await getSession(sessionId, { runId, sender, trigger, sessionKey: logicalSessionKey });

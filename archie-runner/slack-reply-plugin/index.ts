@@ -42,7 +42,21 @@ export default definePluginEntry({
     // OpenClaw sets SLACK_PROXY_URL; under Pi/AgentCore pi-entrypoint resolves the same host as
     // DISPATCHER_BASE_URL at boot. Accept either so neither runtime needs a bespoke env var.
     const proxyUrl = process.env.SLACK_PROXY_URL || process.env.DISPATCHER_BASE_URL;
-    const secret = process.env.DISPATCHER_SHARED_SECRET;
+    // READ PER CALL, NOT CAPTURED AT REGISTER.
+    //
+    // This used to be `const secret = process.env.DISPATCHER_SHARED_SECRET`, closed over by
+    // slack_send and slack_download_file. That was correct while the value was a static secret
+    // resolved once at boot. It stops being correct the moment the value is a PER-TURN token
+    // (archie-dispatcher-token-plan.md phase 3): register() runs once, so every later turn would
+    // present the first turn's token — which the dispatcher deletes when that turn ends, so every
+    // slack_send after the first would 401 with `revoked`, and would do it while looking exactly
+    // like an attack on the alarm.
+    //
+    // The env var is the interface (D3) and the runtime rewrites it at the start of each turn, so
+    // the only safe read is at call time. `proxyUrl` stays captured: it is per-deployment.
+    const secretNow = () => process.env.DISPATCHER_SHARED_SECRET;
+    // Init-time snapshot, used ONLY for the one-off startup warning below. Never for a request.
+    const secretAtInit = secretNow();
 
     // Warn once at init if either env var is missing. We don't refuse
     // to register the tool — that would hide the agent's failure mode
@@ -54,12 +68,12 @@ export default definePluginEntry({
           "slack-reply-plugin: SLACK_PROXY_URL not set — slack_send will error at call time",
         );
       }
-      if (!secret) {
+      if (!secretAtInit) {
         api.logger.warn(
           "slack-reply-plugin: DISPATCHER_SHARED_SECRET not set — slack_send will error at call time",
         );
       }
-      if (proxyUrl && secret) {
+      if (proxyUrl && secretAtInit) {
         api.logger.info(`slack-reply-plugin: ready — proxy=${proxyUrl}`);
       }
     }
@@ -116,6 +130,7 @@ export default definePluginEntry({
             "slack_download_file: SLACK_PROXY_URL is not set in the container env",
           );
         }
+        const secret = secretNow();
         if (!secret) {
           throw new Error(
             "slack_download_file: DISPATCHER_SHARED_SECRET is not set in the container env",
@@ -341,6 +356,7 @@ export default definePluginEntry({
         if (!proxyUrl) {
           throw new Error("slack_send: SLACK_PROXY_URL is not set in the container env");
         }
+        const secret = secretNow();
         if (!secret) {
           throw new Error("slack_send: DISPATCHER_SHARED_SECRET is not set in the container env");
         }

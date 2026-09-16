@@ -23,13 +23,23 @@ const DEFAULT_TIMEOUT_MS = 10_000;
 
 export function createDispatcherClient(opts = {}) {
   const base = String(opts.baseUrl ?? process.env.DISPATCHER_BASE_URL ?? '').replace(/\/+$/, '');
-  const secret = opts.secret ?? process.env.DISPATCHER_SHARED_SECRET ?? '';
+  // READ PER CALL, NOT CAPTURED HERE.
+  //
+  // This client is built once per SESSION (buildCustomTools → buildCronTools, pi-adapter), and a
+  // session serves many turns. While DISPATCHER_SHARED_SECRET held a static boot-resolved secret
+  // that was fine. It stops being fine the moment the value is a PER-TURN token
+  // (archie-dispatcher-token-plan.md phase 3): the client would pin turn 1's token for the life of
+  // the session, and the dispatcher deletes that token when turn 1 ends — so every cron call from
+  // turn 2 onward would 401 with `revoked`, indistinguishable at the alarm from a replay.
+  //
+  // `base` stays captured: it is per-deployment and cannot change under a running session.
+  const secretNow = () => opts.secret ?? process.env.DISPATCHER_SHARED_SECRET ?? '';
   const doFetch = opts.fetchImpl || globalThis.fetch;
   const timeoutMs = opts.timeoutMs || DEFAULT_TIMEOUT_MS;
 
   function assertConfigured() {
     if (!base) throw new Error('dispatcher-client: DISPATCHER_BASE_URL not set');
-    if (!secret) throw new Error('dispatcher-client: DISPATCHER_SHARED_SECRET not set');
+    if (!secretNow()) throw new Error('dispatcher-client: DISPATCHER_SHARED_SECRET not set');
   }
 
   async function call(method, path, body) {
@@ -39,7 +49,7 @@ export function createDispatcherClient(opts = {}) {
     try {
       const res = await doFetch(`${base}${path}`, {
         method,
-        headers: { 'content-type': 'application/json', 'x-dispatcher-secret': secret },
+        headers: { 'content-type': 'application/json', 'x-dispatcher-secret': secretNow() },
         ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
         signal: ac.signal,
       });
@@ -60,7 +70,7 @@ export function createDispatcherClient(opts = {}) {
 
   const enc = encodeURIComponent;
   return {
-    isConfigured: () => Boolean(base && secret),
+    isConfigured: () => Boolean(base && secretNow()),
     add: (job) => call('POST', '/cron', job),
     list: (agentId) => call('GET', `/cron/${enc(agentId)}`),
     update: (agentId, jobId, patch) => call('PUT', `/cron/${enc(agentId)}/${enc(jobId)}`, patch),

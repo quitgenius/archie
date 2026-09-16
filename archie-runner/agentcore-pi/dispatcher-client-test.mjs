@@ -112,10 +112,32 @@ check('reads config from env when opts omitted', async () => {
   delete process.env.DISPATCHER_SHARED_SECRET;
 });
 
+// PHASE 3 of the per-turn credential: the client is built once per SESSION and a session serves many
+// turns, so a captured secret would pin turn 1's token for the life of the session — and the
+// dispatcher deletes that token when turn 1 ends.
+check('reads the secret PER CALL, so a per-turn token is never stale', async () => {
+  const f = mockFetch({ body: { ok: true, jobs: [] } });
+  const prev = process.env.DISPATCHER_SHARED_SECRET;
+  process.env.DISPATCHER_SHARED_SECRET = 'turn-1-token';
+  const c = createDispatcherClient({ baseUrl: 'https://d.example.com', fetchImpl: f, timeoutMs: 500 });
+  await c.list('a');
+  process.env.DISPATCHER_SHARED_SECRET = 'turn-2-token';   // a new turn rewrites the env var
+  await c.list('a');
+  if (prev === undefined) delete process.env.DISPATCHER_SHARED_SECRET; else process.env.DISPATCHER_SHARED_SECRET = prev;
+  assert.deepEqual(
+    f.calls.map((c2) => c2.opts.headers['x-dispatcher-secret']),
+    ['turn-1-token', 'turn-2-token'],
+  );
+});
+
 for (const { name, fn } of checks) {
   try { await fn(); console.log(`  ✅ ${name}`); pass += 1; }
   catch (e) { console.log(`  ❌ ${name}\n     ${e.message}`); }
 }
 const ok = pass === checks.length;
+
+
+
+
 console.log(`[dispatcher-client] ${pass}/${checks.length} ${ok ? 'PASS ✅' : 'FAIL ❌'}`);
 process.exit(ok ? 0 : 1);

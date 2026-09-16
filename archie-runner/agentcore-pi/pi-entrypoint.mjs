@@ -333,22 +333,23 @@ async function main() {
     }
   }
 
-  // Dispatcher shared secret — resolve from Secrets Manager so the cron tool can
-  // authenticate to the dispatcher's manager API via the x-dispatcher-secret header
-  // (Option B cron; see pi-cron-migration-plan.md §2b). Mirrors the CONNECTOR_API_KEY
-  // pattern: DISPATCHER_SHARED_SECRET_ID names the secret; the resolved value lands in
-  // DISPATCHER_SHARED_SECRET (the same env name the ECS agents use, so tool code is
-  // stack-agnostic). A pre-set plain DISPATCHER_SHARED_SECRET skips the fetch (local/test).
-  const dispatcherSecretId = process.env.DISPATCHER_SHARED_SECRET_ID;
-  if (dispatcherSecretId && !process.env.DISPATCHER_SHARED_SECRET) {
-    try {
-      const secret = await fetchSecret(dispatcherSecretId, process.env.DISPATCHER_SHARED_SECRET_REGION);
-      if (secret) {
-        process.env.DISPATCHER_SHARED_SECRET = secret;
-        log({ level: 'info', msg: 'DISPATCHER_SHARED_SECRET resolved from Secrets Manager', fp: await fingerprint(secret) });
-      }
-    } catch (e) { log({ level: 'warn', msg: 'dispatcher secret fetch failed', err: e.message }); }
-  }
+  // NO DISPATCHER SECRET AT BOOT — DELIBERATELY REMOVED (phase 3 of
+  // archie-docs/archie-dispatcher-token-plan.md). This used to resolve DISPATCHER_SHARED_SECRET_ID
+  // from Secrets Manager into DISPATCHER_SHARED_SECRET, mirroring the CONNECTOR_API_KEY pattern above.
+  //
+  // `DISPATCHER_SHARED_SECRET` is now written by pi-adapter at the START OF EVERY TURN, from the
+  // per-turn token on the invoke payload. Its value is a credential for one turn of one scope
+  // instead of the fleet-wide secret that let any agent act as any other.
+  //
+  // THE FETCH IS GONE RATHER THAN KEPT AS A FALLBACK, and that is the decision (D3, sandbox): a
+  // boot-resolved value would silently become the fallback for exactly the cases the token exists to
+  // close — a turn with no token would quietly reach the dispatcher with fleet-wide authority
+  // instead of failing. There is nothing to fall back to, on purpose.
+  //
+  // WHAT BREAKS IF THE ORDER IS WRONG: an image carrying this change, running against a dispatcher
+  // that does not yet MINT (phase 1), leaves every agent with no credential at all. Gateway first,
+  // always. DISPATCHER_SHARED_SECRET_ID stays on the runtime spec until phase 4 — harmless now that
+  // nothing reads it, and removing it is a spec change with its own rollout.
 
   // Hand off — the adapter self-boots on import. It takes the config from agent-config.mjs's memo
   // (the resolve bootConfig already paid for, same module instance in this process) + PI_WORKSPACE.
