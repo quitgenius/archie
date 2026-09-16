@@ -86,6 +86,8 @@ function checkCompleteness(sources, caps) {
     ...(caps.hookOnly || []),
     // Capabilities with no tool AND no token — see TOOLLESS_CAPABILITIES below.
     ...(caps.toolless || []),
+    // Capabilities a PLUGIN provides — see PLUGIN_PROVIDERS below.
+    ...(caps.pluginProvided || []),
     ...(caps.slugs || []),
   ]);
   const out = [];
@@ -456,6 +458,12 @@ function runSourceChecks(sources, { caps, knownScopes = null, cedar } = {}) {
  *   hindsight.write           hook-only. It has no tool, no token and no prefix — the hindsight retain
  *                             gate names it directly (hindsight-extension.mjs) — so it appears in no
  *                             projection and must be added explicitly or it reads as dead.
+ *   PLUGIN_PROVIDERS          capabilities whose tools a PLUGIN registers at runtime, so no static
+ *                             CORE_TOOLS/CUSTOM_TOOLS row names them. `demo_sensitive_action` is the case that
+ *                             exposed the gap: demo_sensitive_tool is declared by
+ *                             connector-session-plugin, and without this the capability read as a dead
+ *                             declaration the moment it was pinned. `files.publish` did not warn only
+ *                             because it is also baseline, which is luck rather than coverage.
  *   TOOLLESS_CAPABILITIES     capabilities that are an IAM fact and a policy pin rather than a tool:
  *                             the five reverted AWS/observability skills (which ALSO_ALLOW_CAP still
  *                             projects, so they were never at risk) and the PIN-ONLY ones ported from
@@ -469,7 +477,7 @@ function runSourceChecks(sources, { caps, knownScopes = null, cedar } = {}) {
  * universe so a typo'd slug is still caught.
  */
 async function capabilityUniverse(sources = null, { itemsDir = ITEMS_AGENTS } = {}) {
-  const [{ CAPABILITY_DEFAULTS }, { ALSO_ALLOW_CAP, prefixToCapability }, { TOOLLESS_CAPABILITIES }] = await Promise.all([
+  const [{ CAPABILITY_DEFAULTS }, { ALSO_ALLOW_CAP, prefixToCapability }, { TOOLLESS_CAPABILITIES, PLUGIN_PROVIDERS }] = await Promise.all([
     import(`file://${require.resolve('../../archie-runner/agentcore-pi/permissions/capabilities.mjs')}`),
     import(`file://${require.resolve('../../archie-runner/config-resolver/caps-from-config.mjs')}`),
     import(`file://${require.resolve('../../archie-runner/agentcore-pi/tool-declarations.mjs')}`),
@@ -487,6 +495,8 @@ async function capabilityUniverse(sources = null, { itemsDir = ITEMS_AGENTS } = 
     hookOnly: ['hindsight.write'],
     // No tool, and for the pin-only ones no token either — the runtime names them through IAM.
     toolless: [...TOOLLESS_CAPABILITIES],
+    // Plugin-registered tools: the capability is real and named at runtime, just not by a static row.
+    pluginProvided: [...new Set(Object.values(PLUGIN_PROVIDERS).flatMap((d) => d.capabilities || []))],
     slugs: Array.isArray(data.slugs) ? data.slugs : realKeys(data.slugs || {}),
     // TRUE when items/ was unavailable, so the reverse half of check 2 must report itself as partial
     // rather than claiming a capability is dead on incomplete evidence.

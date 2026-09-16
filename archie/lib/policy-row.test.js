@@ -29,14 +29,15 @@ const PROD = loadPolicySources({ env: 'prod' });
 const SANDBOX = loadPolicySources({ env: 'sandbox' });
 
 /** The 12 policy-pinned capabilities — the only ones any statement overrides (semantics.cedar B + C). */
-// FOURTEEN since 2026-09-15: `bedrock-mantle` and `ec2` joined when OpenClaw's per-agent IAM
-// statements started becoming capabilities (archie-docs/archie-agent-iam-capability-port.md). Both
-// are pin-only — no token, no tool — so a grant row can never confer them, which is exactly what the
-// denies below assert.
+// FIFTEEN since 2026-09-16: `bedrock-mantle` and `ec2` joined when OpenClaw's per-agent IAM
+// statements started becoming capabilities (archie-docs/archie-agent-iam-capability-port.md), then
+// `demo_sensitive_action` once demo_sensitive_tool was ported. ec2 and bedrock-mantle are pin-only (no token,
+// no tool); demo_sensitive_action has a tool but still cannot be conferred by a grant row, which is what the
+// denies below assert for all fifteen.
 const PINNED = [
-  'airflow', 'aws-person79b333-secrets', 'aws-readonly', 'bedrock-mantle', 'cloudwatch-logs', 'datadog',
-  'ec2', 'demo_diagram_app', 'hindsight.write', 'demo_notes_app', 'otel.fleet', 'demo_cache',
-  'sandbox-probe', 'demo_mail_app',
+  'airflow', 'aws-person79b333-secrets', 'aws-readonly', 'bedrock-mantle', 'cloudwatch-logs',
+  'demo_sensitive_action', 'datadog', 'ec2', 'demo_diagram_app', 'hindsight.write', 'demo_notes_app', 'otel.fleet',
+  'demo_cache', 'sandbox-probe', 'demo_mail_app',
 ];
 
 const PEER_TWO = 'dm-udbugah9aty';       // pin.aws-readonly, and nothing else
@@ -74,7 +75,7 @@ test('three verdicts, and each one comes from a distinguishable place in the pol
   // `deny` — a pin whose group this scope is not in. Nothing can allow it.
   assert.equal(all['demo_cache'], VERDICT.DENY);
 
-  assert.equal(Object.keys(all).length, 35, 'the full map covers the whole domain');
+  assert.equal(Object.keys(all).length, 36, 'the full map covers the whole domain');
 });
 
 test('a pinned capability is never `grant`, in either environment', () => {
@@ -96,14 +97,14 @@ test('THE LOAD-BEARING DENY: a non-member with a live DynamoDB grant is denied',
   const entities = [...sharedEntities(PROD), scopeEntity(UNSEEN, PROD)];
   for (const cap of PINNED) {
     // The row must SAY deny, not omit the entry: §1.1's consumer falls through an absent entry to
-    // `grants.has(capability)`, and none of these fourteen is baseline — so an omitted entry means a
+    // `grants.has(capability)`, and none of these fifteen is baseline — so an omitted entry means a
     // DynamoDB row would confer it, which is precisely what the pin exists to make impossible.
     assert.equal(decisionFor({ scope: UNSEEN, capability: cap, grants: [cap], policies, entities }), 'deny', cap);
     assert.equal(rowFor(UNSEEN, PROD).verdicts[cap], VERDICT.DENY, cap);
   }
 });
 
-test('rowFor is TOTAL — a scope never seen before gets fourteen denies, not an error', () => {
+test('rowFor is TOTAL — a scope never seen before gets fifteen denies, not an error', () => {
   // Plan §2 property 3: every pin is conditioned only on group membership, so a channel minted between
   // deploys is computable at mint time. There is no unknown-scope case to handle, and this is what
   // makes one delivery point serve both writers.

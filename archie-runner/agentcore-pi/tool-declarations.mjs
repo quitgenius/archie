@@ -160,6 +160,13 @@ export const PLUGIN_PROVIDERS = {
   // tool-registry.test.mjs asserts it matches allCustomTools() in both directions — a plugin tool
   // listed there fails that test.
   'file-publish': { capabilities: ['files.publish'], kind: 'plugin', tools: ['save_artifact'] },
+  // `demo_sensitive_action` — an EXAMPLE of a privileged, MUTATING capability whose tool
+  // carries its own approval gate on top of the pin. Two controls, not one: the pin answers
+  // "which scope may hold this at all", the gate answers "may this particular call proceed".
+  // Listed separately from the general third-party surface so the Tools tab and
+  // `assertGrantable` name the capability the pin actually governs, not a broader one it
+  // happens to sit inside.
+  'demo_sensitive_action': { capabilities: ['demo_sensitive_action'], kind: 'plugin', tools: ['demo_sensitive_tool'] },
   'demo-cache': { capabilities: ['demo_cache'], kind: 'plugin' },
   'mcp-auth': { capabilities: ['demo_warehouse'], kind: 'plugin' },
   hindsight: { capabilities: ['hindsight.read', 'hindsight.write'], kind: 'plugin-hooks' },
@@ -192,6 +199,8 @@ export const PROVIDER_NAMES = new Set([
   // provider is a tool the dispatcher cannot describe or grant against.
   'hindsight.write',
   'connector', 'demo-cache', 'mcp-auth', 'hindsight',
+  // `demo_sensitive_action` — demo_sensitive_tool's provider; same closure reason as file-publish below.
+  'demo_sensitive_action',
   // `file-publish` — save_artifact's provider. Needed here for the same reason as the two above:
   // provider-registry's closure check requires every capability that has tools to have a provider,
   // and grants.js derives the universe the Tools tab describes from this set.
