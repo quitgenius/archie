@@ -95,7 +95,7 @@ function pathSubject(path) {
 // Everything NOT in this list (/reload, /simulate, /routes, /debug/streaming, /files/download) is
 // operator surface and keeps accepting the shared secret: those callers are people and CI, they have
 // no turn, and there is no token for them to hold.
-const AGENT_ROUTE_PREFIXES = ['/cron', '/approvals', '/api'];
+const AGENT_ROUTE_PREFIXES = ['/cron', '/approvals', '/api', '/spawn'];
 
 /**
  * @param deps.secret      the fleet-wide shared secret (still accepted this phase)

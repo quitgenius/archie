@@ -15,6 +15,7 @@ import { buildMemoryTools } from './memory-tool.mjs';
 import { buildKnowledgeTools } from './knowledge-tools.mjs';
 import { buildKnowledgeWriteTools } from './knowledge-write-tools.mjs';
 import { buildCronTools } from './cron-tool.mjs';
+import { buildSpawnTools } from './spawn-tool.mjs';
 import { buildOtelTools } from './otel-tool.mjs';
 import { buildSandboxProbeTools } from './sandbox-probe-tool.mjs';
 
@@ -113,7 +114,7 @@ export function buildCustomTools(allow, cwd, ctx = {}) {
     // applyToolFilter drops them from the model's surface for any scope whose verdict is not `allow` and
     // the tool_call PEP denies a call that arrives anyway.
     ...buildKnowledgeWriteTools(ctx.hindsight || {}),
-    ...buildCronTools(allow, ctx), ...buildOtelTools(),
+    ...buildCronTools(allow, ctx), ...buildSpawnTools(allow), ...buildOtelTools(),
     // §7.3/7.4 ported AWS skills (grant-gated; each assumes a cross-account reader in-process).
     ...buildSandboxProbeTools(allow),
   ];

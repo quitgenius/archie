@@ -22,7 +22,15 @@ test('the declarations match the tools actually built, exactly and in both direc
 });
 
 test('the Pi built-in list is the shape the resolver hard-codes', () => {
-  assert.equal(Object.keys(CORE_TOOLS).length, 14, 'Pi built-ins: 7 read + 3 write + 4 runtime');
+  // 13, not 14: `sessions_spawn` was listed here as a Pi built-in and never was one — Pi ships no
+  // sessions_* tools at all, which is precisely why ours had to be BUILT rather than enabled
+  // (archie-sessions-spawn-plan.md). It now lives in CUSTOM_TOOLS with the tools we own, and
+  // capabilities.mjs's hard-coded rule dropped it in the same change so the two stay in lockstep.
+  assert.equal(Object.keys(CORE_TOOLS).length, 13, 'Pi built-ins: 7 read + 3 write + 3 runtime');
+  // Named rather than counted, so a future edit has to be deliberate about WHICH tools Pi owns.
+  assert.deepEqual(Object.keys(CORE_TOOLS).filter((k) => CORE_TOOLS[k] === 'runtime'),
+    ['bash', 'exec', 'process']);
+  assert.equal('sessions_spawn' in CORE_TOOLS, false, 'sessions_spawn is ours, not Pi\'s');
 });
 
 // §8.6 closure: every tool that can reach the model surface must DECLARE a capability, and the

@@ -74,11 +74,12 @@ export function makeCapabilityResolver({ mcpPrefixes = [], toolCaps = {} } = {})
     // 1) Our tools DECLARE their capability (the single source; resolver built from the registry).
     if (Object.prototype.hasOwnProperty.call(toolCaps, n)) return toolCaps[n];
     // 2) Pi-owned built-ins we can't decorate — createAgentSession injects read/grep/find/ls/glob/
-    //    tree/list (non-mutating → baseline fs.read), write/edit/apply_patch, and bash/exec/process/
-    //    sessions_spawn (→ runtime).
+    //    tree/list (non-mutating → baseline fs.read), write/edit/apply_patch, and bash/exec/process
+    //    (→ runtime). `sessions_spawn` is NOT here: Pi ships no such tool, and ours is adapter-native,
+    //    so it is declared in CUSTOM_TOOLS and answered by rule 1 above.
     if (n === 'read' || n === 'grep' || n === 'find' || n === 'ls' || n === 'glob' || n === 'tree' || n === 'list') return 'fs.read';
     if (n === 'write' || n === 'edit' || n === 'apply_patch') return 'fs.write';
-    if (n === 'bash' || n === 'exec' || n === 'process' || n === 'sessions_spawn') return 'runtime';
+    if (n === 'bash' || n === 'exec' || n === 'process') return 'runtime';
     // 3) Dynamic/plugin surfaces with no static object to decorate. Health must come BEFORE the
     //    server-prefix rules so e.g. demo_cache__health / demo_query_app__health aren't gated as data caps.
     if (n.endsWith('_plugin_health') || n.endsWith('__health')) return 'health';

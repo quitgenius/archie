@@ -48,6 +48,7 @@ const approvalsStore = require('./approvals-store');
 const { mintTurnToken, claimsOf } = require('./turn-token');
 const { createTurnTokenStore } = require('./turn-token-store');
 const { createDispatcherAuth } = require('./dispatcher-auth');
+const { createSpawnApi } = require('./spawn-api');
 const { makeApprovalHandlers, registerApprovalRoutes } = require('./approvals-routes');
 const { registerSlackProxyRoute } = require('./slack-proxy-routes');
 const { createApprovalWake } = require('./approvals-wake');
@@ -3242,6 +3243,17 @@ web.use(dispatcherAuth.enforceScope);
 // surface (/reload, /simulate, /routes, /debug/streaming) — those callers are people and CI, they
 // have no turn, and there is no token for them to hold.
 web.use(dispatcherAuth.AGENT_ROUTE_PREFIXES, dispatcherAuth.requireToken);
+
+// `POST /spawn` — sessions_spawn's server half (archie-sessions-spawn-plan.md). Token-only like every
+// other agent route, and it reads NO identity from the body: the scope comes from the signature, so
+// spawning as another agent is unrepresentable rather than merely refused.
+web.use('/spawn', createSpawnApi({
+  agentCore,
+  ensureRuntime: ensureCurrentRuntime,
+  mintTurnToken: (claims) => mintTurnToken(claims, DISPATCHER_SECRET),
+  turnTokens,
+  log,
+}));
 
 // Cron manager API — the AGENT mount. Token-only (the gate above), so every job written here is
 // written by the scope the token names and the invalid-delivery bypass is not available. The

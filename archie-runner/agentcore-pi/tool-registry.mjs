@@ -20,6 +20,7 @@ import { buildMemoryTools } from './memory-tool.mjs';
 import { buildKnowledgeTools } from './knowledge-tools.mjs';
 import { buildKnowledgeWriteTools } from './knowledge-write-tools.mjs';
 import { buildCronTools } from './cron-tool.mjs';
+import { buildSpawnTools } from './spawn-tool.mjs';
 import { buildOtelTools } from './otel-tool.mjs';
 import { createSandboxProbeTool } from './sandbox-probe-tool.mjs';
 import { CUSTOM_TOOLS, permissiveAllowSet } from './tool-declarations.mjs';
@@ -42,6 +43,7 @@ export function allCustomTools(cwd = '/tmp') {
     // to supply something or the tools are simply absent and the declarations look like drift.
     ...buildKnowledgeWriteTools({ apiUrl: 'https://hindsight.invalid', bankId: 'closure-check' }),
     ...buildCronTools(allow),
+    ...buildSpawnTools(allow),
     ...buildOtelTools(),
     createSandboxProbeTool(),
   ];

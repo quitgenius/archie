@@ -272,7 +272,7 @@ describe('dispatcher auth — requireToken, the line that closes the hole', () =
   // presented the secret" could not previously be treated as a signal. It has its own surface now.
   it('covers exactly the agent routes, leaving the operator surface alone', () => {
     const { AGENT_ROUTE_PREFIXES } = harness().auth;
-    expect(AGENT_ROUTE_PREFIXES).toEqual(['/cron', '/approvals', '/api']);
+    expect(AGENT_ROUTE_PREFIXES).toEqual(['/cron', '/approvals', '/api', '/spawn']);
     for (const operator of ['/reload', '/simulate', '/routes', '/debug/streaming']) {
       expect(AGENT_ROUTE_PREFIXES.some((p) => operator.startsWith(p))).toBe(false);
     }

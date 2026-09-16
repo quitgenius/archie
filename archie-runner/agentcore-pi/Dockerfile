@@ -167,6 +167,7 @@ COPY agentcore-pi/pi-runtime.mjs agentcore-pi/bedrock-model-registry.mjs agentco
      agentcore-pi/turn-outcome.mjs agentcore-pi/tool-outcome.mjs \
      agentcore-pi/dispatcher-client.mjs agentcore-pi/dispatcher-token.mjs \
      agentcore-pi/cron-tool-core.mjs agentcore-pi/cron-tool.mjs agentcore-pi/workspace-seed.mjs \
+     agentcore-pi/spawn-tool-core.mjs agentcore-pi/spawn-tool.mjs \
      agentcore-pi/skill-sync.mjs agentcore-pi/skill-scope.mjs agentcore-pi/tls-scoped.mjs \
      agentcore-pi/trace-context.mjs agentcore-pi/otel-tool.mjs \
      agentcore-pi/sandbox-probe-tool.mjs agentcore-pi/observability-iam.cjs agentcore-pi/tool-registry.mjs \

@@ -21,6 +21,11 @@
 
 const DEFAULT_TIMEOUT_MS = 10_000;
 
+// `spawn` blocks on a child TURN, not a store write. This ceiling only has to outlast the server's
+// own budget — which the dispatcher derives from the parent turn's token expiry and enforces with
+// its own abort — so it is a backstop against a hung connection, never the real limit.
+const SPAWN_TIMEOUT_MS = 10 * 60_000;
+
 export function createDispatcherClient(opts = {}) {
   const base = String(opts.baseUrl ?? process.env.DISPATCHER_BASE_URL ?? '').replace(/\/+$/, '');
   // READ PER CALL, NOT CAPTURED HERE.
@@ -42,10 +47,13 @@ export function createDispatcherClient(opts = {}) {
     if (!secretNow()) throw new Error('dispatcher-client: DISPATCHER_SHARED_SECRET not set');
   }
 
-  async function call(method, path, body) {
+  async function call(method, path, body, opts = {}) {
     assertConfigured();
     const ac = new AbortController();
-    const timer = setTimeout(() => ac.abort(), timeoutMs);
+    // Per-call override. The 10s default is right for cron CRUD, which is a store write; it is
+    // hopeless for `spawn`, which blocks on a whole child turn. A client-side abort shorter than the
+    // server-side budget would look to the model like a broken tool rather than a slow child.
+    const timer = setTimeout(() => ac.abort(), opts.timeoutMs || timeoutMs);
     try {
       const res = await doFetch(`${base}${path}`, {
         method,
@@ -76,6 +84,17 @@ export function createDispatcherClient(opts = {}) {
     update: (agentId, jobId, patch) => call('PUT', `/cron/${enc(agentId)}/${enc(jobId)}`, patch),
     remove: (agentId, jobId) => call('DELETE', `/cron/${enc(agentId)}/${enc(jobId)}`),
     run: (agentId, jobId) => call('POST', `/cron/${enc(agentId)}/${enc(jobId)}/run`),
+    /**
+     * `sessions_spawn`'s server half (archie-sessions-spawn-plan.md).
+     *
+     * NO agentId ARGUMENT, and that is the design rather than an omission: the scope comes from the
+     * per-turn token this client already sends, so there is no parameter through which a caller
+     * could name another agent. Every other method here takes an agentId because it predates the
+     * token; this one never will.
+     */
+    spawn: (prompt, { timeoutSeconds, timeoutMs } = {}) => call('POST', '/spawn',
+      { prompt, ...(timeoutSeconds ? { timeoutSeconds } : {}) },
+      { timeoutMs: timeoutMs || SPAWN_TIMEOUT_MS }),
     _base: base,
   };
 }

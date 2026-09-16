@@ -1350,17 +1350,49 @@ const MAX_CONCURRENT_PROVISIONS = Number(process.env.AGENTCORE_MAX_CONCURRENT_PR
 // site must bypass this bound.
 const MAX_CONCURRENT_INVOKES = Number(process.env.AGENTCORE_MAX_CONCURRENT_INVOKES || 25);
 
+// DERIVED FROM THE FLEET BOUND, not a magic number of its own (2026-09-16). It cannot be the
+// SAME SEMAPHORE — that is the deadlock above — but it has no business being an independent knob
+// either: what it needs to express is "a fraction of the fleet's invoke concurrency", so that spawns
+// degrade themselves long before they matter to anyone else. One knob still tunes both.
+//
+// Sharing the same VALUE (25) was the other option and it is not free: peak concurrent invokes would
+// double to 50 against a socket pool sized for 25, so it would quietly spend the retry/poll headroom
+// INVOKE_MAX_SOCKETS exists to keep. A quarter keeps the socket arithmetic honest below.
+const MAX_CONCURRENT_SPAWNS = Number(process.env.AGENTCORE_MAX_CONCURRENT_SPAWNS
+  || Math.max(1, Math.floor(MAX_CONCURRENT_INVOKES / 4)));
+
 // Socket pools. A concurrency bound above the socket count is a fiction (see sdk-http.js), so both
 // derive from the bounds above with headroom for the retry/poll traffic each path generates.
-const INVOKE_MAX_SOCKETS = Number(process.env.AGENTCORE_INVOKE_MAX_SOCKETS || Math.max(50, MAX_CONCURRENT_INVOKES * 2));
+// BOTH invoke pools share this socket pool, so the bound it has to cover is the SUM — see
+// MAX_CONCURRENT_SPAWNS above. Sizing it off `MAX_CONCURRENT_INVOKES` alone was correct while there
+// was one pool; leaving it that way once spawns exist would keep the number unchanged while the
+// concurrency it is meant to cover grew, which is how the "2x with headroom" promise above quietly
+// stops being true.
+const INVOKE_MAX_SOCKETS = Number(process.env.AGENTCORE_INVOKE_MAX_SOCKETS
+  || Math.max(50, (MAX_CONCURRENT_INVOKES + MAX_CONCURRENT_SPAWNS) * 2));
 const CONTROL_MAX_SOCKETS = Number(process.env.AGENTCORE_CONTROL_MAX_SOCKETS || Math.max(50, MAX_CONCURRENT_PROVISIONS * 8));
 
 const _provisionSem = createSemaphore(MAX_CONCURRENT_PROVISIONS, { name: 'provision' });
 const _invokeSem = createSemaphore(MAX_CONCURRENT_INVOKES, { name: 'invoke' });
 
+// THE BYPASS THE INVARIANT ABOVE DEMANDS — a SEPARATE pool for invokes made from inside a running
+// turn (`sessions_spawn`, archie-sessions-spawn-plan.md §7a).
+//
+// A spawning parent is blocked waiting on its child while HOLDING an `_invokeSem` permit. If the
+// child drew from the same pool, 25 concurrent spawns would hold all 25 permits waiting for permits
+// that can only be released by the children they are waiting for: a total invoke deadlock across the
+// fleet, recoverable only by timeouts. Two pools make that unrepresentable — a permit held by a
+// parent is never the permit its child needs.
+//
+// SMALL, and deliberately so: a fan-out should degrade ITSELF long before it competes with the real
+// Slack turns people are waiting on. It is also why the recursion depth cap is 1 — this pool is
+// deadlock-free only while its occupants cannot themselves be waiting on it, which grandchildren
+// would break.
+const _spawnSem = createSemaphore(MAX_CONCURRENT_SPAWNS, { name: 'spawn' });
+
 /** Occupancy of both bounds, for the EMF gauges and the dispatcher.request span attributes. */
 function concurrencyStats() {
-  return { provision: _provisionSem.stats(), invoke: _invokeSem.stats() };
+  return { provision: _provisionSem.stats(), invoke: _invokeSem.stats(), spawn: _spawnSem.stats() };
 }
 
 /**
@@ -1433,9 +1465,13 @@ function runExclusiveForSession(sessionId, fn, { metrics, agent, logger } = {}) 
     // session slot is per-thread and the invoke permit is process-wide, so acquiring the narrow lock
     // first and the shared one second is the order that cannot deadlock. It also means a turn queued
     // on the global bound is not holding up other threads' provisioning, only its own thread.
-    return runExclusiveForSession(runtimeSessionId, () => _invokeSem.run(async (waitedMs) => {
+    // `spawned` picks the OTHER pool. See MAX_CONCURRENT_SPAWNS: a turn-initiated invoke must not
+    // queue behind permits held by turns that are waiting on it.
+    const sem = opts.spawned ? _spawnSem : _invokeSem;
+    const limit = opts.spawned ? MAX_CONCURRENT_SPAWNS : MAX_CONCURRENT_INVOKES;
+    return runExclusiveForSession(runtimeSessionId, () => sem.run(async (waitedMs) => {
       if (waitedMs > 0) {
-        opts.logger?.info?.({ agent: opts.agent, sessionId: runtimeSessionId, waitedMs, limit: MAX_CONCURRENT_INVOKES },
+        opts.logger?.info?.({ agent: opts.agent, sessionId: runtimeSessionId, waitedMs, limit, pool: opts.spawned ? 'spawn' : 'invoke' },
           'invoke waited for a concurrency permit');
       }
       return invokeStreamingNow(runtimeArn, runtimeSessionId, payload, onChunk, opts);
