@@ -136,7 +136,7 @@ function cronSpanAttrs(job) {
  * The timer is always cleared, including on the success path, so a long-lived dispatcher does not
  * accumulate one pending timer per fire.
  */
-async function withTimeout(timeoutMs, fn, { span, log, job } = {}) {
+async function withTimeout(timeoutMs, fn, { span, log, job, onTimeoutKill } = {}) {
   if (timeoutMs == null) return fn(undefined);
   const controller = new AbortController();
   let timer = null;
@@ -161,6 +161,10 @@ async function withTimeout(timeoutMs, fn, { span, log, job } = {}) {
         span?.addEvent('cron.timed_out', { 'cron.timeout_ms': timeoutMs });
       } catch { /* enrichment must never mask the timeout */ }
       if (log?.warn) log.warn({ jobId: job && job.jobId, timeoutMs }, 'cron fire timed out — invoke aborted');
+      // Alarmable counterpart to the span attribute above. A span is queryable after the fact; an
+      // alarm is what tells someone it happened. Wrapped because telemetry must never convert a
+      // timeout into a different failure.
+      try { onTimeoutKill?.(job, { timeoutMs }); } catch { /* never mask the timeout */ }
       // NORMALISE, don't rely on which side of the race settled first.
       //
       // Caught by its own test: `controller.abort()` rejects the in-flight invoke SYNCHRONOUSLY, so
@@ -190,6 +194,9 @@ async function withTimeout(timeoutMs, fn, { span, log, job } = {}) {
  * @param deps.runnerFlags       optional { isAgentCore(agentId), get(agentId) } — the per-scope
  *                               CRON_RUNNER gate (cron-runner-flag.js). Absent = ungated, which is
  *                               what the unit tests and any pre-flag caller get.
+ * @param deps.onTimeoutKill      optional (job, {timeoutMs}) => void — telemetry for a run killed
+ *                               at the ceiling. The ONLY way we kill a cron run since the per-job
+ *                               budget was removed, so it is alarmable at >= 1.
  * @param deps.onRunnerGated     optional (job, {runner, source}) => void — telemetry for a declined
  *                               fire. Without it a gated scope is invisible to every metric.
  * @param deps.log               optional pino-shaped logger
@@ -206,6 +213,7 @@ function createCronFire(deps) {
   const deliver = deps.deliver || (async () => {});
   const now = deps.now || Date.now;
   const runnerFlags = deps.runnerFlags || null;
+  const onTimeoutKill = deps.onTimeoutKill || (() => {});
   const onRunnerGated = deps.onRunnerGated || (() => {});
   const log = deps.log || { info() {}, warn() {}, error() {} };
 
@@ -303,7 +311,7 @@ function createCronFire(deps) {
           (signal) => agentCore.invokeStreaming(runtimeArn, sessionId, body, NOOP_CHUNK, {
             logger: child, retryIncomplete: true, agent: job.agentId, trigger: 'cron', abortSignal: signal,
           }),
-          { span, log: child, job },
+          { span, log: child, job, onTimeoutKill },
         );
         // A turn that THREW inside the runtime arrives as an empty final carrying `error` (see
         // invokeStreaming). Treat it as a fire failure: without this the run is recorded 'ok',

@@ -169,31 +169,20 @@ export function describeSchedule(schedule, nowMs) {
  * Absent now means absent; the dispatcher applies the §12c scoping.
  */
 /**
- * Cron turns get a 60-MINUTE budget, whatever the agent asked for.
+ * `payload.timeoutSeconds` IS NO LONGER TOUCHED HERE (2026-09-16).
  *
- * An agent sizes `timeoutSeconds` against what it observes under Pi, and that measurement does not
- * transfer. The same payload costs more under OpenClaw, where the agent performs the Slack send
- * itself instead of replying with text for the gateway to announce. Live 2026-08-12: `orange-code`
- * carried the agent's 30s, completed comfortably under archie, and timed out on EVERY OpenClaw run
- * at ~34s — killed about four seconds short, indefinitely.
+ * There was a floor: anything under 60 minutes was raised, because an agent sizes a budget against
+ * what it observes and that measurement does not transfer between hosts — `orange-code` carried an
+ * agent-chosen 30s and was killed four seconds short, indefinitely. The floor fixed the direction
+ * agents got wrong and left the field meaningful in the other.
  *
- * `run: timeout` is already the largest prod failure class (30 of 79 failing jobs, §12c.6b), so a
- * too-tight budget is the single most common way a cron job dies. A cron turn is unattended: there
- * is no user waiting on it, and a slow one is far better than one that can never finish. The
- * dispatcher's own default for an agentTurn is the same 60 minutes
- * (CRON_TIMEOUT.AGENT_TURN_DEFAULT_MS) — this stops an agent talking us BELOW it.
- *
- * A floor, not an override: a job that genuinely wants longer keeps it. Overruns are separately
- * visible via the long-run metric and the overlap-skip metric.
+ * The dispatcher now gives every agentTurn ONE ceiling (7h50m — cron-inventory-metrics
+ * AGENT_TURN_CEILING_MS) and reads the field not at all, so there is nothing to floor: a job that
+ * takes five minutes is finished at five minutes, and the budget only ever acts on one that is
+ * already overrunning. The field is still ACCEPTED on input — hydrated OpenClaw jobs carry it — it
+ * simply decides nothing. The cost of the ceiling is that an overrunning job eats its own next
+ * fires, which is now an alarm (CronOverlapSkip) rather than a per-job guess.
  */
-const CRON_MIN_TIMEOUT_SECONDS = 3600;
-
-export function floorCronTimeout(payload) {
-  if (!payload || typeof payload !== 'object') return payload;
-  const t = payload.timeoutSeconds;
-  if (typeof t !== 'number' || !Number.isFinite(t) || t >= CRON_MIN_TIMEOUT_SECONDS) return payload;
-  return { ...payload, timeoutSeconds: CRON_MIN_TIMEOUT_SECONDS };
-}
 
 export function toDispatcherJob(agentId, jobId, spec, createdAtMs, sessionKey, entityId) {
   const dj = {
@@ -254,7 +243,7 @@ export function makeCronExecute(deps) {
           const createdAtMs = now();
           // Resolve relative/loose times to absolute epoch-ms before the write, so the
           // dispatcher record carries the one wire form its validator accepts.
-          const spec = { ...raw, schedule: normalizeSchedule(raw.schedule, createdAtMs), ...(raw.payload ? { payload: floorCronTimeout(raw.payload) } : {}) };
+          const spec = { ...raw, schedule: normalizeSchedule(raw.schedule, createdAtMs) };
           const scheduledFor = describeSchedule(spec.schedule, createdAtMs);
           const res = await dispatcher.add(toDispatcherJob(agentId, jobId, spec, createdAtMs, sessionKey, entityId));
           return { ok: true, jobId, job: res.job || null, ...(scheduledFor ? { scheduledFor } : {}) };
@@ -269,9 +258,7 @@ export function makeCronExecute(deps) {
           if (!jobId) throw new Error('cron: jobId required for update');
           // Same normalisation on a reschedule (patch.schedule is the whole schedule object).
           const nowMs = now();
-          let patch = rawPatch.schedule ? { ...rawPatch, schedule: normalizeSchedule(rawPatch.schedule, nowMs) } : rawPatch;
-          // Same floor on a patched payload, or an update quietly reintroduces a tight budget.
-          if (patch.payload) patch = { ...patch, payload: floorCronTimeout(patch.payload) };
+          const patch = rawPatch.schedule ? { ...rawPatch, schedule: normalizeSchedule(rawPatch.schedule, nowMs) } : rawPatch;
           const scheduledFor = patch.schedule ? describeSchedule(patch.schedule, nowMs) : null;
           const res = await dispatcher.update(agentId, jobId, patch);
           return { ok: true, job: res.job || null, ...(scheduledFor ? { scheduledFor } : {}) };

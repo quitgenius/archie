@@ -588,9 +588,25 @@ function createCronInventoryEmitter(deps = {}) {
 //   • `<= 0` means NO TIMEOUT (documented in the cron tool's own doc string as "0 means no
 //     timeout"), so it returns null here rather than a number.
 const CRON_TIMEOUT = {
-  // upstream AGENT_TURN_SAFETY_TIMEOUT_MS — "agent turns can legitimately run much longer"
-  AGENT_TURN_DEFAULT_MS: 60 * 60_000,
-  // upstream DEFAULT_JOB_TIMEOUT_MS
+  // ONE CEILING FOR EVERY AGENT TURN, and no per-job knob (2026-09-16). `payload.timeoutSeconds` is no longer read: a job that
+  // takes five minutes is finished at five minutes, so the budget only ever acts on a job that is
+  // ALREADY overrunning, and every attempt to size it per job killed healthy work instead. The
+  // author-supplied value was the first attempt (`orange-code` carried an agent-chosen 30s and was
+  // killed four seconds short, indefinitely); a schedule-derived bound was the second and would have
+  // killed a 2.5h run on a 2h schedule that 8h would have completed. `run: timeout` was 30 of 79
+  // failing prod jobs — a too-tight budget is the single most common way a cron job dies.
+  //
+  // 7h50m, NOT 8h, and the ten minutes are the whole point. The runtime's session
+  // `maxLifetime` is 28800s (agentcore-provisioning.js:521) — a knob WE set, not an AWS limit. At an
+  // equal budget the two race, and when AgentCore wins the turn dies with an opaque platform error
+  // instead of our own timeout: no CRON_TIMEOUT_ERROR, no CronTimeoutKill, no alarm, and
+  // cron-hydrator's classifyUpstreamFailure files it as `failing-upstream` rather than `run-timeout`.
+  // Sitting under the session lifetime is what makes OUR timeout the one that fires, which is what
+  // makes the alarm trustworthy. Raise this only together with maxLifetime, and keep the gap.
+  AGENT_TURN_CEILING_MS: 28_200_000,
+  // upstream DEFAULT_JOB_TIMEOUT_MS. UNCHANGED: a systemEvent is a dispatcher-side operation, not an
+  // agent turn — one still running after ten minutes is hung, not busy, and the reasoning above
+  // (about long agent work being legitimate) does not transfer to it.
   DEFAULT_MS: 10 * 60_000,
 };
 
@@ -604,12 +620,11 @@ const CRON_TIMEOUT = {
  */
 function resolveCronTimeoutMs(job) {
   const p = (job && job.payload) || {};
-  const isAgentTurn = p.kind === 'agentTurn';
-  const raw = isAgentTurn && typeof p.timeoutSeconds === 'number' && Number.isFinite(p.timeoutSeconds)
-    ? Math.floor(p.timeoutSeconds * 1000)
-    : undefined;
-  if (raw === undefined) return isAgentTurn ? CRON_TIMEOUT.AGENT_TURN_DEFAULT_MS : CRON_TIMEOUT.DEFAULT_MS;
-  return raw <= 0 ? null : raw;
+  // `payload.timeoutSeconds` is deliberately NOT read. Hydrated OpenClaw jobs still carry it and must
+  // keep adding cleanly, so it is tolerated as inert data rather than rejected — but it no longer
+  // decides anything, in either direction. `<= 0` (unbounded) is gone with it: nothing can outlive
+  // the session lifetime anyway, so "unbounded" only ever meant "killed by the platform instead".
+  return p.kind === 'agentTurn' ? CRON_TIMEOUT.AGENT_TURN_CEILING_MS : CRON_TIMEOUT.DEFAULT_MS;
 }
 
 /** Upstream's error text, verbatim — see `normalizeCronRunErrorText`. Kept identical so the runner's

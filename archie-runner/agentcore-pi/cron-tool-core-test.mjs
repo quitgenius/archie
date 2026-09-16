@@ -239,32 +239,27 @@ check('update: a rescheduling patch is normalised before the dispatcher call', a
 // timeoutSeconds against what it sees under Pi, and that does not transfer — live 2026-08-12,
 // orange-code carried the agent's 30s, passed under archie, and timed out on EVERY OpenClaw run at
 // ~34s. `run: timeout` is already the largest prod failure class (30 of 79 failing jobs).
-check('add: an agent-chosen timeout below 60m is raised to the floor', async () => {
-  const disp = mockDispatcher();
-  const exec = makeCronExecute({ agentId: 'a', dispatcher: disp, now: () => NOW, newId: () => 'J' });
-  await exec({ action: 'add', job: { ...SPEC, payload: { kind: 'agentTurn', message: 'x', timeoutSeconds: 30 } } });
-  assert.equal(disp.calls.find((c) => c.name === 'add').args[0].payload.timeoutSeconds, 3600);
+check('add: timeoutSeconds passes through untouched, whatever it says', async () => {
+  for (const timeoutSeconds of [45, 7200, 0]) {
+    const disp = mockDispatcher();
+    const exec = makeCronExecute({ agentId: 'a', dispatcher: disp, now: () => NOW, newId: () => 'J' });
+    await exec({ action: 'add', job: { ...SPEC, payload: { kind: 'agentTurn', message: 'x', timeoutSeconds } } });
+    assert.equal(disp.calls.find((c) => c.name === 'add').args[0].payload.timeoutSeconds, timeoutSeconds);
+  }
 });
 
-check('add: a LARGER explicit timeout is preserved (floor, not override)', async () => {
-  const disp = mockDispatcher();
-  const exec = makeCronExecute({ agentId: 'a', dispatcher: disp, now: () => NOW, newId: () => 'J' });
-  await exec({ action: 'add', job: { ...SPEC, payload: { kind: 'agentTurn', message: 'x', timeoutSeconds: 7200 } } });
-  assert.equal(disp.calls.find((c) => c.name === 'add').args[0].payload.timeoutSeconds, 7200);
-});
-
-check('add: no timeout stays absent (the dispatcher default applies)', async () => {
+check('add: no timeout stays absent — the tool does not invent one', async () => {
   const disp = mockDispatcher();
   const exec = makeCronExecute({ agentId: 'a', dispatcher: disp, now: () => NOW, newId: () => 'J' });
   await exec({ action: 'add', job: { ...SPEC, payload: { kind: 'agentTurn', message: 'x' } } });
   assert.equal('timeoutSeconds' in disp.calls.find((c) => c.name === 'add').args[0].payload, false);
 });
 
-check('update: a patched payload cannot reintroduce a tight timeout', async () => {
+check('update: a patched payload passes through untouched too', async () => {
   const disp = mockDispatcher();
   const exec = makeCronExecute({ agentId: 'a', dispatcher: disp, now: () => NOW });
   await exec({ action: 'update', jobId: 'J', patch: { payload: { kind: 'agentTurn', message: 'x', timeoutSeconds: 45 } } });
-  assert.equal(disp.calls.find((c) => c.name === 'update').args[2].payload.timeoutSeconds, 3600);
+  assert.equal(disp.calls.find((c) => c.name === 'update').args[2].payload.timeoutSeconds, 45);
 });
 
 check('unknown action → {ok:false}', async () => {

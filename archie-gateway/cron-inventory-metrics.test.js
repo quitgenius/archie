@@ -502,46 +502,49 @@ describe('buildCronSessionKey (§12c)', () => {
 });
 
 // ── G7 (§12c.7): timeoutSeconds / model, mirrored from OpenClaw v2026.4.24 ────────
-describe('resolveCronTimeoutMs (G7)', () => {
+// ONE CEILING, NO PER-JOB BUDGET (2026-09-16 — archie-docs/archie-cron-budget-plan.md).
+//
+// Every assertion below used to be about `payload.timeoutSeconds`: defaults by kind, seconds→ms,
+// 0/negative meaning unbounded, junk falling back. The field is no longer read, so those tests
+// described behaviour that no longer exists. These replace them, and the property they hold is
+// stronger than the old ones: NOTHING an author writes changes an agentTurn's budget.
+describe('resolveCronTimeoutMs — one ceiling for every agent turn', () => {
   const j = (payload) => ({ agentId: 'a', jobId: 'j', payload });
 
-  it('defaults by payload KIND when absent (60 min agentTurn / 10 min otherwise)', () => {
-    expect(resolveCronTimeoutMs(j({ kind: 'agentTurn', message: 'x' }))).toBe(CRON_TIMEOUT.AGENT_TURN_DEFAULT_MS);
-    expect(resolveCronTimeoutMs(j({ kind: 'agentTurn', message: 'x' }))).toBe(3_600_000);
+  it('gives every agentTurn the ceiling, whatever timeoutSeconds says', () => {
+    for (const timeoutSeconds of [undefined, 0, -1, 30, 300, 1.5, 99_999, 'nope', NaN, Infinity]) {
+      const payload = { kind: 'agentTurn', message: 'x', ...(timeoutSeconds === undefined ? {} : { timeoutSeconds }) };
+      expect(resolveCronTimeoutMs(j(payload))).toBe(CRON_TIMEOUT.AGENT_TURN_CEILING_MS);
+    }
+  });
+
+  // 7h50m, and the ten-minute gap is the whole point: the runtime's session maxLifetime is 28800s
+  // (agentcore-provisioning.js), so at an equal budget the two race and AgentCore's kill produces an
+  // opaque platform error instead of CRON_TIMEOUT_ERROR — no CronTimeoutKill, no alarm, and
+  // cron-hydrator files it as `failing-upstream` rather than `run-timeout`. Ours must fire first.
+  it('sits BELOW the session maxLifetime so our timeout is the one that fires', () => {
+    expect(CRON_TIMEOUT.AGENT_TURN_CEILING_MS).toBe(28_200_000);
+    expect(CRON_TIMEOUT.AGENT_TURN_CEILING_MS).toBeLessThan(28_800_000);
+  });
+
+  // A systemEvent is a dispatcher-side operation, not an agent turn: one still running after ten
+  // minutes is hung, not busy, so the reasoning that justifies 7h50m for a turn does not transfer.
+  it('leaves systemEvent on the 10-minute default', () => {
     expect(resolveCronTimeoutMs(j({ kind: 'systemEvent', text: 'x' }))).toBe(CRON_TIMEOUT.DEFAULT_MS);
-    expect(resolveCronTimeoutMs(j({ kind: 'systemEvent', text: 'x' }))).toBe(600_000);
-  });
-
-  it('honours an explicit budget in seconds → ms', () => {
-    expect(resolveCronTimeoutMs(j({ kind: 'agentTurn', timeoutSeconds: 300 }))).toBe(300_000);
-    expect(resolveCronTimeoutMs(j({ kind: 'agentTurn', timeoutSeconds: 600 }))).toBe(600_000);
-    expect(resolveCronTimeoutMs(j({ kind: 'agentTurn', timeoutSeconds: 1.5 }))).toBe(1_500);
-  });
-
-  // The question that started this: agent-abs67d's renamer carries timeoutSeconds: 0.
-  it('0 means NO TIMEOUT (null), per the cron tool doc string + both upstream layers', () => {
-    expect(resolveCronTimeoutMs(j({ kind: 'agentTurn', timeoutSeconds: 0 }))).toBeNull();
-  });
-
-  // Upstream clamps negatives to 0 at the field layer, and 0 means unbounded — so a typo'd -1
-  // means "run forever". We MATCH that at read time (fidelity) and refuse it at add time
-  // (cron-api payloadRejection), which is where the trap can actually be closed.
-  it('treats a negative as unbounded too, matching upstream Math.max(0, v)', () => {
-    expect(resolveCronTimeoutMs(j({ kind: 'agentTurn', timeoutSeconds: -1 }))).toBeNull();
-  });
-
-  // Upstream reads timeoutSeconds ONLY for agentTurn. A systemEvent that sets it is ignored.
-  it('IGNORES timeoutSeconds on a systemEvent (upstream reads it only for agentTurn)', () => {
     expect(resolveCronTimeoutMs(j({ kind: 'systemEvent', text: 'x', timeoutSeconds: 5 }))).toBe(600_000);
-    expect(resolveCronTimeoutMs(j({ kind: 'systemEvent', text: 'x', timeoutSeconds: 0 }))).toBe(600_000);
   });
 
-  it('is defensive about junk (a bad field must not make a job unfireable)', () => {
-    expect(resolveCronTimeoutMs(j({ kind: 'agentTurn', timeoutSeconds: 'nope' }))).toBe(3_600_000);
-    expect(resolveCronTimeoutMs(j({ kind: 'agentTurn', timeoutSeconds: NaN }))).toBe(3_600_000);
-    expect(resolveCronTimeoutMs(j({ kind: 'agentTurn', timeoutSeconds: Infinity }))).toBe(3_600_000);
+  it('is defensive about junk (a bad payload must not make a job unfireable)', () => {
     expect(resolveCronTimeoutMs({})).toBe(600_000);
     expect(resolveCronTimeoutMs(null)).toBe(600_000);
+  });
+
+  // No job can be unbounded any more. It never really could: "unbounded" only ever meant "killed by
+  // the session lifetime instead of by us", i.e. killed with a worse error.
+  it('never returns null', () => {
+    for (const payload of [{ kind: 'agentTurn', timeoutSeconds: 0 }, { kind: 'agentTurn', timeoutSeconds: -1 }]) {
+      expect(resolveCronTimeoutMs(j(payload))).not.toBeNull();
+    }
   });
 });
 

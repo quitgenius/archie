@@ -162,31 +162,30 @@ describe('cron fire — timeoutSeconds (G7)', () => {
     expect(opts.abortSignal.aborted).toBe(false);
   });
 
-  // timeoutSeconds: 0 = unbounded. The passthrough must not even create a controller, so the
-  // unbounded path cannot be broken by the timeout code.
-  it('passes NO abortSignal when the job is unbounded (timeoutSeconds: 0)', async () => {
+  // `timeoutSeconds: 0` USED to mean unbounded, and the passthrough did not even create a
+  // controller. Since the per-job budget was removed (2026-09-16) the field is inert: every
+  // agentTurn gets AGENT_TURN_CEILING_MS, so 0 is bounded like everything else. This asserts the
+  // field is ignored rather than honoured — the old behaviour would show up as a missing signal.
+  it('IGNORES timeoutSeconds: 0 — no job is unbounded any more', async () => {
     const m = mocks();
     await m.fire(job({ payload: { kind: 'agentTurn', message: 'x', timeoutSeconds: 0 } }));
-    expect(m.agentCore.invokeStreaming.mock.calls[0][4].abortSignal).toBeUndefined();
+    expect(m.agentCore.invokeStreaming.mock.calls[0][4].abortSignal).toBeInstanceOf(AbortSignal);
   });
 
-  it('ABORTS the invoke and fails with upstream\'s verbatim error when the budget expires', async () => {
-    let seenSignal = null;
-    const m = mocks({
-      agentCore: {
-        // never settles on its own — only the budget can end this turn
-        invokeStreaming: vi.fn((_arn, _sid, _body, _cb, opts) => new Promise((resolve, reject) => {
-          seenSignal = opts.abortSignal;
-          opts.abortSignal.addEventListener('abort', () => reject(new Error('aborted')));
-        })),
-      },
-    });
-    await expect(m.fire(job({ payload: { kind: 'agentTurn', message: 'x', timeoutSeconds: 0.01 } })))
-      .rejects.toThrow(CRON_TIMEOUT_ERROR);
-    expect(seenSignal.aborted).toBe(true);      // the turn was actually cancelled, not just un-awaited
-    expect(m.deliver).not.toHaveBeenCalled();   // a timed-out turn delivers nothing
+  it('every agentTurn gets the same ceiling, whatever it asked for', () => {
+    const { CRON_TIMEOUT, resolveCronTimeoutMs } = require('./cron-inventory-metrics');
+    for (const timeoutSeconds of [0, -1, 30, 300, 99_999]) {
+      expect(resolveCronTimeoutMs(job({ payload: { kind: 'agentTurn', message: 'x', timeoutSeconds } })))
+        .toBe(CRON_TIMEOUT.AGENT_TURN_CEILING_MS);
+    }
+    // 7h50m, not 8h: the runtime's session maxLifetime is 28800s, and our timeout has to fire FIRST
+    // or the turn dies with an opaque platform error instead of CRON_TIMEOUT_ERROR + CronTimeoutKill.
+    expect(CRON_TIMEOUT.AGENT_TURN_CEILING_MS).toBe(28_200_000);
+    expect(CRON_TIMEOUT.AGENT_TURN_CEILING_MS).toBeLessThan(28_800_000);
   });
 
+  // The abort itself is unit-tested against `withTimeout` below with a small budget — it can no
+  // longer be driven through a job, because a job cannot ask for a short one any more.
   // The error text is load-bearing: the runner's consecutiveErrors -> failureAlert path and
   // cron-hydrator's classifyUpstreamFailure both key off it, and a rolled-back OpenClaw job
   // must look identical.
@@ -219,6 +218,32 @@ describe('cron fire — timeoutSeconds (G7)', () => {
       expect(span.setAttribute).toHaveBeenCalledWith('cron.timed_out', true);
       expect(span.setAttribute).toHaveBeenCalledWith('cron.timeout_ms', 5);
       expect(span.addEvent).toHaveBeenCalledWith('cron.timed_out', { 'cron.timeout_ms': 5 });
+    });
+
+    it('ABORTS the work and fails with upstream\'s verbatim error when the budget expires', async () => {
+      let seen = null;
+      await expect(withTimeout(5, (sig) => new Promise((_r, rej) => {
+        seen = sig;
+        sig.addEventListener('abort', () => rej(new Error('aborted')));
+      }))).rejects.toThrow(CRON_TIMEOUT_ERROR);
+      // Cancelled, not merely un-awaited: otherwise the turn keeps running on the runtime, billed
+      // and with its side effects intact, and we have only looked away.
+      expect(seen.aborted).toBe(true);
+    });
+
+    it('emits onTimeoutKill with the budget that was exceeded', async () => {
+      const onTimeoutKill = vi.fn();
+      const j = { agentId: 'a', jobId: 'j' };
+      await expect(withTimeout(5, (sig) => new Promise((_r, rej) => {
+        sig.addEventListener('abort', () => rej(new Error('aborted')));
+      }), { job: j, onTimeoutKill })).rejects.toThrow(CRON_TIMEOUT_ERROR);
+      expect(onTimeoutKill).toHaveBeenCalledWith(j, { timeoutMs: 5 });
+    });
+
+    it('a throwing onTimeoutKill never masks the timeout', async () => {
+      await expect(withTimeout(5, (sig) => new Promise((_r, rej) => {
+        sig.addEventListener('abort', () => rej(new Error('aborted')));
+      }), { onTimeoutKill: () => { throw new Error('metrics dead'); } })).rejects.toThrow(CRON_TIMEOUT_ERROR);
     });
 
     it('span enrichment failure never masks the timeout', async () => {

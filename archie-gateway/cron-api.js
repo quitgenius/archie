@@ -61,36 +61,15 @@ function deliveryRejection(job) {
   return detail ? `cron: invalid delivery (${status}) — ${detail}` : null;
 }
 
-/**
- * §12c.7 (G7) — reject a NEGATIVE payload.timeoutSeconds.
- *
- * Upstream silently clamps it (`TimeoutSecondsFieldSchema` is `Math.max(0, v)`) and 0 means NO
- * TIMEOUT — so under OpenClaw a typo'd `-1` quietly means "run forever", the exact opposite of what
- * the author intended, and the `< 0 → use the default` branch in resolveAgentTimeoutMs is therefore
- * unreachable from the tool path. We refuse instead: 0 stays a legitimate explicit opt-out of the
- * bound, but you cannot arrive at it by accident.
- *
- * Deliberately NOT rejected: an unknown `model`. The runtime falls back to the agent's configured
- * model, and rejecting here would mean a model id that merely postdates the pinned pi-ai catalog
- * (as agent-k4wmx6's `claude-opus-4-8` does) could not be authored at all.
- */
-function payloadRejection(job) {
-  const p = (job && job.payload) || {};
-  const t = p.timeoutSeconds;
-  if (t === undefined || t === null) return null;
-  if (typeof t !== 'number' || !Number.isFinite(t)) {
-    return 'cron: payload.timeoutSeconds must be a finite number of seconds (omit it for the default, or 0 for no timeout).';
-  }
-  if (t < 0) {
-    return 'cron: payload.timeoutSeconds cannot be negative. Omit it for the default (60 min for '
-      + 'an agentTurn, 10 min otherwise), or set exactly 0 to mean NO timeout.';
-  }
-  return null;
-}
-
 /** Both add/update gates in one call, so the two routes cannot drift. */
 function requestRejection(job) {
-  return deliveryRejection(job) || payloadRejection(job);
+  // Delivery only, since 2026-09-16. There WAS a payload gate here refusing a negative
+  // `timeoutSeconds` — upstream silently clamps it, so a typo'd `-1` quietly meant "run forever".
+  // The field is no longer read at all (cron-inventory-metrics resolveCronTimeoutMs), so there is
+  // nothing left to refuse: a negative value is now inert rather than dangerous. Deliberately NOT
+  // replaced with a rejection of the field itself — hydrated OpenClaw jobs carry it, and failing
+  // them would break the seed for a value we simply ignore.
+  return deliveryRejection(job);
 }
 
 function createCronApi(deps) {
@@ -243,4 +222,4 @@ function createCronApi(deps) {
   return router;
 }
 
-module.exports = { createCronApi, deliveryRejection, payloadRejection, requestRejection };
+module.exports = { createCronApi, deliveryRejection, requestRejection };

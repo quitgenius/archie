@@ -3111,6 +3111,7 @@ cronService = createCronService({
   // class, and for a frequent job it also means ticks are being dropped. Both alarm in Terraform.
   onLongRun: cronAlerts.onLongRun,
   onOverlapSkip: cronAlerts.onOverlapSkip,
+  onTimeoutKill: cronAlerts.onTimeoutKill,
   // Deletion telemetry: a removal used to leave no trace at all (§M4 follow-up).
   onJobAdded: cronAlerts.onJobAdded,
   onJobUpdated: cronAlerts.onJobUpdated,

@@ -64,6 +64,12 @@ const METRIC_ENABLED_CHANGED = 'CronJobEnabledChanged';
 // is 30 of 79 failing prod jobs). Duration rides as a property; the metric is a count so the alarm
 // is "any long run in the period".
 const METRIC_LONG_RUN = 'CronLongRun';
+// A run KILLED at the ceiling (cron-fire withTimeout). Distinct from CronFailureAlert on purpose:
+// that one is threshold-based (`failureAlert: {after: N}`) and conflates every failure cause, so a
+// job killed at the ceiling could stay invisible until it had failed N times — i.e. up to N × 7h50m
+// later. After the per-job budget was removed (2026-09-16) this is the ONLY way we kill a cron run,
+// so it is rare by construction and alarmable at >= 1.
+const METRIC_TIMEOUT_KILL = 'CronTimeoutKill';
 // A tick discarded because the previous run of the same job was still going. There is no queue and
 // no catch-up (cron-runner.onDue), so this is a LOST execution: the job silently runs at a fraction
 // of its configured frequency. Previously log.info only — invisible to every metric and alarm.
@@ -163,6 +169,18 @@ function createCronAlertEmitter(deps = {}) {
       durationMs: (info && info.durationMs) || 0,
       status: (info && info.status) || null,
     });
+  }
+
+  function onTimeoutKill(job, info) {
+    emitMetric(METRIC_TIMEOUT_KILL, job && job.agentId, job && job.jobId, {
+      name: (job && job.name) || null,
+      // The budget that was exceeded, so the alarm's drill-down answers "killed at what?" without
+      // reading the code — and so a future ceiling change is visible in the data rather than implied.
+      timeoutMs: (info && info.timeoutMs) || null,
+      schedule: (job && job.schedule && job.schedule.kind) || null,
+    });
+    log.warn({ agent: agentOf(job), jobId: jobIdOf(job), timeoutMs: info && info.timeoutMs },
+      'cron run killed at the ceiling — emitted CronTimeoutKill metric');
   }
 
   function onOverlapSkip(job) {
@@ -277,7 +295,7 @@ function createCronAlertEmitter(deps = {}) {
     }
   }
 
-  return { onAlert, onDeliveryFailure, onJobAdded, onJobUpdated, onJobRemoved, onLongRun, onOverlapSkip, onRunnerGated, _namespace: namespace, _metric: METRIC, _metricDelivery: METRIC_DELIVERY };
+  return { onAlert, onDeliveryFailure, onJobAdded, onJobUpdated, onJobRemoved, onLongRun, onOverlapSkip, onTimeoutKill, onRunnerGated, _namespace: namespace, _metric: METRIC, _metricDelivery: METRIC_DELIVERY };
 }
 
 module.exports = {

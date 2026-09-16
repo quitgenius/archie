@@ -4,7 +4,7 @@
 // Real express app on an ephemeral port, driven with fetch — a genuine API test of
 // the router (routing, status codes, sole-writer delegation to the service).
 const express = require('express');
-const { createCronApi, payloadRejection } = require('./cron-api');
+const { createCronApi } = require('./cron-api');
 const { keyOf } = require('./cron-store');
 
 function fakeService(over = {}) {
@@ -175,8 +175,16 @@ describe('delivery validation at add/update time', () => {
   });
 });
 
-// ── G7 (§12c.7): payload.timeoutSeconds validation ────────────────────────────
-describe('cron api — payload validation (G7)', () => {
+// ── payload.timeoutSeconds is INERT (2026-09-16) ──────────────────────────────
+// There was a G7 gate here refusing a negative `timeoutSeconds`, because upstream clamped it to 0
+// and 0 meant NO TIMEOUT — so a typo'd `-1` silently meant "run forever". The field is no longer
+// read at all: every agentTurn gets one ceiling (cron-inventory-metrics AGENT_TURN_CEILING_MS), so
+// a negative value is inert rather than dangerous and there is nothing left to refuse.
+//
+// These tests are the replacement, not a deletion: the promise changed from "reject a bad value" to
+// "accept ANY value and ignore it", and that promise needs holding. Hydrated OpenClaw jobs carry the
+// field, so rejecting it would break the seed for something we ignore.
+describe('cron api — payload.timeoutSeconds is accepted and ignored', () => {
   const base_ = () => ({
     agentId: 'a', jobId: 'j',
     schedule: { kind: 'cron', expr: '0 9 * * *' },
@@ -184,45 +192,27 @@ describe('cron api — payload validation (G7)', () => {
   });
   const withPayload = (payload) => ({ ...base_(), payload });
 
-  // Upstream clamps a negative to 0 and 0 means NO TIMEOUT — so a typo'd -1 silently means
-  // "run forever". 0 stays legal; you just cannot arrive at it by accident.
-  it('rejects a NEGATIVE timeoutSeconds (upstream silently makes it unbounded)', async () => {
-    const res = await post('/cron/', withPayload({ kind: 'agentTurn', message: 'x', timeoutSeconds: -1 }));
-    expect(res.status).toBe(400);
-    const body = await res.json();
-    expect(body.error).toMatch(/cannot be negative/);
-    expect(body.error).toMatch(/exactly 0 to mean NO timeout/);
-    expect(service.add).not.toHaveBeenCalled();
+  it.each([
+    ['a negative (the old 400)', -1],
+    ['zero (the old "unbounded" opt-out)', 0],
+    ['a positive budget', 300],
+    ['a string', '300'],
+    ['null', null],
+  ])('accepts %s', async (_label, timeoutSeconds) => {
+    const res = await post('/cron/', withPayload({ kind: 'agentTurn', message: 'x', timeoutSeconds }));
+    expect(res.status).toBe(200);
+    expect(service.add).toHaveBeenCalled();
   });
 
-  it('rejects a STRING timeoutSeconds over HTTP', async () => {
-    const res = await post('/cron/', withPayload({ kind: 'agentTurn', message: 'x', timeoutSeconds: '300' }));
-    expect(res.status).toBe(400);
-    expect((await res.json()).error).toMatch(/finite number of seconds/);
-  });
-
-  // NaN/Infinity cannot travel over JSON — JSON.stringify turns both into `null`, so the only way
-  // they reach the gate is in-process. Unit-test the predicate directly rather than pretend an HTTP
-  // client can send them (the first draft of this test asserted a 400 that can never happen).
-  it.each([['NaN', Number.NaN], ['Infinity', Number.POSITIVE_INFINITY], ['a string', '300']])
-  ('the predicate rejects a non-finite timeoutSeconds (%s)', (_l, timeoutSeconds) => {
-    expect(payloadRejection({ payload: { kind: 'agentTurn', timeoutSeconds } })).toMatch(/finite number of seconds/);
-  });
-
-  // …and `null` (what a JSON NaN degrades to) is treated as ABSENT, i.e. the kind default. Silently
-  // accepting it is right: the alternative is rejecting jobs whose author sent an explicit null.
-  it('treats null as absent (JSON has no NaN, so this is the wire form)', async () => {
-    expect(payloadRejection({ payload: { kind: 'agentTurn', timeoutSeconds: null } })).toBeNull();
-    expect((await post('/cron/', withPayload({ kind: 'agentTurn', message: 'x', timeoutSeconds: Number.NaN }))).status).toBe(200);
-  });
-
-  it('ACCEPTS 0 — an explicit, deliberate opt-out of the bound', async () => {
-    expect((await post('/cron/', withPayload({ kind: 'agentTurn', message: 'x', timeoutSeconds: 0 }))).status).toBe(200);
-  });
-
-  it('ACCEPTS a positive budget and an absent field', async () => {
-    expect((await post('/cron/', withPayload({ kind: 'agentTurn', message: 'x', timeoutSeconds: 300 }))).status).toBe(200);
+  it('accepts an absent field', async () => {
     expect((await post('/cron/', withPayload({ kind: 'agentTurn', message: 'x' }))).status).toBe(200);
+  });
+
+  // The case that used to need the hydrator's bypass header. It no longer does, which is the point:
+  // a legacy job replayed from OpenClaw adds on the normal path.
+  it('a legacy negative from hydration needs no bypass header', async () => {
+    const res = await post('/cron/', withPayload({ kind: 'agentTurn', message: 'x', timeoutSeconds: -1 }));
+    expect(res.status).toBe(200);
   });
 
   // An unknown model must NOT be rejected: the runtime falls back to the agent default, and a model
@@ -231,22 +221,9 @@ describe('cron api — payload validation (G7)', () => {
     expect((await post('/cron/', withPayload({ kind: 'agentTurn', message: 'x', model: 'global.anthropic.claude-opus-4-8' }))).status).toBe(200);
   });
 
-  it('the same gate applies on UPDATE (the two routes must not drift)', async () => {
+  it('the same is true on UPDATE (the two routes must not drift)', async () => {
     const res = await put('/cron/a/j', { payload: { kind: 'agentTurn', message: 'x', timeoutSeconds: -5 } });
-    expect(res.status).toBe(400);
-    expect((await res.json()).error).toMatch(/cannot be negative/);
-  });
-
-  // Hydration replays legacy jobs; a negative one must not fail the seed (that leaves the agent
-  // un-hydrated and retrying forever = cutover blocker). Same escape hatch as an invalid delivery.
-  it('the hydrator bypass forces a legacy negative through', async () => {
-    const res = await fetch(`${base}/cron/`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-cron-allow-invalid-delivery': '1' },
-      body: JSON.stringify(withPayload({ kind: 'agentTurn', message: 'x', timeoutSeconds: -1 })),
-    });
     expect(res.status).toBe(200);
-    expect(service.add).toHaveBeenCalled();
   });
 });
 
