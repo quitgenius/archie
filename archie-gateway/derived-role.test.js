@@ -156,8 +156,15 @@ describe('the per-agent scoped read (the reason roles are per-agent)', () => {
     const read = doc.Statement.find((s) => s.Sid === 'DdbReadOwnScope');
     expect(read).toBeTruthy();
     expect(read.Action).toEqual(['dynamodb:GetItem', 'dynamodb:Query', 'dynamodb:BatchGetItem']);
+    // FOUR partitions. `OAUTH#<id>` joined with the v2 OAuth callback flow — the agent reads the
+    // callbacks that landed for it. It is a SEPARATE partition rather than a sort key under
+    // AGENT#<id> deliberately: IAM has no sort-key condition, so a callback row under AGENT# would
+    // have forced the internet-facing callback Lambda's WRITE grant to `LeadingKeys AGENT#*`, which
+    // also covers CONFIG (the tool surface the agent is policed on) and META (routing). Keeping them
+    // apart is what stops the public side reopening that escalation, so the shape is the point and
+    // this list is the assertion that holds it.
     expect(read.Condition['ForAllValues:StringLike']['dynamodb:LeadingKeys'])
-      .toEqual(['AGENT#dm-u1', 'GRANT#dm-u1', 'SKILL#*']);
+      .toEqual(['AGENT#dm-u1', 'GRANT#dm-u1', 'OAUTH#dm-u1', 'SKILL#*']);
   });
   it('grants NO write verb anywhere — the runtime is read-only on the config table', async () => {
     const spec = await resolve({ capabilities: ['aws-readonly'] });
@@ -289,7 +296,7 @@ describe('putDerivedGrants — live update must PRESERVE the scoped config read'
     const read = doc.Statement.find((s) => s.Sid === 'DdbReadOwnScope');
     expect(read).toBeTruthy();
     expect(read.Condition['ForAllValues:StringLike']['dynamodb:LeadingKeys'])
-      .toEqual(['AGENT#dm-u1', 'GRANT#dm-u1', 'SKILL#*']);
+      .toEqual(['AGENT#dm-u1', 'GRANT#dm-u1', 'OAUTH#dm-u1', 'SKILL#*']);
     expect(read.Resource[0]).toBe(`arn:aws:dynamodb:${REGION}:${ACCOUNT}:table/${TABLE}`);
   });
 
