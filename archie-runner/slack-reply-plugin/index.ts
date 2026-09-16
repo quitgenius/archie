@@ -55,8 +55,6 @@ export default definePluginEntry({
     // The env var is the interface (D3) and the runtime rewrites it at the start of each turn, so
     // the only safe read is at call time. `proxyUrl` stays captured: it is per-deployment.
     const secretNow = () => process.env.DISPATCHER_SHARED_SECRET;
-    // Init-time snapshot, used ONLY for the one-off startup warning below. Never for a request.
-    const secretAtInit = secretNow();
 
     // Warn once at init if either env var is missing. We don't refuse
     // to register the tool — that would hide the agent's failure mode
@@ -68,12 +66,17 @@ export default definePluginEntry({
           "slack-reply-plugin: SLACK_PROXY_URL not set — slack_send will error at call time",
         );
       }
-      if (!secretAtInit) {
-        api.logger.warn(
-          "slack-reply-plugin: DISPATCHER_SHARED_SECRET not set — slack_send will error at call time",
-        );
-      }
-      if (proxyUrl && secretAtInit) {
+      // NO WARNING ABOUT THE SECRET AT INIT — it is EXPECTED to be unset here.
+      //
+      // register() runs at container boot (prewarmCompat) and again per session, while
+      // DISPATCHER_SHARED_SECRET is now written per TURN by pi-adapter from the invoke payload
+      // (archie-dispatcher-token-plan.md phase 3). At boot there has been no turn, so the variable is
+      // legitimately absent — and warning about it would fire on every single container start with
+      // "slack_send will error at call time", which is false. A warning that is always wrong is worse
+      // than no warning: it teaches people to skip the log line that will one day be true.
+      //
+      // The real check moved to call time, where the answer is knowable and the error is actionable.
+      if (proxyUrl) {
         api.logger.info(`slack-reply-plugin: ready — proxy=${proxyUrl}`);
       }
     }
