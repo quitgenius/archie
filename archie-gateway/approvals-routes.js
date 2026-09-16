@@ -1,6 +1,6 @@
 'use strict';
-// HTTP handlers for outbound-comms approvals. Auth (x-dispatcher-secret) is
-// applied by the caller when registering routes; handlers assume authed reqs.
+// HTTP handlers for outbound-comms approvals. Auth is applied by the dispatcher's global gate
+// (dispatcher-auth.js) before these routes are reached; handlers assume authed reqs.
 
 const REQUIRED = [
   'agentId', 'approverUserId', 'requesterUserId', 'sessionKey',
@@ -80,9 +80,19 @@ function makeApprovalHandlers({ store, notifyApprover, log }) {
   };
 }
 
-function registerApprovalRoutes({ web, verifySecret, handlers }) {
+/**
+ * `authed` asserts that the global gate ALREADY authenticated this request, rather than
+ * re-implementing it.
+ *
+ * It used to re-check the shared secret from the header itself. That became wrong the moment the
+ * gate started accepting a per-turn token in the same header (dispatcher-auth.js): the token is not
+ * the secret, so a correctly-authenticated agent would have been 401'd here — by a second check
+ * whose only purpose was to repeat the first. Asserting the gate's OUTPUT keeps the belt-and-braces
+ * against a future re-mount outside it, without knowing what a valid credential looks like.
+ */
+function registerApprovalRoutes({ web, handlers }) {
   const authed = (fn) => (req, res) => {
-    if (!verifySecret(req.headers['x-dispatcher-secret'])) return res.status(401).json({ error: 'unauthorized' });
+    if (!req.dispatcherAuth) return res.status(401).json({ error: 'unauthorized' });
     return fn(req, res);
   };
   web.post('/approvals', authed(handlers.create));

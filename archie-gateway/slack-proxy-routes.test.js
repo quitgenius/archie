@@ -150,3 +150,37 @@ test('a Slack-level rejection is passed through as-is, so the caller can see ok:
   assert.equal(res.statusCode, 200);
   assert.deepEqual(res.body, { ok: false, error: 'channel_not_found' });
 });
+
+// The "attributable" half of the slack_send decision: this proxy is not restricted by scope, so the
+// log line is the only record of who posted where — and it is the evidence any future restriction
+// would be argued from.
+describe('slack proxy — scope attribution', () => {
+  const logger = () => {
+    const lines = []; const bound = {};
+    const mk = (ctx) => ({ child: (c) => mk({ ...ctx, ...c }), info: (f, m) => lines.push({ ...ctx, ...f, msg: m }), warn() {}, error() {} });
+    return Object.assign(mk({}), { lines, bound });
+  };
+
+  it('logs the calling scope and the destination together', async () => {
+    const log = logger();
+    const handler = makeSlackProxyHandler({ slack: { apiCall: async () => ({ ok: true }) }, log });
+    const res = { json: vi.fn(), status: vi.fn(() => res) };
+    await handler({
+      params: { method: 'chat.postMessage' },
+      body: { channel: 'C999', text: 'hi' },
+      headers: {},
+      dispatcherAuth: { kind: 'token', scope: 'dm-u1' },
+    }, res);
+    const line = log.lines.find((l) => l.msg === 'slack api call ok');
+    expect(line.scope).toBe('dm-u1');
+    expect(line.destination).toBe('C999');
+  });
+
+  it('records null rather than guessing when the caller has no derivable scope', async () => {
+    const log = logger();
+    const handler = makeSlackProxyHandler({ slack: { apiCall: async () => ({ ok: true }) }, log });
+    const res = { json: vi.fn(), status: vi.fn(() => res) };
+    await handler({ params: { method: 'chat.postMessage' }, body: { channel: 'C1' }, headers: {}, dispatcherAuth: { kind: 'secret', scope: null } }, res);
+    expect(log.lines.find((l) => l.msg === 'slack api call ok').scope).toBe(null);
+  });
+});

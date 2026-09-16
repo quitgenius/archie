@@ -5,9 +5,10 @@
 // store — every add/update/remove funnels through here, keeping schedule naming +
 // validation centralised and the store single-writer.
 //
-// Auth: mounted BEHIND the dispatcher's global x-dispatcher-secret middleware (same as
-// /api/:method), so this router does not re-check. It is the same trust boundary the
-// agents already use to proxy Slack calls.
+// Auth: mounted BEHIND the dispatcher's global gate (dispatcher-auth.js), which accepts either the
+// fleet-wide secret or a per-turn token in the x-dispatcher-secret header and, for a token, refuses
+// any request naming a scope other than the token's. This router does not re-check — it is the same
+// trust boundary the agents already use to proxy Slack calls through /api/:method.
 //
 // Routes (all under the mount path, e.g. /cron):
 //   POST   /                        add a job         (body = job)

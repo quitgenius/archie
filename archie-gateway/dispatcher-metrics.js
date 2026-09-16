@@ -57,6 +57,19 @@ const M_INVOKE_LATENCY_MS = 'InvokeLatencyMs';
 const M_INVOKE_COLD_RETRIES = 'InvokeColdRetries';
 const M_INVOKE_ERROR = 'InvokeErrorCount';
 
+// Per-turn dispatcher credential (archie-dispatcher-token-plan.md §8.8). `Reason` is the dimension,
+// never the scope: in normal operation `revoked` and `unknown` cannot occur at all, so the alarm sits
+// at a threshold of zero and the scope belongs in the log line beside it.
+//   missing  no credential presented        — routine during dual-accept, a misconfiguration after it
+//   expired  outlived its turn's budget     — an overrun, or a background process outliving its turn
+//   revoked  the turn finished              — ALARM: a post-turn caller or a replay
+//   unknown  no valid signature             — ALARM: forged, guessed, or minted by nobody
+const M_TOKEN_REJECTED = 'DispatcherTokenRejected';
+// Revocation could not be consulted, so a signed unexpired token was accepted on its signature
+// alone. Not a rejection — a DEGRADED acceptance, and it is separate precisely so it cannot be
+// mistaken for one. Silent loss of revocation is the thing worth seeing here.
+const M_TOKEN_STORE_UNAVAILABLE = 'DispatcherTokenStoreUnavailable';
+
 // Per-session queue (per-message isolation). Turns for one Slack thread run strictly one at a time,
 // so a burst QUEUES rather than overlapping — which means a user's perceived latency is
 // SessionQueueWaitMs + InvokeLatencyMs, and InvokeLatencyMs alone stops telling the whole story the
@@ -205,13 +218,17 @@ function createDispatcherMetrics(deps = {}) {
 
   // Emit one EMF line: a single metric with an `Agent` dimension AND a fleet-wide aggregate.
   // `props` become searchable EMF context properties (not dimensions).
-  function emitMetric(metricName, value, unit, agent, props = {}) {
+  // `dimensions` defaults to per-agent + fleet-wide, which is right for everything that happens TO an
+  // agent. It is overridable for the handful of metrics whose useful breakdown is not the agent —
+  // token rejections key on the REASON, and dimensioning those by agent as well would multiply 230
+  // scopes by every reason for no question anyone asks.
+  function emitMetric(metricName, value, unit, agent, props = {}, dimensions = [['Agent'], []]) {
     const emf = {
       _aws: {
         Timestamp: now(),
         CloudWatchMetrics: [{
           Namespace: namespace,
-          Dimensions: [['Agent'], []], // per-agent AND a fleet-wide aggregate
+          Dimensions: dimensions,
           Metrics: [{ Name: metricName, Unit: unit }],
         }],
       },
@@ -280,6 +297,18 @@ function createDispatcherMetrics(deps = {}) {
     if (trigger) props.trigger = trigger;
     if (errName) props.errName = errName;
     emitMetric(M_INVOKE_ERROR, 1, 'Count', agent, props);
+  }
+
+  // ── Per-turn credential metrics ────────────────────────────────────────────
+  //
+  // `agent` is the scope the token CLAIMED, which is unverified by definition on a rejection — so it
+  // rides as a property for the log trail and never as a dimension.
+  function emitTokenRejected(reason, { agent } = {}) {
+    emitMetric(M_TOKEN_REJECTED, 1, 'Count', agent, { Reason: reason || 'unknown' }, [['Reason'], []]);
+  }
+
+  function emitTokenStoreUnavailable({ agent } = {}) {
+    emitMetric(M_TOKEN_STORE_UNAVAILABLE, 1, 'Count', agent, {}, [[]]);
   }
 
   // ── Per-session queue metrics ──────────────────────────────────────────────
@@ -471,6 +500,8 @@ function createDispatcherMetrics(deps = {}) {
     emitRuntimeGenerationRoll,
     emitMessageReceived,
     emitOwnerAdded,
+    emitTokenRejected,
+    emitTokenStoreUnavailable,
     _namespace: namespace,
   };
 }
@@ -493,6 +524,8 @@ const NOOP_METRICS = {
   emitRuntimeGenerationRoll() {},
   emitMessageReceived() {},
   emitOwnerAdded() {},
+  emitTokenRejected() {},
+  emitTokenStoreUnavailable() {},
   _namespace: NAMESPACE,
 };
 
@@ -515,6 +548,8 @@ module.exports = {
     M_INVOKE_LATENCY_MS,
     M_INVOKE_COLD_RETRIES,
     M_INVOKE_ERROR,
+    M_TOKEN_REJECTED,
+    M_TOKEN_STORE_UNAVAILABLE,
     M_SESSION_QUEUE_DEPTH,
     M_SESSION_QUEUE_WAIT_MS,
     M_SESSION_QUEUE_REJECTED,

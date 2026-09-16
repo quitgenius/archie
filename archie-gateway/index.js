@@ -47,6 +47,7 @@ const agentCore = createAgentCoreClient();
 const approvalsStore = require('./approvals-store');
 const { mintTurnToken, claimsOf } = require('./turn-token');
 const { createTurnTokenStore } = require('./turn-token-store');
+const { createDispatcherAuth } = require('./dispatcher-auth');
 const { makeApprovalHandlers, registerApprovalRoutes } = require('./approvals-routes');
 const { registerSlackProxyRoute } = require('./slack-proxy-routes');
 const { createApprovalWake } = require('./approvals-wake');
@@ -3202,12 +3203,22 @@ web.get('/health', (_req, res) => {
   return res.json({ ok: true, socket_connected: true, last_slack_event_ms_ago: lastEventAgo });
 });
 
-web.use((req, res, next) => {
-  if (!verifySecret(req.headers['x-dispatcher-secret'])) {
-    return res.status(401).json({ ok: false, error: 'unauthorized' });
-  }
-  next();
+// PHASE 2 of the per-turn credential: ONE header, two credential types. `x-dispatcher-secret` now
+// carries either the fleet-wide secret (as it always has) or a per-turn token, told apart by shape.
+// Dual-accept is deliberate — the runtime does not send a token until phase 3, and ~230 EFS
+// workspaces hold scripts that read the env var by name and cannot be audited.
+//
+// `enforceScope` then makes a token-authenticated caller unable to NAME another scope: a mismatch is
+// a 403 rather than a silent substitution, and an absent agentId is filled in from the signature.
+// It is a no-op for a secret-authenticated caller, which is every caller until phase 3.
+const dispatcherAuth = createDispatcherAuth({
+  secret: DISPATCHER_SECRET,
+  turnTokens,
+  metrics: agentCore.metrics,
+  log,
 });
+web.use(dispatcherAuth.authenticate);
+web.use(dispatcherAuth.enforceScope);
 
 // Cron manager API (behind the shared-secret gate above): agents, via the Pi cron
 // tool, create/list/update/remove/run scheduled jobs here. The dispatcher is the sole
@@ -3270,7 +3281,6 @@ const _notifyApprover = (record) => {
 
 registerApprovalRoutes({
   web,
-  verifySecret,
   handlers: makeApprovalHandlers({ store: approvalsStore, notifyApprover: _notifyApprover, log }),
 });
 

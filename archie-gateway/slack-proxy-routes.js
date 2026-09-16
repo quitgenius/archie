@@ -69,7 +69,13 @@ function anchorDmPostMessage(method, body, sessionKey) {
 function makeSlackProxyHandler({ slack, isSimulateChannel = () => false, log }) {
   return async function slackProxy(req, res) {
     const method = req.params.method;
-    const child = log.child ? log.child({ slack_method: method }) : log;
+    // ATTRIBUTABLE, DELIBERATELY NOT RESTRICTED (the plan's slack_send decision). This proxy can post
+    // as Archie anywhere the bot is, and a token-authenticated caller does not change that — what it
+    // changes is that we now know WHICH scope asked. Every call therefore logs scope-with-destination,
+    // which is both the audit trail and the data any future restriction would have to be argued from.
+    // `null` means a secret-authenticated caller, i.e. one with no derivable scope at all.
+    const scope = (req.dispatcherAuth && req.dispatcherAuth.scope) || null;
+    const child = log.child ? log.child({ slack_method: method, scope }) : log;
     if (!ALLOWED_METHODS.has(method)) {
       child.warn('method not allowed');
       return res.status(403).json({ ok: false, error: 'method not allowed' });
@@ -93,6 +99,7 @@ function makeSlackProxyHandler({ slack, isSimulateChannel = () => false, log }) 
       child.info({
         latency_ms: Date.now() - started,
         ok: result && result.ok,
+        destination: (body && body.channel) || null,
         thread_ts: body && body.thread_ts,
         thread_anchor_applied: Boolean(body && body.thread_ts && !(req.body && req.body.thread_ts)),
       }, 'slack api call ok');
