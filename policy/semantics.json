@@ -1,0 +1,72 @@
+{
+  "$comment": [
+    "Shared entity data for the Cedar policy — the capability/group facts that are true in EVERY",
+    "environment. Scope ids and group membership are per-environment and live in pins.<env>.json.",
+    "",
+    "OPEN-SOURCE BUILD. The structure is real; the capability set is an example. A deployment's",
+    "capabilities are its own — which external systems an agent may reach is the most",
+    "deployment-specific thing in the design — so this ships the shape and a handful of illustrative",
+    "entries rather than a real fleet's inventory.",
+    "",
+    "Two things are deliberately NOT here, and both were in the original:",
+    "  1. HOLDER COUNTS. Each capability carried a count projected over every agent in the fleet. That",
+    "     is an exposure map — it says which privileged capability is widely held and which is held by",
+    "     one scope — and it is also a number that is wrong the moment it is written. Derive it when",
+    "     you need it; do not record it.",
+    "  2. A COMMS SLUG LIST. A capability group naming the specific outbound actions (send a message,",
+    "     send mail, upload a file) that a comms approval gate would govern. Ship that once the gate",
+    "     exists: a declared group with nothing enforcing it describes an intended control rather than",
+    "     a real one, and the difference matters to anyone reading the policy to find out what is",
+    "     actually stopped.",
+    "",
+    "$-prefixed keys are ANNOTATION, never data. Every consumer filters on the PREFIX, not the type —",
+    "a `$comment` may be a string in one file and an array in another."
+  ],
+
+  "capGroups": {
+    "$comment": [
+      "Groups that carry AUTHORITY. `baseline` is the ambient set every scope holds without a grant;",
+      "it is referenced by the A1 permit in semantics.cedar, so adding a capability here makes it",
+      "generally available fleet-wide. Nothing else should be added without a statement to match."
+    ],
+    "baseline": [
+      "fs.read",
+      "memory",
+      "cron",
+      "otel",
+      "health",
+      "hindsight.read",
+      "slack.send",
+      "files.publish"
+    ]
+  },
+
+  "capabilities": {
+    "$comment": [
+      "Every capability that can be the resource of a decision, grouped by ORIGIN for review — the",
+      "groups above carry authority, this map does not. `tier` records how a capability is reached:",
+      "baseline (ambient), grant (a DynamoDB row, per turn), or pin (group membership alone, with no",
+      "row involved). A capability absent from this map has no permit, and Cedar's default is deny."
+    ],
+
+    "fs.read": { "tier": "baseline" },
+    "memory": { "tier": "baseline" },
+    "cron": { "tier": "baseline" },
+    "otel": { "tier": "baseline" },
+    "health": { "tier": "baseline" },
+    "hindsight.read": { "tier": "baseline" },
+    "slack.send": { "tier": "baseline" },
+    "files.publish": { "tier": "baseline" },
+
+    "fs.write": { "tier": "grant" },
+    "runtime": { "tier": "grant" },
+    "spawn": { "tier": "grant" },
+    "connector": { "tier": "grant" },
+
+    "otel.fleet": { "tier": "pin", "note": "reads other agents' telemetry, not just its own" },
+    "hindsight.write": { "tier": "pin", "note": "visible to every reader of the shared bank" },
+    "demo_query_app": { "tier": "pin", "note": "EXAMPLE. Replace with your own." },
+    "demo_warehouse": { "tier": "pin", "note": "EXAMPLE. Replace with your own." },
+    "sandbox-probe": { "tier": "pin", "note": "TEST-ONLY. Pin to [] outside a sandbox." }
+  }
+}

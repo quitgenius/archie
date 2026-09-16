@@ -1,0 +1,35 @@
+Archie
+Copyright (C) 2026 Pelago Health
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option) any
+later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License along
+with this program. If not, see <https://www.gnu.org/licenses/>.
+
+--------------------------------------------------------------------------------
+
+Note on section 13 (Remote Network Interaction). Archie is a network service by
+design: it runs behind a Slack gateway and users interact with it over a network
+without ever receiving a copy. The AGPL is chosen deliberately for that reason —
+if you run a modified version of Archie as a service, you must offer its users
+access to the corresponding source of your modified version.
+
+--------------------------------------------------------------------------------
+
+THIRD-PARTY COMPONENTS
+
+This distribution depends on third-party packages declared in the package.json
+files of each component. Those retain their own licences and copyright; see each
+package's own distribution for terms. Nothing in this NOTICE alters them.
+
+Some modules are shipped as stubs with their real export surface but without an
+implementation — see "What is not included" in README.md. Where a stub names a
+third-party service, that name is used only to describe the interface a real
+implementation would satisfy, and implies no affiliation or endorsement.
