@@ -29,7 +29,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 
 const norm = (k) => String(k).toLowerCase();
 
@@ -78,7 +78,11 @@ export function writeIndexEntry({ sessionsDir, key, sessionId, sessionFile, upda
     sessionFile: sessionFile ? path.basename(sessionFile) : undefined,
     updatedAt: updatedAt || new Date().toISOString(),
   };
-  const tmp = `${pointerPath}.${process.pid}.tmp`;
+  // RANDOM, not the pid: microVMs have separate PID namespaces (measured — two concurrent runtimes
+  // both reported pid 19), so a pid-suffixed temp file is not unique across writers. The per-session
+  // invoke lock means two VMs should never write the same key at once, but a temp name whose
+  // uniqueness depends on that being true is a trap rather than a guarantee.
+  const tmp = `${pointerPath}.${randomBytes(6).toString('hex')}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(body, null, 2));
   fs.renameSync(tmp, pointerPath);
   return pointerPath;
