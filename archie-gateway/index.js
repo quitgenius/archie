@@ -45,6 +45,8 @@ const { createAgentCoreClient } = require('./agentcore-client');
 const agentCore = createAgentCoreClient();
 
 const approvalsStore = require('./approvals-store');
+const { mintTurnToken, claimsOf } = require('./turn-token');
+const { createTurnTokenStore } = require('./turn-token-store');
 const { makeApprovalHandlers, registerApprovalRoutes } = require('./approvals-routes');
 const { registerSlackProxyRoute } = require('./slack-proxy-routes');
 const { createApprovalWake } = require('./approvals-wake');
@@ -109,6 +111,11 @@ const NO_SOCKET_MODE = process.env.NO_SOCKET_MODE === 'true';
 const SLACK_BOT_TOKEN = requireEnv('SLACK_BOT_TOKEN');
 const SLACK_APP_TOKEN = NO_SOCKET_MODE ? null : requireEnv('SLACK_APP_TOKEN');
 const DISPATCHER_SECRET = requireEnv('DISPATCHER_SHARED_SECRET');
+// How long a SLACK turn's dispatcher token stays valid. The cron path derives its own from the job's
+// budget (cron-fire), which can be hours; an interactive turn has no such number, so this is a
+// ceiling rather than a measurement. 30 minutes is far longer than any interactive turn and still
+// four orders of magnitude tighter than the static fleet secret it replaces.
+const SLACK_TURN_TOKEN_TTL_MS = 30 * 60_000;
 const CONNECTOR_API_KEY = process.env.CONNECTOR_API_KEY || '';
 
 // STREAMING_AGENTS (optional): comma-separated agent names to force streaming
@@ -1083,8 +1090,30 @@ async function forwardToAgentCore(agent, event, child, opts = {}) {
           return bridge(ev);
         };
 
+        // PHASE 1 of the per-turn credential (archie-docs/archie-dispatcher-token-plan.md): mint a
+        // scope-bound token and hand it to the turn. Nothing consumes it yet — the runtime reads
+        // named payload fields and ignores the rest (pi-adapter.mjs:1391, the same way
+        // `input.traceparent` already works), so shipping this alone is inert by construction.
+        //
+        // `exp` is the TURN's budget, not a constant: a Slack turn is short and a cron run can be
+        // hours, and a token that outlives its turn is exactly the window the design exists to
+        // close. SLACK_TURN_TOKEN_TTL_MS is generous rather than tight — an expired token mid-turn
+        // breaks a live conversation, while a few spare minutes on a scope-bound credential costs
+        // almost nothing.
+        //
+        // Minted OUTSIDE the try so the `finally` below can revoke it.
+        const dispatcherToken = mintTurnToken({
+          scope: agent, sessionId, runId, expMs: Date.now() + SLACK_TURN_TOKEN_TTL_MS,
+        }, DISPATCHER_SECRET);
+        const dispatcherTokenClaims = claimsOf(dispatcherToken);
+        // Presence of the row IS the token's liveness, so it is opened BEFORE the invoke. A failed
+        // write does not abort the turn — nothing verifies the token yet (phase 2), and once
+        // something does, a turn that can still answer the user beats a turn refused because
+        // DynamoDB blinked. The store logs the failure at error either way.
+        await turnTokens.open(dispatcherTokenClaims);
+
         try {
-          const body = { input: { prompt: payload.message, runId, sender: event.user || null, trigger: event.type || 'user', sessionKey: payload.sessionKey } };
+          const body = { input: { prompt: payload.message, runId, sender: event.user || null, trigger: event.type || 'user', sessionKey: payload.sessionKey, dispatcherToken } };
           // M1 D6: pass agent + trigger so invokeStreaming emits ClawdbotDispatcher InvokeLatencyMs /
           // InvokeColdRetries / InvokeErrorCount (all invoke emit lives inside the client — one helper).
           // Reentrant: we already hold this session's slot, so this does NOT queue again.
@@ -1101,6 +1130,11 @@ async function forwardToAgentCore(agent, event, child, opts = {}) {
           if (session) streaming.stopStream(session, null);
           await slack.chat.postMessage({ channel, thread_ts: threadTs, text: `Sorry — the agent hit an error. Please try again.` }).catch(() => {});
         } finally {
+          // The token dies with the turn — every exit, including the error path above. After this
+          // the credential is refused however it leaked, rather than staying good for the remainder
+          // of its `exp`. Never throws (see the store), so it cannot turn a finished turn into a
+          // failed one, and it runs before the drain so a Slack write cannot delay the revocation.
+          await turnTokens.close(dispatcherTokenClaims);
           // The slot must not be released while Slack writes are still queued. stopStream and the
           // delta appends schedule onto session.stream.chain and return WITHOUT awaiting (they run
           // from a synchronous SSE callback), so without this the next turn's startStream resets
@@ -3066,6 +3100,14 @@ const cronAlerts = createCronAlertEmitter({ log });
 // process can see the other one. The flag is what decides, per scope, which of the two owns firing;
 // archie's fire path exits early unless it reads `agentcore`, and absent means `openclaw`, so the
 // whole un-migrated fleet is held back by default rather than by an operational rule.
+// The revocation half of the per-turn credential. Same rule as the flags below: no table means no
+// client — the store says so and tokens are then valid until expiry with no revocation.
+const turnTokens = createTurnTokenStore({
+  doc: AGENT_CONFIG_TABLE ? configDoc() : null,
+  table: AGENT_CONFIG_TABLE,
+  log,
+});
+
 const cronRunnerFlags = createCronRunnerFlags({
   // No table = no client: an unconfigured dispatcher resolves every scope to `openclaw` (it does
   // not fire) rather than constructing a DynamoDB client it can never use.
@@ -3112,6 +3154,10 @@ cronService = createCronService({
   onLongRun: cronAlerts.onLongRun,
   onOverlapSkip: cronAlerts.onOverlapSkip,
   onTimeoutKill: cronAlerts.onTimeoutKill,
+  // Same signing secret as the Slack path and as file-ref: one credential-signing key for the
+  // dispatcher, not one per feature.
+  mintTurnToken: (claims) => mintTurnToken(claims, DISPATCHER_SECRET),
+  turnTokens,
   // Deletion telemetry: a removal used to leave no trace at all (§M4 follow-up).
   onJobAdded: cronAlerts.onJobAdded,
   onJobUpdated: cronAlerts.onJobUpdated,

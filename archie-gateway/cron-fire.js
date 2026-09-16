@@ -19,8 +19,17 @@ const {
   classifyDelivery, scheduleOf, resolveCronTimeoutMs, resolveCronModel, CRON_TIMEOUT_ERROR,
 } = require('./cron-inventory-metrics');
 const { CRON_RUNNER } = require('./cron-runner-flag');
+// The claim decode only — never the minter. Where the signing secret lives stays index.js's business
+// (deps.mintTurnToken), but reading back the jti of a token this module was handed is pure.
+const { claimsOf } = require('./turn-token');
 
 const NOOP_CHUNK = () => {};
+
+// Slack for the token beyond the turn's own budget. The turn is aborted at the budget, but the
+// abort and the last in-flight dispatcher call are not simultaneous — a tool call already on the
+// wire when the timer fires must not fail on an expired credential and report a confusing auth
+// error instead of the timeout that actually happened.
+const TOKEN_MARGIN_MS = 5 * 60_000;
 
 /**
  * Tell the agent how its output reaches anyone — the cron counterpart of the Slack path's
@@ -194,6 +203,15 @@ async function withTimeout(timeoutMs, fn, { span, log, job, onTimeoutKill } = {}
  * @param deps.runnerFlags       optional { isAgentCore(agentId), get(agentId) } — the per-scope
  *                               CRON_RUNNER gate (cron-runner-flag.js). Absent = ungated, which is
  *                               what the unit tests and any pre-flag caller get.
+ * @param deps.mintTurnToken      optional ({scope,sessionId,runId,expMs}) => string — the per-turn
+ *                               dispatcher credential (archie-docs/archie-dispatcher-token-plan.md).
+ *                               Injected rather than imported so this module keeps no opinion about
+ *                               where the signing secret lives, and so a test can assert the claims
+ *                               without a real one. Absent → no token on the payload, which is a
+ *                               valid state: the runtime ignores the field either way.
+ * @param deps.turnTokens        optional { open(claims), close(claims) } — the revocation store
+ *                               (turn-token-store.js). Injected for the same reason as the minter.
+ *                               Absent → no revocation row, which is what every unit test gets.
  * @param deps.onTimeoutKill      optional (job, {timeoutMs}) => void — telemetry for a run killed
  *                               at the ceiling. The ONLY way we kill a cron run since the per-job
  *                               budget was removed, so it is alarmable at >= 1.
@@ -214,6 +232,8 @@ function createCronFire(deps) {
   const now = deps.now || Date.now;
   const runnerFlags = deps.runnerFlags || null;
   const onTimeoutKill = deps.onTimeoutKill || (() => {});
+  const mintTurnToken = deps.mintTurnToken || null;
+  const turnTokens = deps.turnTokens || { async open() {}, async close() {} };
   const onRunnerGated = deps.onRunnerGated || (() => {});
   const log = deps.log || { info() {}, warn() {}, error() {} };
 
@@ -271,6 +291,10 @@ function createCronFire(deps) {
         ...cronSpanAttrs(job),
       },
     }, async (span) => {
+      // Hoisted so the `finally` can revoke it however this fire ends — INCLUDING the timeout kill,
+      // which is the one exit where revocation matters most: the runtime has been aborted and is not
+      // coming back, so anything still holding the token is not it.
+      let tokenClaims = null;
       try {
         const child = (log.child ? log.child({ jobId: job.jobId, agent: job.agentId }) : log);
 
@@ -290,13 +314,28 @@ function createCronFire(deps) {
         // (agent-k4wmx6's 4 jobs name `global.anthropic.claude-opus-4-8`, which postdates the pinned
         // pi-ai catalog, so a strict runtime would break 4 working jobs to honour a preference).
         const model = resolveCronModel(job);
+        const runId = `cron:${job.agentId}:${job.jobId}:${now()}`;
+        // PHASE 1 of the per-turn credential: the token's life is THIS job's budget plus a margin.
+        // A cron turn can legitimately run for hours (7h50m ceiling), so a fixed TTL would either
+        // expire mid-run on the long jobs or be uselessly loose on the short ones. The budget is
+        // already computed on the next line to drive the abort signal; reusing it means the token
+        // and the turn die together by construction.
+        const tokenTtlMs = resolveCronTimeoutMs(job) + TOKEN_MARGIN_MS;
+        const dispatcherToken = mintTurnToken
+          ? mintTurnToken({ scope: job.agentId, sessionId, runId, expMs: now() + tokenTtlMs })
+          : null;
+        // Presence of the row is the token's liveness, so it opens before the invoke. A failed write
+        // is logged by the store and does not abort the fire.
+        tokenClaims = dispatcherToken ? claimsOf(dispatcherToken) : null;
+        if (tokenClaims) await turnTokens.open(tokenClaims);
         const body = {
           input: {
             prompt: promptFor(job),
-            runId: `cron:${job.agentId}:${job.jobId}:${now()}`,
+            runId,
             sender: job.connectorEntity || null, // per-job Connector identity (§7); null = system
             trigger: 'cron',
             sessionKey: job.sessionKey || null,
+            ...(dispatcherToken ? { dispatcherToken } : {}),
             ...(model ? { model } : {}),
           },
         };
@@ -359,6 +398,10 @@ function createCronFire(deps) {
         span.setStatus({ code: SpanStatusCode.ERROR, message: err && err.message });
         throw err;
       } finally {
+        // §8.8: revoke on FINAL completion, not per attempt. invokeStreaming retries internally and
+        // those retries share the token, so this sits outside the whole awaited call — and a timeout
+        // is a completion. Never throws.
+        if (tokenClaims) await turnTokens.close(tokenClaims);
         span.end();
       }
     });

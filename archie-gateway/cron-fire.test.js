@@ -12,7 +12,16 @@ function mocks(over = {}) {
   };
   const deliver = vi.fn(async () => {});
   const sessionIdFor = over.sessionIdFor || ((job) => `sess-${job.agentId}-${job.sessionTarget || 'main'}`.padEnd(33, '0'));
-  const fireHandler = createCronFire({ agentCore, sessionIdFor, deliver, now: () => 1234 });
+  // `now` and `mintTurnToken` are threaded from `over` so a test can control the clock and observe
+  // the token claims; everything else keeps its default. Without the pass-through a test that passes
+  // them silently gets the defaults and asserts nothing.
+  const fireHandler = createCronFire({
+    agentCore, sessionIdFor, deliver,
+    now: over.now || (() => 1234),
+    ...(over.mintTurnToken ? { mintTurnToken: over.mintTurnToken } : {}),
+    ...(over.turnTokens ? { turnTokens: over.turnTokens } : {}),
+    ...(over.onTimeoutKill ? { onTimeoutKill: over.onTimeoutKill } : {}),
+  });
   return { agentCore, deliver, sessionIdFor, fire: fireHandler.fire };
 }
 
@@ -416,5 +425,78 @@ describe('the CRON_RUNNER gate decides whether this stack fires at all', () => {
     const m = mocks();
     await m.fire(job());
     expect(m.agentCore.invokeStreaming).toHaveBeenCalled();
+  });
+});
+
+// ── the per-turn dispatcher token (plan phase 1) ─────────────────────────────
+// Minting only. Nothing consumes the token yet — the runtime reads named payload fields and ignores
+// the rest — so these assert the CLAIMS, which are the part a later phase will trust.
+describe('cron fire — per-turn dispatcher token', () => {
+  it('puts a scope-bound token on the payload', async () => {
+    const seen = [];
+    const m = mocks({ mintTurnToken: (c) => { seen.push(c); return 'tok-1'; } });
+    await m.fire(job({ payload: { kind: 'agentTurn', message: 'x' } }));
+    expect(m.agentCore.invokeStreaming.mock.calls[0][2].input.dispatcherToken).toBe('tok-1');
+    expect(seen[0].scope).toBe('agentA');     // the JOB's agent, never anything from the payload
+    expect(seen[0].runId).toMatch(/^cron:agentA:/);
+  });
+
+  // A fixed TTL would expire mid-run on an 8-hour job or be uselessly loose on a 30-second one. The
+  // budget is already computed to drive the abort signal, so the token and the turn die together.
+  it('ties the token\'s life to THIS job\'s budget, not a constant', async () => {
+    const seen = [];
+    const m = mocks({ now: () => 1_000_000, mintTurnToken: (c) => { seen.push(c); return 't'; } });
+    await m.fire(job({ payload: { kind: 'agentTurn', message: 'x' } }));
+    const { CRON_TIMEOUT } = require('./cron-inventory-metrics');
+    // budget + margin, so an in-flight call at the moment of abort does not fail on auth instead of
+    // reporting the timeout that actually happened.
+    expect(seen[0].expMs).toBeGreaterThan(1_000_000 + CRON_TIMEOUT.AGENT_TURN_CEILING_MS);
+  });
+
+  it('omits the field entirely when no minter is injected — the field is optional by design', async () => {
+    const m = mocks();
+    await m.fire(job({ payload: { kind: 'agentTurn', message: 'x' } }));
+    expect('dispatcherToken' in m.agentCore.invokeStreaming.mock.calls[0][2].input).toBe(false);
+  });
+});
+
+// The row is what makes the token die with its turn; without the close it would stay good for the
+// whole 8-hour budget after the run finished.
+describe('cron fire — the token\'s revocation row', () => {
+  const tracked = () => {
+    const calls = [];
+    return { calls, open: async (c) => calls.push(['open', c.jti]), close: async (c) => calls.push(['close', c.jti]) };
+  };
+  const minter = () => {
+    const { mintTurnToken } = require('./turn-token');
+    return (c) => mintTurnToken({ ...c }, 'secret');
+  };
+
+  it('opens before the invoke and closes after it', async () => {
+    const t = tracked();
+    const m = mocks({ mintTurnToken: minter(), turnTokens: t });
+    await m.fire(job({ payload: { kind: 'agentTurn', message: 'x' } }));
+    expect(t.calls.map((c) => c[0])).toEqual(['open', 'close']);
+    expect(t.calls[0][1]).toBe(t.calls[1][1]);   // the same row, not a second one
+  });
+
+  // The exit that matters most: the runtime was aborted and is not coming back, so anything still
+  // presenting the token is not it.
+  it('closes when the turn FAILS', async () => {
+    const t = tracked();
+    const m = mocks({
+      mintTurnToken: minter(),
+      turnTokens: t,
+      agentCore: { invokeStreaming: vi.fn(async () => { throw new Error('boom'); }) },
+    });
+    await expect(m.fire(job({ payload: { kind: 'agentTurn', message: 'x' } }))).rejects.toThrow('boom');
+    expect(t.calls.map((c) => c[0])).toEqual(['open', 'close']);
+  });
+
+  it('does nothing when no token was minted — the row is the token\'s, not the job\'s', async () => {
+    const t = tracked();
+    const m = mocks({ turnTokens: t });
+    await m.fire(job({ payload: { kind: 'agentTurn', message: 'x' } }));
+    expect(t.calls).toEqual([]);
   });
 });
