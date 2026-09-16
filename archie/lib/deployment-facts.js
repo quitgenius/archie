@@ -176,7 +176,14 @@ async function discoverFacts(ctx, config, deps = {}) {
     secrets: secrets.list,
     credentialSecretName: secrets.credentialSecretName,
     // Named separately because the hydrator needs THIS one on its own — it authenticates to the
-    // manager API and reads nothing else.
+    // ADMIN manager API (/admin/cron) and reads nothing else.
+    //
+    // It is the FLEET secret, and since phase 4 that is correct rather than a compromise. The
+    // hydrator is INFRASTRUCTURE: it has no turn, so it cannot hold a per-turn token, and it
+    // legitimately writes jobs for every scope in the estate. What changed is the other side —
+    // agents can no longer obtain this secret (the agentcore-base grant and the runtime env var are
+    // both gone) and could not use it on an agent route if they did (requireToken). So one secret
+    // serving one caller class is no longer a shared credential.
     dispatcherSharedSecretArn: (secrets.list.find((x) => x.name === 'DISPATCHER_SHARED_SECRET') || {}).valueFrom,
   };
 }

@@ -47,6 +47,12 @@ const METRIC_REASON = {
   // grants, policy and config from it per turn, unguarded), so it will have alarmed long before this
   // metric says anything. An alarm here would only restate that.
   unavailable: 'unavailable',
+  // PHASE 4. The fleet-wide secret on a route that now requires a token — the alarm this whole plan
+  // was built to make possible. It has no benign explanation once the hydrator is on /admin/cron.
+  shared_secret: 'shared_secret',
+  // A bad or missing key on the ADMIN surface. Its own reason because the admin key is a different
+  // credential with a different holder: a failure here is an infrastructure caller, never an agent.
+  admin_denied: 'admin_denied',
   malformed: 'unknown',
   unknown_version: 'unknown',
   invalid: 'unknown',
@@ -82,6 +88,15 @@ function pathSubject(path) {
   return null;
 }
 
+// The routes an AGENT reaches. After phase 4 these are TOKEN-ONLY: presenting the fleet-wide shared
+// secret to one of them is refused and alarmed, which is only unambiguous because the hydrator — the
+// one legitimate secret-bearing caller of /cron — moved to /admin/cron with its own key.
+//
+// Everything NOT in this list (/reload, /simulate, /routes, /debug/streaming, /files/download) is
+// operator surface and keeps accepting the shared secret: those callers are people and CI, they have
+// no turn, and there is no token for them to hold.
+const AGENT_ROUTE_PREFIXES = ['/cron', '/approvals', '/api'];
+
 /**
  * @param deps.secret      the fleet-wide shared secret (still accepted this phase)
  * @param deps.turnTokens  the revocation store (turn-token-store.js) — `isLive(claims)`
@@ -94,13 +109,15 @@ function createDispatcherAuth(deps = {}) {
   const log = deps.log || { info() {}, warn() {}, error() {} };
   if (!secret) throw new Error('createDispatcherAuth: secret required');
 
-  function secretMatches(header) {
-    const a = Buffer.from(header || '');
-    const b = Buffer.from(secret);
+  function timingSafeEquals(presented, expected) {
+    const a = Buffer.from(presented || '');
+    const b = Buffer.from(expected || '');
     // timingSafeEqual throws on a length mismatch, and a length mismatch is the common case here.
     if (a.length !== b.length) return false;
     return crypto.timingSafeEqual(a, b);
   }
+
+  const secretMatches = (header) => timingSafeEquals(header, secret);
 
   function reject(req, res, reason, detail) {
     const claimed = detail && detail.scope;
@@ -199,7 +216,68 @@ function createDispatcherAuth(deps = {}) {
     return res.status(403).json({ ok: false, error: 'scope_mismatch', scope });
   }
 
-  return { authenticate, enforceScope, secretMatches, looksLikeToken };
+  /**
+   * PHASE 4: an agent route requires a TOKEN. The fleet-wide secret is refused here.
+   *
+   * This is the line that actually closes the hole. Everything before it made the token WORK; this
+   * makes the secret STOP working where it conferred cross-scope authority — `/cron` (CRUD another
+   * agent's jobs), `/approvals` (request or redeem as another agent), `/api` (post as Archie
+   * anywhere the bot is).
+   *
+   * IT IS ONLY UNAMBIGUOUS BECAUSE THE HYDRATOR MOVED. While the hydrator legitimately POSTed to
+   * `/cron` with the shared secret, "an agent presented the secret" could not be treated as a signal
+   * — the hydrator did it on every cutover. With it on `/admin/cron` behind its own key, a secret on
+   * an agent route has no benign explanation left, which is what makes the alarm meaningful.
+   */
+  function requireToken(req, res, next) {
+    const auth = req.dispatcherAuth;
+    if (auth && auth.kind === 'token') return next();
+    metrics.emitTokenRejected('shared_secret', {});
+    log.warn({ path: req.path, method: req.method, kind: auth && auth.kind },
+      'dispatcher auth: SHARED SECRET presented to an agent route — refusing');
+    return res.status(401).json({
+      ok: false,
+      error: 'unauthorized',
+      reason: 'shared_secret',
+      detail: 'This route requires a per-turn dispatcher token. Infrastructure callers use /admin/cron.',
+    });
+  }
+
+  /**
+   * The admin surface's gate: the shared secret, and ONLY the shared secret.
+   *
+   * WHY THIS IS NOT A SECOND SECRET, having first been built as one. D4 proposed a dedicated key on
+   * the grounds that leaving the hydrator on the fleet secret means "the secret still confers
+   * cross-scope cron CRUD, so the hole is narrowed rather than closed". That reasoning assumed the
+   * secret stays REACHABLE by agents. Phase 4 removes both routes to it — the `agentcore-base` grant
+   * that let every derived role read it from Secrets Manager, and `DISPATCHER_SHARED_SECRET_ID` from
+   * the runtime spec — so an agent cannot obtain it, and `requireToken` means it could not spend it
+   * on an agent route if it did. A second secret would have added a Secrets Manager resource, a
+   * terraform apply, a discovered fact and a task-definition field to protect a credential that is
+   * already out of agents' reach. (2026-09-16)
+   *
+   * So the fleet secret is no longer SHARED in the sense that mattered. It is the INFRASTRUCTURE
+   * credential: the hydrator, `archie cron *` and the E2E runner hold it, none of them has a turn,
+   * and every one of them is a caller a human ran.
+   *
+   * A TOKEN IS REFUSED HERE, and that is the half that does need enforcing: an agent holding a
+   * perfectly valid per-turn token must not reach a surface that writes other scopes' jobs.
+   */
+  function requireAdminSecret(req, res, next) {
+    const presented = req.headers['x-dispatcher-secret'];
+    if (!presented || looksLikeToken(presented) || !timingSafeEquals(presented, secret)) {
+      metrics.emitTokenRejected('admin_denied', {});
+      log.warn({ path: req.path, method: req.method, wasToken: looksLikeToken(presented) },
+        'admin surface: refused — this surface takes the infrastructure credential only');
+      return res.status(401).json({ ok: false, error: 'unauthorized', reason: 'admin_denied' });
+    }
+    // Marked so the routers behind it can tell WHICH surface they are serving — cron-api honours the
+    // invalid-delivery bypass on this one only.
+    req.dispatcherAuth = { kind: 'admin', scope: null, claims: null };
+    return next();
+  }
+
+  return { authenticate, enforceScope, requireToken, requireAdminSecret, secretMatches, looksLikeToken, AGENT_ROUTE_PREFIXES };
 }
 
 module.exports = { createDispatcherAuth, looksLikeToken, pathSubject, PATH_SUBJECT, BODY_SUBJECT_PATHS, METRIC_REASON };

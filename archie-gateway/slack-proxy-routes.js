@@ -11,12 +11,21 @@
 // with an operator rather than ours (live-caught 2026-09-03 on the email-check-crayon cron).
 //
 // WHAT THE REMOVAL NOTE WARNED ABOUT, AND WHERE IT STANDS. The note called this an ungated
-// Slack-WRITE surface: the only auth is the shared secret, every runtime can resolve that secret
-// (DISPATCHER_SHARED_SECRET_ID + its derived role's Secrets Manager read), so an agent holding
-// `bash` can curl this directly and post as the bot in any channel the bot can see — past the
-// tool-permission PEP, which only gates the TOOL. That is still true here, and it is a DELIBERATE,
-// TIME-BOXED choice (2026-09-03): it is the same surface OpenClaw runs in production today,
-// so this is parity rather than a new exposure.
+// Slack-WRITE surface: the only auth was the FLEET-WIDE shared secret, which every runtime could
+// resolve at boot, so an agent holding `bash` could curl this directly and post as the bot in any
+// channel the bot can see — past the tool-permission PEP, which only gates the TOOL. It was accepted
+// as a DELIBERATE, TIME-BOXED choice (2026-09-03) on the grounds that it was parity with the
+// OpenClaw surface running in production.
+//
+// HALF OF THAT IS NOW FIXED, and it is worth being precise about which half. Since phase 4 of
+// archie-dispatcher-token-plan.md this route is TOKEN-ONLY: the credential is per-turn, scope-bound
+// and revoked when the turn ends, and the fleet-wide secret is refused here and alarmed. So the
+// CROSS-AGENT and PERSISTENT parts are gone — a leaked credential is one scope's, for one turn.
+//
+// WHAT REMAINS is the destination: an agent's own token still lets `bash` post as the bot in any
+// channel the bot can see, because the caller names the channel. That is unchanged, still deliberate,
+// and now ATTRIBUTABLE — every call logs scope-with-destination, which is the evidence any future
+// restriction would be argued from.
 //
 // The bounded version, if and when it is assessed: take the destination OUT of the caller's hands.
 // A `POST /api/slack/send` that carries the agent's scope id and resolves the channel server-side

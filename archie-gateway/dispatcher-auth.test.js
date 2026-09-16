@@ -237,3 +237,82 @@ describe('dispatcher auth — an unexpected throw fails closed rather than hangi
     expect(res.code).toBe(401);
   });
 });
+
+// ── PHASE 4: the agent surface becomes token-only ────────────────────────────
+describe('dispatcher auth — requireToken, the line that closes the hole', () => {
+  const gate = (h, req) => {
+    const res = resOf();
+    let nexted = false;
+    h.auth.requireToken(req, res, () => { nexted = true; });
+    return { res, nexted };
+  };
+
+  it('lets a token-authenticated caller through', () => {
+    const h = harness();
+    expect(gate(h, reqOf({ dispatcherAuth: { kind: 'token', scope: 'dm-u1' } })).nexted).toBe(true);
+  });
+
+  // The whole point: the fleet-wide secret authenticated "a member of this fleet", and every agent
+  // route then took its subject from the request. Here that stops being possible.
+  it('REFUSES the fleet-wide shared secret, and meters it', () => {
+    const h = harness();
+    const { res, nexted } = gate(h, reqOf({ dispatcherAuth: { kind: 'secret', scope: null } }));
+    expect(nexted).toBe(false);
+    expect(res.code).toBe(401);
+    expect(res.body.reason).toBe('shared_secret');
+    expect(h.rejected).toEqual([['shared_secret', undefined]]);
+  });
+
+  it('refuses an unauthenticated request too — it never stands in for the gate before it', () => {
+    const h = harness();
+    expect(gate(h, reqOf()).nexted).toBe(false);
+  });
+
+  // The hydrator is the one legitimate secret-bearing caller of /cron, and it is why "an agent
+  // presented the secret" could not previously be treated as a signal. It has its own surface now.
+  it('covers exactly the agent routes, leaving the operator surface alone', () => {
+    const { AGENT_ROUTE_PREFIXES } = harness().auth;
+    expect(AGENT_ROUTE_PREFIXES).toEqual(['/cron', '/approvals', '/api']);
+    for (const operator of ['/reload', '/simulate', '/routes', '/debug/streaming']) {
+      expect(AGENT_ROUTE_PREFIXES.some((p) => operator.startsWith(p))).toBe(false);
+    }
+  });
+});
+
+// The admin surface takes the INFRASTRUCTURE credential — the shared secret — because the hydrator
+// has no turn and so cannot hold a per-turn token. What makes that safe is not a second secret but
+// the fact that agents can no longer obtain this one (the agentcore-base grant and the runtime env
+// var are both gone in phase 4).
+describe('dispatcher auth — the admin surface, and what it refuses', () => {
+  const gate = (h, req) => {
+    const res = resOf();
+    let nexted = false;
+    h.auth.requireAdminSecret(req, res, () => { nexted = true; });
+    return { res, nexted };
+  };
+
+  it('accepts the shared secret and marks the request as admin', () => {
+    const h = harness();
+    const req = reqOf({ headers: { 'x-dispatcher-secret': SECRET }, path: '/' });
+    expect(gate(h, req).nexted).toBe(true);
+    expect(req.dispatcherAuth.kind).toBe('admin');
+  });
+
+  // The half that genuinely needs enforcing: a perfectly valid per-turn token must not reach a
+  // surface that writes ANY scope's jobs and can bypass delivery validation.
+  it('REFUSES a per-turn token — no agent reaches this surface, however well authenticated', () => {
+    const h = harness();
+    const { res, nexted } = gate(h, reqOf({ headers: { 'x-dispatcher-secret': token() } }));
+    expect(nexted).toBe(false);
+    expect(res.code).toBe(401);
+    expect(h.rejected).toEqual([['admin_denied', undefined]]);
+  });
+
+  it('refuses a wrong or missing credential without throwing on the length compare', () => {
+    const h = harness();
+    for (const v of [undefined, '', 'x', 'a'.repeat(200)]) {
+      expect(() => gate(h, reqOf({ headers: { 'x-dispatcher-secret': v } }))).not.toThrow();
+      expect(gate(h, reqOf({ headers: { 'x-dispatcher-secret': v } })).nexted).toBe(false);
+    }
+  });
+});

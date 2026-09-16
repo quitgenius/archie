@@ -532,6 +532,8 @@ function composeCronHydratorTaskDefinition({
         { name: 'MANAGER_API_URL', value: dispatcherBaseUrl(facts) },
         { name: 'AWS_REGION', value: region },
       ],
+      // PHASE 4: unchanged, and deliberately so. The hydrator posts to /admin/cron with the fleet
+      // secret — it is infrastructure, it has no turn, and the secret no longer reaches agents.
       secrets: [{ name: 'DISPATCHER_SHARED_SECRET', valueFrom: facts.dispatcherSharedSecretArn }],
       mountPoints: [{ sourceVolume: volumeName, containerPath: mountPath, readOnly: true }],
       logConfiguration: {
@@ -594,6 +596,8 @@ function composeCronPurgeTaskDefinition({
         { name: 'MANAGER_API_URL', value: dispatcherBaseUrl(facts) },
         { name: 'AWS_REGION', value: region },
       ],
+      // PHASE 4: unchanged, and deliberately so. The hydrator posts to /admin/cron with the fleet
+      // secret — it is infrastructure, it has no turn, and the secret no longer reaches agents.
       secrets: [{ name: 'DISPATCHER_SHARED_SECRET', valueFrom: facts.dispatcherSharedSecretArn }],
       logConfiguration: {
         logDriver: 'awslogs',

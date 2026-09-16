@@ -870,6 +870,9 @@ async function managerApi(ctx, out, deps) {
         + "balancer's generated hostname (modules/archie/dispatcher_lb.tf), only reachable from inside the VPC.",
     });
   }
+  // PHASE 4: these commands drive the ADMIN surface (`/admin/cron`), which takes the fleet secret.
+  // That is an operator credential now, not a shared one — agents cannot read it and `/cron` does
+  // not accept it.
   let secret = deps.env.DISPATCHER_SHARED_SECRET;
   if (!secret) {
     // Terraform names it `${var.name}-dispatcher-shared-secret` (secrets.tf:44) — one knob again.

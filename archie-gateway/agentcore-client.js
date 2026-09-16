@@ -125,8 +125,6 @@ function baseConfig() {
     // dispatcher + Hindsight hostnames (tls-scoped.mjs) and restores global cert verification,
     // rather than disabling it process-wide. Prod ALBs have real ACM certs → set this to '1'.
     dispatcherBaseUrl: process.env.DISPATCHER_BASE_URL || 'https://service.example.com',
-    dispatcherSecretId: process.env.DISPATCHER_SHARED_SECRET_ID || 'agent-4ggvzl-dispatcher-shared-secret',
-    dispatcherSecretRegion: process.env.DISPATCHER_SHARED_SECRET_REGION || 'us-east-1',
     nodeTlsReject: process.env.AGENTCORE_RUNTIME_TLS_REJECT || '0',
     // §9.9a: the baked new-agent skeleton the dispatcher templates into a fresh agent's SEED. Same
     // files the agent image carries (both COPY from archie-runner/config-seed in the shared build
@@ -342,10 +340,15 @@ function createAgentCoreClient(overrides = {}) {
       // save_artifact's destination. Conditional: an empty value would make the plugin build an
       // S3 client against a nameless bucket instead of returning "not configured".
       ...(config.artifactsBucket ? { ARTIFACTS_S3_BUCKET: config.artifactsBucket } : {}),
-      // Cron tool → dispatcher manager API (secret resolved at boot by pi-entrypoint).
+      // Cron tool / slack_send / approvals → dispatcher. The URL only: the CREDENTIAL arrives on the
+      // invoke payload per turn and pi-adapter writes it to DISPATCHER_SHARED_SECRET for the duration
+      // of that turn (archie-dispatcher-token-plan.md phase 3).
+      //
+      // DISPATCHER_SHARED_SECRET_ID/_REGION REMOVED (phase 4). pi-entrypoint stopped fetching the
+      // secret at boot in phase 3, so these were already inert — but leaving them would have left a
+      // runtime spec that still NAMES the fleet-wide secret, which is the first thing someone
+      // reintroducing a boot fetch would reach for.
       DISPATCHER_BASE_URL: config.dispatcherBaseUrl,
-      DISPATCHER_SHARED_SECRET_ID: config.dispatcherSecretId,
-      DISPATCHER_SHARED_SECRET_REGION: config.dispatcherSecretRegion,
       NODE_TLS_REJECT_UNAUTHORIZED: config.nodeTlsReject,
       // §9 sandbox: point the runtime's AWS tools at the in-account stand-in readers (only when set).
       ...(config.readersAccount ? { AGENTCORE_READERS_ACCOUNT: config.readersAccount } : {}),

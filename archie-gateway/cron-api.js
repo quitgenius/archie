@@ -47,7 +47,11 @@ const REJECTABLE = {
 // Escape hatch for the CRON HYDRATOR (§9b) only. Hydration replays jobs authored under OpenClaw;
 // if one of them is already broken, rejecting it would fail the seed, which leaves the agent
 // un-hydrated and retrying forever — a cutover blocker. The hydrator sets this header, logs what
-// it forced through, and the job still shows up in CronJobsMisconfigured. Agents never set it.
+// it forced through, and the job still shows up in CronJobsMisconfigured.
+//
+// "Agents never set it" used to be a convention. Since phase 4 it is ENFORCED: the header is only
+// read on the `/admin/cron` mount (`allowDeliveryBypass`), so an agent setting it on `/cron` is
+// ignored rather than trusted.
 const BYPASS_HEADER = 'x-cron-allow-invalid-delivery';
 
 // jobIds that would collide with a sibling route under `/:agentId/`. A job called `runner` could be
@@ -76,6 +80,11 @@ function requestRejection(job) {
 function createCronApi(deps) {
   const { service } = deps;
   const log = deps.log || { info() {}, warn() {}, error() {} };
+  // PHASE 4: the invalid-delivery bypass is honoured on the ADMIN mount only. The router is mounted
+  // twice — `/cron` for agents (token-only) and `/admin/cron` for the hydrator — and an agent that
+  // could set the header would be able to author a job the validation exists to refuse. Defaults to
+  // off, so a mount that forgets to ask for it gets the safe behaviour.
+  const allowDeliveryBypass = deps.allowDeliveryBypass === true;
   const router = express.Router();
 
   // A validation error from the service (bad schedule / missing ids) is a 400;
@@ -96,7 +105,7 @@ function createCronApi(deps) {
     if (RESERVED_JOB_IDS.has(String(job.jobId))) {
       return res.status(400).json({ ok: false, error: `cron: "${job.jobId}" is a reserved jobId — it would collide with the /${job.jobId} route and the job could never be updated` });
     }
-    const bypass = req.get(BYPASS_HEADER) === '1';
+    const bypass = allowDeliveryBypass && req.get(BYPASS_HEADER) === '1';
     const rejection = requestRejection(job);
     if (rejection && !bypass) {
       child.warn({ agentId: job.agentId, jobId: job.jobId, rejection }, 'cron api rejected an invalid delivery at add time');
@@ -191,7 +200,7 @@ function createCronApi(deps) {
     const { agentId, jobId } = req.params;
     const job = { ...(req.body || {}), agentId, jobId };
     const rejection = requestRejection(job);
-    if (rejection && req.get(BYPASS_HEADER) !== '1') {
+    if (rejection && !(allowDeliveryBypass && req.get(BYPASS_HEADER) === '1')) {
       child.warn({ agentId, jobId, rejection }, 'cron api rejected an invalid job on update');
       return res.status(400).json({ ok: false, error: rejection });
     }

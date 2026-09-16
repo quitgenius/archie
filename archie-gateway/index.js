@@ -3217,12 +3217,35 @@ const dispatcherAuth = createDispatcherAuth({
   metrics: agentCore.metrics,
   log,
 });
+
+// ── The ADMIN surface (phase 4, D4) ──────────────────────────────────────────
+//
+// Mounted BEFORE the agent gate, and it takes the INFRASTRUCTURE credential (the shared secret)
+// while `/cron` takes a per-turn token. Separating the two surfaces is what makes "an agent
+// presented the shared secret" a signal at all: while the hydrator POSTed to `/cron` with that
+// secret on every cutover, there was no way to tell a legitimate caller from an agent.
+//
+// Same router, different mount. The invalid-delivery bypass is enabled here and nowhere else —
+// hydration replays already-broken OpenClaw jobs and must not fail the seed over them, while an
+// agent must not be able to author past the same validation.
+//
+// TAGGED FOR DELETION. Hydration exists to replay OpenClaw jobs during the migration; when the last
+// scope flips, this mount, its secret, cron-hydrator.js and the ephemeral task definition go
+// together. That deletability is why it is a separate prefix and not a special case inside /cron.
+web.use('/admin/cron', dispatcherAuth.requireAdminSecret, createCronApi({
+  service: cronService, log, allowDeliveryBypass: true,
+}));
+
 web.use(dispatcherAuth.authenticate);
 web.use(dispatcherAuth.enforceScope);
+// Agent routes are TOKEN-ONLY from here. The fleet-wide secret still authenticates the OPERATOR
+// surface (/reload, /simulate, /routes, /debug/streaming) — those callers are people and CI, they
+// have no turn, and there is no token for them to hold.
+web.use(dispatcherAuth.AGENT_ROUTE_PREFIXES, dispatcherAuth.requireToken);
 
-// Cron manager API (behind the shared-secret gate above): agents, via the Pi cron
-// tool, create/list/update/remove/run scheduled jobs here. The dispatcher is the sole
-// writer of the cron store.
+// Cron manager API — the AGENT mount. Token-only (the gate above), so every job written here is
+// written by the scope the token names and the invalid-delivery bypass is not available. The
+// infrastructure mount is /admin/cron. The dispatcher is the sole writer of the cron store.
 web.use('/cron', createCronApi({ service: cronService, log }));
 
 // ── Outbound-comms approvals API (also behind the shared-secret gate above).

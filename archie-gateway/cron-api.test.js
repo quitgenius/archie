@@ -37,7 +37,11 @@ beforeEach(async () => {
   service = fakeService();
   const app = express();
   app.use(express.json());
+  // BOTH MOUNTS, exactly as index.js wires them (phase 4): `/cron` is the agent surface with the
+  // invalid-delivery bypass OFF, `/admin/cron` is the hydrator's with it ON. Mounting only one would
+  // let the bypass's confinement regress without a test noticing.
   app.use('/cron', createCronApi({ service }));
+  app.use('/admin/cron', createCronApi({ service, allowDeliveryBypass: true }));
   await new Promise((resolve) => { server = app.listen(0, resolve); });
   base = `http://127.0.0.1:${server.address().port}`;
 });
@@ -162,16 +166,26 @@ describe('delivery validation at add/update time', () => {
     expect(service.update).not.toHaveBeenCalled();
   });
 
-  it('HYDRATOR BYPASS: the header forces an already-broken legacy job through', async () => {
+  const bypassPost = (path) => fetch(`${base}${path}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-cron-allow-invalid-delivery': '1' },
+    body: JSON.stringify({ ...jobFixture, delivery: { mode: 'announce' } }),
+  });
+
+  it('HYDRATOR BYPASS: the header forces an already-broken legacy job through on /admin/cron', async () => {
     // Hydration replays OpenClaw-era jobs. Rejecting one that is ALREADY broken would fail the
     // seed, leaving the agent un-hydrated and retrying forever — a cutover blocker.
-    const res = await fetch(`${base}/cron`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-cron-allow-invalid-delivery': '1' },
-      body: JSON.stringify({ ...jobFixture, delivery: { mode: 'announce' } }),
-    });
+    const res = await bypassPost('/admin/cron');
     expect(res.status).toBe(200);
     expect(service.add).toHaveBeenCalledOnce();
+  });
+
+  // PHASE 4: "agents never set it" used to be a convention. It is enforced now — the header is only
+  // read on the admin mount, so an agent cannot author past the validation by setting it.
+  it('the same header is IGNORED on the agent mount', async () => {
+    const res = await bypassPost('/cron');
+    expect(res.status).toBe(400);
+    expect(service.add).not.toHaveBeenCalled();
   });
 });
 
